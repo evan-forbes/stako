@@ -30,6 +30,40 @@ pub const RequestKind = union(enum) {
     pause_stack: struct { stack: []const u8 },
     resume_stack: struct { stack: []const u8 },
     config_patch: struct { stack: []const u8, patches: []const mutations.ConfigPatch },
+    /// Internal: runtime-initiated transition (queued↔running↔terminal).
+    /// Not reachable from the HTTP API; the runtime / session manager
+    /// submits these to keep all writes single-writer.
+    runtime_transition: RuntimeTransitionInput,
+};
+
+/// Status targets the runtime can request via `runtime_transition`. The
+/// queue maps these to `mutations.applyRuntimeTransition`.
+pub const RuntimeTargetStatus = enum {
+    running,
+    completed,
+    failed,
+    canceled,
+    blocked,
+    paused,
+    queued,
+};
+
+pub const RuntimeTransitionInput = struct {
+    stack: []const u8,
+    id: []const u8,
+    to: RuntimeTargetStatus,
+    failed_reason: ?[]const u8 = null,
+    blocked_reason: ?[]const u8 = null,
+    canceled_by: ?[]const u8 = null,
+    /// Optional terminal `[result]` block to record on the item. Used when
+    /// completing or failing a harness session.
+    result_harness: ?[]const u8 = null,
+    result_model: ?[]const u8 = null,
+    result_session_id: ?[]const u8 = null,
+    result_session_file: ?[]const u8 = null,
+    result_transcript_path: ?[]const u8 = null,
+    result_exit_code: ?i64 = null,
+    result_completed_at: ?[]const u8 = null,
 };
 
 pub const RequestError = error{
@@ -218,6 +252,29 @@ pub const Queue = struct {
                 .pause_stack => |p| mutations.applySetPaused(self.allocator, self.notes_root_abs, req.ident, p.stack, true),
                 .resume_stack => |p| mutations.applySetPaused(self.allocator, self.notes_root_abs, req.ident, p.stack, false),
                 .config_patch => |p| mutations.applyConfigPatch(self.allocator, self.notes_root_abs, req.ident, p.stack, p.patches),
+                .runtime_transition => |inp| mutations.applyRuntimeTransition(self.allocator, self.notes_root_abs, req.ident, .{
+                    .stack = inp.stack,
+                    .id = inp.id,
+                    .to = switch (inp.to) {
+                        .running => .running,
+                        .completed => .completed,
+                        .failed => .failed,
+                        .canceled => .canceled,
+                        .blocked => .blocked,
+                        .paused => .paused,
+                        .queued => .queued,
+                    },
+                    .failed_reason = inp.failed_reason,
+                    .blocked_reason = inp.blocked_reason,
+                    .canceled_by = inp.canceled_by,
+                    .result_harness = inp.result_harness,
+                    .result_model = inp.result_model,
+                    .result_session_id = inp.result_session_id,
+                    .result_session_file = inp.result_session_file,
+                    .result_transcript_path = inp.result_transcript_path,
+                    .result_exit_code = inp.result_exit_code,
+                    .result_completed_at = inp.result_completed_at,
+                }),
             } catch |e| break :blk mutationErrorToKind(e);
 
             maybe_output = out;
@@ -228,8 +285,20 @@ pub const Queue = struct {
             return;
         }
         var out = maybe_output.?;
-        // 3. Commit.
-        if (self.enable_git) {
+        // 3. Commit. Per design_version_control.md, the runtime-initiated
+        //    `queued → running` transition is NOT committed (that would
+        //    flood the history with intermediate status flips); only the
+        //    one-per-harness-completion terminal transition is committed.
+        const skip_commit = blk: {
+            switch (req.kind) {
+                .runtime_transition => |inp| {
+                    if (inp.to == .running) break :blk true;
+                },
+                else => {},
+            }
+            break :blk false;
+        };
+        if (self.enable_git and !skip_commit) {
             const commit_res = vcs.commit(self.allocator, self.notes_root_abs, .{
                 .paths = sliceConst(out.paths),
                 .subject = out.commit_subject,
@@ -246,14 +315,18 @@ pub const Queue = struct {
             std.mem.copyForwards(u8, &req.commit_short_sha, &commit_res.short_sha);
         }
 
-        // 4. Audit-log entry.
-        self.audit_writer.append(.{
-            .identity = req.ident.identity,
-            .action = out.audit_action,
-            .target = out.audit_target,
-            .outcome = .allowed,
-            .details = out.audit_details,
-        }) catch {};
+        // 4. Audit-log entry. We skip writing a second audit line for the
+        //    runtime `running` transition because the session manager
+        //    already emitted a `dispatch_harness` event at spawn time.
+        if (!skip_commit or req.kind != .runtime_transition) {
+            self.audit_writer.append(.{
+                .identity = req.ident.identity,
+                .action = out.audit_action,
+                .target = out.audit_target,
+                .outcome = .allowed,
+                .details = out.audit_details,
+            }) catch {};
+        }
 
         req.output = out;
     }

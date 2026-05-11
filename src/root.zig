@@ -22,6 +22,14 @@ pub const audit = @import("audit.zig");
 pub const vcs = @import("vcs.zig");
 pub const mutations = @import("mutations.zig");
 pub const mutation_queue = @import("mutation_queue.zig");
+pub const events = @import("events.zig");
+pub const adapter = @import("adapter.zig");
+pub const fake_adapter = @import("fake_adapter.zig");
+pub const transcript = @import("transcript.zig");
+pub const sse = @import("sse.zig");
+pub const runtime_file = @import("runtime_file.zig");
+pub const session_manager = @import("session_manager.zig");
+pub const runtime = @import("runtime.zig");
 
 pub const Status = state.Status;
 pub const Kind = item.Kind;

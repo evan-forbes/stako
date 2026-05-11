@@ -224,6 +224,24 @@ pub fn build(b: *std.Build) void {
     const run_mutation_tests = b.addRunArtifact(mutation_tests);
     run_mutation_tests.setCwd(b.path("."));
 
+    // Milestone 6: runtime core integration tests. Drives the session
+    // manager against the bundled fake-harness scripts under
+    // test/fixtures/harness/, exercises SSE, cancellation escalation, and
+    // restart-orphan reconciliation. Runs from the build root so fixture
+    // paths resolve.
+    const runtime_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/runtime_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "organo", .module = mod },
+            },
+        }),
+    });
+    const run_runtime_tests = b.addRunArtifact(runtime_tests);
+    run_runtime_tests.setCwd(b.path("."));
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -235,6 +253,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_daemon_tests.step);
     test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_mutation_tests.step);
+    test_step.dependOn(&run_runtime_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

@@ -1,0 +1,4 @@
+{"kind":"session_started","data":{"harness":"codex","model":"gpt-5","session":"sess-codex-hello"}}
+{"kind":"turn_started","data":{"turn":0}}
+{"kind":"message","data":{"text":"Hi from codex.","role":"assistant"}}
+{"kind":"turn_completed","data":{"turn":0,"usage":{}}}

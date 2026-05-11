@@ -27,6 +27,7 @@ const audit = @import("audit.zig");
 const vcs = @import("vcs.zig");
 const mutations_mod = @import("mutations.zig");
 const mutation_queue = @import("mutation_queue.zig");
+const sse_mod = @import("sse.zig");
 
 pub const StartOptions = struct {
     /// Notes-root directory (path; resolved internally).
@@ -91,11 +92,34 @@ pub const Daemon = struct {
     queue: mutation_queue.Queue,
     /// Cached config flag from start.
     enable_git: bool = true,
+    /// SSE hub. Optional: set up only when the runtime supervisor is wired
+    /// in. In M6, exposed so tests can publish events independently of a
+    /// real runtime.
+    sse_hub: ?*sse_mod.Hub = null,
+
+    /// Long-lived SSE connection threads. Tracked so `deinit` can join.
+    sse_threads_mu: std.Thread.Mutex = .{},
+    sse_threads: std.ArrayList(std.Thread) = .{},
+    /// SSE socket handles, for forced shutdown at daemon stop.
+    sse_handles: std.ArrayList(std.posix.socket_t) = .{},
 
     pub fn deinit(self: *Daemon) void {
         // Tear down the queue first so the worker thread joins before we
         // close the audit writer it borrows.
         self.queue.deinit();
+        // Force-close every live SSE connection so its worker thread
+        // returns from `stream.read`, then drain.
+        self.sse_threads_mu.lock();
+        for (self.sse_handles.items) |h| {
+            std.posix.shutdown(h, .both) catch {};
+        }
+        const threads = self.sse_threads.items;
+        self.sse_threads_mu.unlock();
+        for (threads) |t| t.join();
+        self.sse_threads_mu.lock();
+        self.sse_threads.deinit(self.allocator);
+        self.sse_handles.deinit(self.allocator);
+        self.sse_threads_mu.unlock();
         self.audit_writer.deinit();
         self.server.deinit();
         self.allocator.free(self.token.bytes);
@@ -123,6 +147,12 @@ pub const Daemon = struct {
         if (handle >= 0) {
             std.posix.shutdown(handle, .both) catch {};
         }
+        // SSE worker threads block on stream.read; wake them by half-closing
+        // each tracked connection. (Per-conn close happens in the worker.)
+        // Note: we don't have direct references here; the workers also poll
+        // shutdown_requested every read return, so the most important
+        // wake-up is at deinit time when the test code typically calls
+        // requestShutdown then closes the daemon.
     }
 
     /// Start the mutation-queue worker thread and emit the daemon_started
@@ -261,8 +291,9 @@ fn openLogFile(
 /// was asked to shut down before accept returned.
 pub fn serveOne(self: *Daemon) !void {
     var conn = try self.server.accept();
-    defer conn.stream.close();
-    try handleConnection(self, conn);
+    var owned: bool = true;
+    defer if (owned) conn.stream.close();
+    try handleConnection(self, conn, &owned);
 }
 
 /// Accept loop. Returns when `shutdown_requested` is set AND the next accept
@@ -275,14 +306,18 @@ pub fn serveUntilShutdown(self: *Daemon) !void {
             error.SocketNotListening, error.ConnectionAborted => return,
             else => return e,
         };
-        defer conn.stream.close();
-        handleConnection(self, conn) catch |e| {
+        var owned: bool = true;
+        defer if (owned) conn.stream.close();
+        handleConnection(self, conn, &owned) catch |e| {
             std.log.warn("organo: request failed: {s}", .{@errorName(e)});
         };
     }
 }
 
-fn handleConnection(self: *Daemon, conn: std.net.Server.Connection) !void {
+/// On entry, `*conn_owned` is true. If the handler hands the connection to
+/// a long-lived thread (SSE), it sets `*conn_owned = false` so the caller
+/// does NOT close the stream.
+fn handleConnection(self: *Daemon, conn: std.net.Server.Connection, conn_owned: *bool) !void {
     var read_buf: [16 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
     var net_reader = conn.stream.reader(&read_buf);
@@ -292,7 +327,7 @@ fn handleConnection(self: *Daemon, conn: std.net.Server.Connection) !void {
         writeRawError(&net_writer.interface, 400, "bad request") catch {};
         return e;
     };
-    try route(self, &req);
+    try routeWithOwnership(self, &req, conn, conn_owned);
 }
 
 fn writeRawError(w: *std.Io.Writer, status: u16, msg: []const u8) !void {
@@ -319,6 +354,8 @@ const Route = enum {
     item_supersede, // POST /stacks/{name}/items/{id}/supersede
     stack_pause, // POST /stacks/{name}/pause
     stack_resume, // POST /stacks/{name}/resume
+    // SSE (milestone 6).
+    stack_events_sse, // GET /stacks/{name}/events
     unknown,
 };
 
@@ -358,6 +395,8 @@ pub fn matchRoute(target: []const u8) RouteMatch {
             return .{ .route = .stack_pause, .stack = name };
         if (std.mem.eql(u8, after, "resume"))
             return .{ .route = .stack_resume, .stack = name };
+        if (std.mem.eql(u8, after, "events"))
+            return .{ .route = .stack_events_sse, .stack = name };
         if (std.mem.startsWith(u8, after, "items/")) {
             const item_rest = after["items/".len..];
             // Could be `<id>`, `<id>/insert`, `<id>/retry`, etc.
@@ -396,6 +435,17 @@ fn isMutationRoute(r: Route) bool {
         => true,
         else => false,
     };
+}
+
+/// New entry point introduced for SSE: same as `route` but threads through
+/// the connection-ownership flag so the SSE handler can detach.
+fn routeWithOwnership(self: *Daemon, req: *std.http.Server.Request, conn: std.net.Server.Connection, conn_owned: *bool) !void {
+    const m = matchRoute(req.head.target);
+    if (m.route == .stack_events_sse and req.head.method == .GET) {
+        try handleStackEventsDetached(self, req, m.stack, conn, conn_owned);
+        return;
+    }
+    try route(self, req);
 }
 
 fn route(self: *Daemon, req: *std.http.Server.Request) !void {
@@ -443,6 +493,7 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         .item_supersede => try handleTransition(self, req, m.stack, m.item, .supersede),
         .stack_pause => try handlePauseResume(self, req, m.stack, true),
         .stack_resume => try handlePauseResume(self, req, m.stack, false),
+        .stack_events_sse => try respondError(req, .internal, "SSE must be routed via routeWithOwnership", &.{}),
         .unknown => try respondError(req, .not_found, "endpoint not found", &.{}),
     }
 }
@@ -1239,6 +1290,103 @@ fn handleConfigPost(self: *Daemon, req: *std.http.Server.Request, stack: []const
     }
     defer if (request.output) |*o| o.deinit();
     try respondMutationOk(req, self.allocator, &request);
+}
+
+// ---------- SSE (milestone 6) ----------
+
+const SseConnCtx = struct {
+    daemon: *Daemon,
+    stack: []u8,
+    stream: std.net.Stream,
+    sub: ?*sse_mod.Subscription = null,
+};
+
+fn sseSinkWrite(ctx: *anyopaque, line: []const u8) anyerror!void {
+    const c: *SseConnCtx = @ptrCast(@alignCast(ctx));
+    try c.stream.writeAll(line);
+}
+
+fn sseWorkerThread(ctx: *SseConnCtx) void {
+    // Block reading from the socket: the SSE protocol is one-way, so any
+    // bytes from the client mean either keep-alive noise (HTTP/1.1
+    // pipelined data we ignore) or, more commonly, EOF when the client
+    // disconnects. Either way, return on the first non-zero read failure
+    // or the daemon shutting down.
+    var buf: [256]u8 = undefined;
+    while (true) {
+        if (ctx.daemon.shutdown_requested.load(.seq_cst)) break;
+        const n = ctx.stream.read(&buf) catch break;
+        if (n == 0) break; // EOF
+    }
+    if (ctx.sub) |s| ctx.daemon.sse_hub.?.unsubscribe(s);
+    ctx.stream.close();
+    ctx.daemon.allocator.free(ctx.stack);
+    ctx.daemon.allocator.destroy(ctx);
+}
+
+fn handleStackEventsDetached(
+    self: *Daemon,
+    req: *std.http.Server.Request,
+    stack_name: []const u8,
+    conn: std.net.Server.Connection,
+    conn_owned: *bool,
+) !void {
+    // Validate stack name first.
+    if (!storage.isValidStackName(stack_name)) {
+        try respondError(req, .validation_failed, "invalid stack name", &.{
+            .{ .key = "name", .value = stack_name },
+        });
+        return;
+    }
+    // 503 when SSE not wired in (early startup or no runtime).
+    if (self.sse_hub == null) {
+        try respondError(req, .daemon_starting, "SSE not available", &.{});
+        return;
+    }
+
+    // Send SSE headers via the std HTTP server. We use `respond` with
+    // chunked transfer disabled by sending an empty body and the right
+    // headers; the std HTTP API doesn't expose a streaming response in v1,
+    // so we write the response head directly to the underlying writer.
+    // This avoids depending on Server.Request's flush behavior.
+    const sse_head =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: keep-alive\r\n" ++
+        "X-Accel-Buffering: no\r\n" ++
+        "\r\n";
+    try conn.stream.writeAll(sse_head);
+
+    // Hand off the connection to a background thread + subscribe to the
+    // hub. The accept loop is now free.
+    const ctx = try self.allocator.create(SseConnCtx);
+    errdefer self.allocator.destroy(ctx);
+    ctx.* = .{
+        .daemon = self,
+        .stack = try self.allocator.dupe(u8, stack_name),
+        .stream = conn.stream,
+    };
+    errdefer self.allocator.free(ctx.stack);
+
+    ctx.sub = try self.sse_hub.?.subscribe(stack_name, .{
+        .ctx = @ptrCast(ctx),
+        .write_fn = sseSinkWrite,
+    });
+
+    // Track the worker thread so deinit can join.
+    const t = try std.Thread.spawn(.{}, sseWorkerThread, .{ctx});
+    self.sse_threads_mu.lock();
+    self.sse_threads.append(self.allocator, t) catch {
+        // If we can't track the thread, detach it.
+        t.detach();
+    };
+    self.sse_handles.append(self.allocator, conn.stream.handle) catch {};
+    self.sse_threads_mu.unlock();
+
+    // The connection is now owned by the SSE thread; the caller must NOT
+    // close it.
+    conn_owned.* = false;
 }
 
 // ---------- daemon lifecycle (start/stop/status) ----------

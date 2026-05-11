@@ -1,0 +1,5 @@
+pid = 999999
+harness = "claude"
+started_at = 2026-05-10T14:00:00.000Z
+transcript_path = "/tmp/organo-fixture/transcript.jsonl"
+session_id = "sess-abandoned"

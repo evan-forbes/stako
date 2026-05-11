@@ -474,6 +474,146 @@ pub fn applyTransition(
     };
 }
 
+// ---------- runtime-initiated transitions ----------
+
+/// Status targets the runtime/session-manager may set. Internal-only.
+pub const RuntimeStatus = enum {
+    running,
+    completed,
+    failed,
+    canceled,
+    blocked,
+    paused,
+    queued,
+
+    pub fn toStatus(self: RuntimeStatus) state.Status {
+        return switch (self) {
+            .running => .running,
+            .completed => .completed,
+            .failed => .failed,
+            .canceled => .canceled,
+            .blocked => .blocked,
+            .paused => .paused,
+            .queued => .queued,
+        };
+    }
+};
+
+pub const RuntimeTransitionInput = struct {
+    stack: []const u8,
+    id: []const u8,
+    to: RuntimeStatus,
+    failed_reason: ?[]const u8 = null,
+    blocked_reason: ?[]const u8 = null,
+    canceled_by: ?[]const u8 = null,
+    result_harness: ?[]const u8 = null,
+    result_model: ?[]const u8 = null,
+    result_session_id: ?[]const u8 = null,
+    result_session_file: ?[]const u8 = null,
+    result_transcript_path: ?[]const u8 = null,
+    result_exit_code: ?i64 = null,
+    result_completed_at: ?[]const u8 = null,
+};
+
+pub fn applyRuntimeTransition(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    ident: IdentityCtx,
+    input: RuntimeTransitionInput,
+) Error!MutationOutput {
+    if (!storage.isValidStackName(input.stack)) return error.InvalidName;
+    if (!item_mod.isValidId(input.id)) return error.ValidationFailed;
+    const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.stack });
+    defer allocator.free(stack_abs);
+    if (!dirExists(stack_abs)) return error.NotFound;
+
+    const item_dir_name = (try findItemDir(allocator, stack_abs, input.id)) orelse return error.NotFound;
+    defer allocator.free(item_dir_name);
+    const meta_abs = try std.fs.path.join(allocator, &.{ stack_abs, item_dir_name, "meta.toml" });
+    defer allocator.free(meta_abs);
+
+    var src_buf: []u8 = undefined;
+    {
+        var f = try std.fs.cwd().openFile(meta_abs, .{});
+        defer f.close();
+        const stat = try f.stat();
+        src_buf = try allocator.alloc(u8, stat.size);
+        _ = try f.readAll(src_buf);
+    }
+    defer allocator.free(src_buf);
+    var diag: item_mod.ParseDiagnostic = .{};
+    var item = item_mod.parseSlice(allocator, src_buf, &diag) catch return error.ValidationFailed;
+    defer item.deinit();
+
+    const target_status = input.to.toStatus();
+    if (!state.isValidTransition(item.status, target_status)) return error.InvalidStateTransition;
+    item.status = target_status;
+
+    const arena = item.arena.allocator();
+    if (input.failed_reason) |r| item.failed_reason = try arena.dupe(u8, r);
+    if (input.blocked_reason) |r| item.blocked_reason = try arena.dupe(u8, r);
+    if (input.canceled_by) |r| item.canceled_by = try arena.dupe(u8, r);
+
+    // [result] block: written on terminal harness completion.
+    const terminal = input.to == .completed or input.to == .failed or input.to == .canceled;
+    if (terminal and (input.result_harness != null or input.result_session_id != null or input.result_exit_code != null or input.result_transcript_path != null)) {
+        var r: item_mod.Result = .{};
+        if (input.result_harness) |s| r.harness = try arena.dupe(u8, s);
+        if (input.result_model) |s| r.model = try arena.dupe(u8, s);
+        if (input.result_session_id) |s| r.session_id = try arena.dupe(u8, s);
+        if (input.result_session_file) |s| r.session_file = try arena.dupe(u8, s);
+        if (input.result_transcript_path) |s| r.transcript_path = try arena.dupe(u8, s);
+        if (input.result_exit_code) |n| r.exit_code = n;
+        if (input.result_completed_at) |s| r.completed_at = try arena.dupe(u8, s);
+        item.result = r;
+    }
+
+    var ts_buf: [40]u8 = undefined;
+    item.updated_at = try arena.dupe(u8, audit.nowRfc3339Millis(&ts_buf));
+
+    var out_buf = std.ArrayList(u8){};
+    defer out_buf.deinit(allocator);
+    try item_mod.write(&item, out_buf.writer(allocator));
+    {
+        var f = try std.fs.cwd().createFile(meta_abs, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(out_buf.items);
+    }
+
+    const path_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/{s}/meta.toml", .{ input.stack, item_dir_name });
+    var paths_list = std.ArrayList([]u8){};
+    errdefer {
+        for (paths_list.items) |p| allocator.free(p);
+        paths_list.deinit(allocator);
+    }
+    try paths_list.append(allocator, path_rel);
+
+    const verb: []const u8 = switch (input.to) {
+        .running => "running",
+        .completed => "completed",
+        .failed => "failed",
+        .canceled => "canceled",
+        .blocked => "blocked",
+        .paused => "paused",
+        .queued => "queued",
+    };
+    const subject = try std.fmt.allocPrint(allocator, "item: {s} → {s}", .{ input.id, verb });
+    const body_str = try std.fmt.allocPrint(allocator, "stack: {s}\nitem: {s}\nidentity: {s}\napi: {s}\n", .{ input.stack, input.id, ident.identity, ident.api_path });
+    const target = try std.fmt.allocPrint(allocator, "stack/{s}/item/{s}", .{ input.stack, input.id });
+    const details = try allocator.alloc(audit.DetailKV, 0);
+
+    return .{
+        .allocator = allocator,
+        .paths = try paths_list.toOwnedSlice(allocator),
+        .commit_subject = subject,
+        .commit_body = body_str,
+        .audit_action = .dispatch_harness,
+        .audit_target = target,
+        .audit_details = details,
+        .detail_storage = try allocator.alloc(u8, 0),
+    };
+}
+
 // ---------- pause / resume / config patch ----------
 
 pub fn applySetPaused(

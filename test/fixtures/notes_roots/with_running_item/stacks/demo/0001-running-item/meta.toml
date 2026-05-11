@@ -1,0 +1,10 @@
+id = "0001"
+slug = "running-item"
+kind = "prompt"
+status = "running"
+created_at = 2026-05-10T14:00:00Z
+updated_at = 2026-05-10T14:00:00Z
+
+[target]
+provider = "anthropic"
+match = "any"
