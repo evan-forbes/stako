@@ -16,5 +16,5 @@ Tracks progress through the implement → review → fix loop for milestones 1�
 | 6 | 06_runtime_core.md | e12ac69 | 1 | c2c76ae | 0 | 0 | blocker: daemon never started Supervisor; fix wired it into startWorker; 206/206 tests; 6 non-blocking remain |
 | 7 | 07_claude_codex_adapters.md | 6f9af37 | 2 | b054686 | 0 | 0 | session_ended → [result] block was missing; fix wires it + 2 adapter [result] tests; 242/242 tests; 7 non-blocking remain |
 | 8 | 08_provider_status_and_gemini.md | f39f3f8 | 0 | — | 0 | 0 | 7 non-blocking; 273/273 tests; Gemini scaffolded only (factory→null, documented in design_execution_harness.md) |
-| 9 | 09_html_rendering.md | | | | | | |
+| 9 | 09_html_rendering.md | 558535f | 1 | c7992ef | 0 | 0 | blocker: step 6 browser mutation controls missing; fix wired pause/resume/cancel/retry + token in form; 301/301 tests |
 | 10 | 10_authorization.md | | | | | | |
