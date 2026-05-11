@@ -18,6 +18,7 @@ const adapter_mod = @import("adapter.zig");
 const fake_adapter = @import("fake_adapter.zig");
 const harness_dispatch = @import("harness_dispatch.zig");
 const runtime_file = @import("runtime_file.zig");
+const provider_status = @import("provider_status.zig");
 
 pub const AdapterFactory = *const fn (allocator: std.mem.Allocator, harness: []const u8) anyerror!?adapter_mod.Adapter;
 
@@ -51,6 +52,13 @@ pub const Options = struct {
     /// When true, runtime-loop ticks log to the audit log. Disable in tests
     /// that pin audit-line counts.
     audit_routing: bool = false,
+    /// When true (default in production), routing preflight calls
+    /// `provider_status.probe` and rejects items routed to a provider
+    /// whose binary is missing (`harness_unavailable`) or whose auth
+    /// detection comes up empty (`auth_missing`). Tests that wire a
+    /// scripted/no-binary dispatch (M6 fake, M7 cat_jsonl) leave this
+    /// off so the scripted subprocess actually runs.
+    enable_provider_preflight: bool = false,
 };
 
 pub const Supervisor = struct {
@@ -62,10 +70,33 @@ pub const Supervisor = struct {
     /// Indexed by stack name.
     workers: std.StringHashMapUnmanaged(*Worker) = .{},
 
+    /// Cache of provider binary-presence + auth-state probes. Populated
+    /// lazily on first use and never invalidated for the supervisor's
+    /// lifetime. The probe itself is cheap (PATH scan + a couple of
+    /// stat()s) but doing it on every tick still adds avoidable syscalls
+    /// when a stack has many queued items, so we cache once per process.
+    /// Daemon restarts re-probe — that's the documented mechanism for
+    /// picking up newly installed provider CLIs (see
+    /// `todos/design_execution_harness.md`, "Gemini capability probe").
+    status_cache_mu: std.Thread.Mutex = .{},
+    status_cache: std.AutoHashMapUnmanaged(provider_status.Provider, provider_status.Status) = .{},
+
     pub fn init(allocator: std.mem.Allocator, opts: Options) Supervisor {
         var sm = session_manager.Manager.init(allocator, opts.notes_root_abs, opts.hub, opts.audit_writer, opts.queue);
         sm.max_concurrent = opts.max_concurrent_total;
         return .{ .allocator = allocator, .opts = opts, .sm = sm };
+    }
+
+    /// Look up the cached provider status, populating the cache if needed.
+    pub fn providerStatus(self: *Supervisor, p: provider_status.Provider) provider_status.Status {
+        self.status_cache_mu.lock();
+        defer self.status_cache_mu.unlock();
+        if (self.status_cache.get(p)) |s| return s;
+        const s = provider_status.probe(self.allocator, p);
+        // Best-effort cache insert; fall through to the un-cached result on
+        // OOM (the next tick will retry).
+        self.status_cache.put(self.allocator, p, s) catch {};
+        return s;
     }
 
     pub fn deinit(self: *Supervisor) void {
@@ -78,6 +109,7 @@ pub const Supervisor = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.workers.deinit(self.allocator);
+        self.status_cache.deinit(self.allocator);
     }
 
     pub fn requestShutdown(self: *Supervisor) void {
@@ -330,6 +362,29 @@ pub const Supervisor = struct {
         const probe = self.opts.dispatch.factory(self.allocator, harness_name) catch null;
         if (probe == null) return .{ .blocked = "harness_unavailable" };
         if (probe) |p| p.deinit(self.allocator);
+
+        // Per-provider preflight: binary-presence + auth-state checks.
+        // Only runs when (a) the supervisor is configured to enforce it
+        // and (b) the harness maps to a known provider. Tests that use
+        // the "fake" harness or scripted cat_jsonl dispatch leave this
+        // disabled so the scripted subprocess actually runs without the
+        // host needing the real provider binary installed.
+        if (self.opts.enable_provider_preflight) {
+            if (harness_dispatch.harnessToProvider(harness_name)) |provider| {
+                const status = self.providerStatus(provider);
+                // Binary-presence is mandatory — even a signed-in but
+                // CLI-less host can't spawn the subprocess.
+                if (!status.binary_present) return .{ .blocked = "harness_unavailable" };
+                // Adapter-disabled providers (Gemini in v1) advertise this
+                // via `available=false`. Same canonical slug for clarity.
+                if (!status.available) return .{ .blocked = "harness_unavailable" };
+                // Auth state is best-effort: when we can detect "no
+                // credentials anywhere", surface `auth_missing` so the UI
+                // can prompt the user instead of failing inside a
+                // subprocess. `unknown` is treated as "go ahead and try".
+                if (status.auth == .signed_out) return .{ .blocked = "auth_missing" };
+            }
+        }
 
         return .{ .proceed = .{ .harness = harness_name, .cwd = workdir_opt } };
     }

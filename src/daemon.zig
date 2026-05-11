@@ -29,6 +29,7 @@ const mutations_mod = @import("mutations.zig");
 const mutation_queue = @import("mutation_queue.zig");
 const sse_mod = @import("sse.zig");
 const runtime_mod = @import("runtime.zig");
+const provider_status = @import("provider_status.zig");
 
 pub const StartOptions = struct {
     /// Notes-root directory (path; resolved internally).
@@ -58,6 +59,11 @@ pub const StartOptions = struct {
     /// Global concurrency cap passed to the session manager. Ignored when
     /// `enable_runtime` is false.
     max_concurrent_total: usize = 8,
+    /// When true (M8 default for the daemon CLI path), the supervisor's
+    /// routing preflight calls `provider_status.probe` to enforce
+    /// binary-presence and auth-state preconditions. M6/M7 tests that use
+    /// scripted fake-harness dispatch leave this false.
+    enable_provider_preflight: bool = false,
 };
 
 pub const StartError = error{
@@ -128,6 +134,7 @@ pub const Daemon = struct {
     runtime_enabled: bool = false,
     runtime_dispatch: ?runtime_mod.Dispatch = null,
     runtime_max_concurrent_total: usize = 8,
+    runtime_enable_provider_preflight: bool = false,
 
     pub fn deinit(self: *Daemon) void {
         // Tear-down order matters:
@@ -241,6 +248,7 @@ pub const Daemon = struct {
                 .hub = hub_p,
                 .dispatch = dispatch,
                 .max_concurrent_total = self.runtime_max_concurrent_total,
+                .enable_provider_preflight = self.runtime_enable_provider_preflight,
             });
             errdefer {
                 sup_p.deinit();
@@ -341,6 +349,7 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
         .runtime_enabled = opts.enable_runtime,
         .runtime_dispatch = opts.dispatch,
         .runtime_max_concurrent_total = opts.max_concurrent_total,
+        .runtime_enable_provider_preflight = opts.enable_provider_preflight,
     };
     d.logLine("[{d}] daemon started on 127.0.0.1:{d}", .{ std.time.timestamp(), bound_port });
     return d;
@@ -450,6 +459,9 @@ const Route = enum {
     stack_resume, // POST /stacks/{name}/resume
     // SSE (milestone 6).
     stack_events_sse, // GET /stacks/{name}/events
+    // Provider status (milestone 8).
+    providers_list, // GET /providers
+    provider_get, // GET /providers/{name}
     unknown,
 };
 
@@ -457,6 +469,8 @@ const RouteMatch = struct {
     route: Route,
     stack: []const u8 = "",
     item: []const u8 = "",
+    /// Filled in for `provider_get`.
+    provider: []const u8 = "",
 };
 
 /// Match the path against the daemon's route table. Exposed for unit tests.
@@ -468,6 +482,16 @@ pub fn matchRoute(target: []const u8) RouteMatch {
     if (std.mem.eql(u8, path, "/healthz")) return .{ .route = .healthz };
     if (std.mem.eql(u8, path, "/stacks") or std.mem.eql(u8, path, "/stacks/"))
         return .{ .route = .stacks_list };
+
+    // Provider status (M8).
+    if (std.mem.eql(u8, path, "/providers") or std.mem.eql(u8, path, "/providers/"))
+        return .{ .route = .providers_list };
+    if (std.mem.startsWith(u8, path, "/providers/")) {
+        const name = path["/providers/".len..];
+        if (name.len > 0 and std.mem.indexOfScalar(u8, name, '/') == null) {
+            return .{ .route = .provider_get, .provider = name };
+        }
+    }
 
     // /stacks/<name>...
     if (std.mem.startsWith(u8, path, "/stacks/")) {
@@ -588,6 +612,9 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         .stack_pause => try handlePauseResume(self, req, m.stack, true),
         .stack_resume => try handlePauseResume(self, req, m.stack, false),
         .stack_events_sse => try respondError(req, .internal, "SSE must be routed via routeWithOwnership", &.{}),
+        // Provider status (M8).
+        .providers_list => try respondProvidersList(self, req),
+        .provider_get => try respondProviderGet(self, req, m.provider),
         .unknown => try respondError(req, .not_found, "endpoint not found", &.{}),
     }
 }
@@ -826,6 +853,35 @@ fn respondStackItemGet(
     defer buf.deinit(self.allocator);
     const w = buf.writer(self.allocator);
     try writeItemJson(w, &it);
+    try respondJson(req, buf.items);
+}
+
+// ---------- provider status (milestone 8) ----------
+
+fn respondProvidersList(self: *Daemon, req: *std.http.Server.Request) !void {
+    var list = provider_status.probeAll(self.allocator) catch {
+        try respondError(req, .internal, "provider probe failed", &.{});
+        return;
+    };
+    defer list.deinit();
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    try provider_status.writeJsonList(buf.writer(self.allocator), list.items);
+    try respondJson(req, buf.items);
+}
+
+fn respondProviderGet(self: *Daemon, req: *std.http.Server.Request, name: []const u8) !void {
+    const p = provider_status.Provider.fromString(name) orelse {
+        try respondError(req, .not_found, "unknown provider", &.{
+            .{ .key = "provider", .value = name },
+        });
+        return;
+    };
+    const status = provider_status.probe(self.allocator, p);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    try provider_status.writeJsonOne(buf.writer(self.allocator), status);
     try respondJson(req, buf.items);
 }
 
@@ -1644,6 +1700,16 @@ test "matchRoute: unknown" {
     try std.testing.expectEqual(Route.unknown, matchRoute("/stacks/foo/items/0001/extra").route);
     // Trailing slash on the collection still matches the list route.
     try std.testing.expectEqual(Route.stacks_list, matchRoute("/stacks/").route);
+}
+
+test "matchRoute: providers (M8)" {
+    try std.testing.expectEqual(Route.providers_list, matchRoute("/providers").route);
+    try std.testing.expectEqual(Route.providers_list, matchRoute("/providers/").route);
+    const m = matchRoute("/providers/anthropic");
+    try std.testing.expectEqual(Route.provider_get, m.route);
+    try std.testing.expectEqualStrings("anthropic", m.provider);
+    // Nested paths under /providers/<name>/... aren't supported in v1.
+    try std.testing.expectEqual(Route.unknown, matchRoute("/providers/anthropic/x").route);
 }
 
 test "start: rejects non-loopback host" {

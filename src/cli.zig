@@ -36,6 +36,7 @@ pub const Subcommand = enum {
     init,
     daemon,
     stack,
+    auth,
 
     /// Accepts the canonical name and the short alias documented in
     /// `todos/implement_cli_client.md`.
@@ -43,6 +44,7 @@ pub const Subcommand = enum {
         if (std.mem.eql(u8, s, "init")) return .init;
         if (std.mem.eql(u8, s, "daemon") or std.mem.eql(u8, s, "d")) return .daemon;
         if (std.mem.eql(u8, s, "stack") or std.mem.eql(u8, s, "s")) return .stack;
+        if (std.mem.eql(u8, s, "auth") or std.mem.eql(u8, s, "a")) return .auth;
         return null;
     }
 };
@@ -364,6 +366,110 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
     return out;
 }
 
+/// `auth` subcommand actions (milestone 8). The canonical shape is:
+///
+///   organo auth status                  # GET /providers, summary view
+///   organo auth <provider>              # GET /providers/<name>, single view
+///   organo auth signout <provider>      # not implemented in v1 — see below
+///
+/// Short aliases: `organo a st`, `organo a <provider>`, `organo a out <p>`.
+///
+/// `signout` is recognized by the parser but the runner emits a stable
+/// "not supported" message: organo doesn't own subscription tokens in v1
+/// (see `todos/research_provider_sign_in.md`), so it has nothing to sign
+/// out. API-key callers should unset the relevant env var themselves.
+pub const AuthAction = enum {
+    status,
+    provider,
+    signout,
+
+    pub fn fromString(s: []const u8) ?AuthAction {
+        if (std.mem.eql(u8, s, "status") or std.mem.eql(u8, s, "st")) return .status;
+        if (std.mem.eql(u8, s, "signout") or std.mem.eql(u8, s, "out")) return .signout;
+        return null;
+    }
+};
+
+pub const AuthArgs = struct {
+    action: AuthAction,
+    /// Filled for `provider` and `signout` actions.
+    provider_name: []const u8 = "",
+    flags: ApiFlags = .{},
+};
+
+/// Parse `auth [status|<provider>|signout <provider>] [flags...]`.
+pub fn parseAuthArgs(args: []const []const u8) UsageError!AuthArgs {
+    if (args.len == 0) {
+        // Bare `organo auth` defaults to status.
+        return .{ .action = .status };
+    }
+    var out: AuthArgs = .{ .action = .status };
+    // First positional: either an action keyword or a provider name.
+    var i: usize = 0;
+    var positional_seen: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        // Shared API flags.
+        if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-j")) {
+            out.flags.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
+            out.flags.verbose = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--root") or std.mem.eql(u8, a, "-r")) {
+            if (i + 1 >= args.len) return error.BadFlagValue;
+            i += 1;
+            out.flags.root = args[i];
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--root=")) {
+            out.flags.root = a["--root=".len..];
+            if (out.flags.root.len == 0) return error.BadFlagValue;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
+            if (i + 1 >= args.len) return error.BadFlagValue;
+            i += 1;
+            out.flags.port_override = std.fmt.parseInt(u16, args[i], 10) catch return error.BadFlagValue;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--port=")) {
+            const v = a["--port=".len..];
+            out.flags.port_override = std.fmt.parseInt(u16, v, 10) catch return error.BadFlagValue;
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
+
+        // Positionals.
+        if (positional_seen == 0) {
+            if (AuthAction.fromString(a)) |act| {
+                out.action = act;
+            } else {
+                // Treated as a provider name shortcut: `organo auth claude`.
+                out.action = .provider;
+                out.provider_name = a;
+            }
+        } else if (positional_seen == 1) {
+            // Only valid for `signout`.
+            if (out.action != .signout) return error.BadFlagValue;
+            out.provider_name = a;
+        } else {
+            return error.BadFlagValue;
+        }
+        positional_seen += 1;
+    }
+
+    // Validate per-action.
+    switch (out.action) {
+        .status => {},
+        .provider => if (out.provider_name.len == 0) return error.NoSubcommand,
+        .signout => if (out.provider_name.len == 0) return error.NoSubcommand,
+    }
+    return out;
+}
+
 /// Top-level dispatch. `argv` excludes argv[0]. `stdout`/`stderr` are
 /// std.Io.Writer-compatible; in tests we pass an `ArrayList(u8)` writer.
 pub fn dispatch(
@@ -388,7 +494,22 @@ pub fn dispatch(
         .init => return try runInit(allocator, rest, stdout, stderr),
         .daemon => return try runDaemon(allocator, rest, stdout, stderr),
         .stack => return try runStack(allocator, rest, stdout, stderr),
+        .auth => return try runAuth(allocator, rest, stdout, stderr),
     }
+}
+
+fn runAuth(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const parsed = parseAuthArgs(args) catch |e| {
+        try stderr.print("organo auth: {s}\n", .{@errorName(e)});
+        try printAuthUsage(stderr);
+        return 2;
+    };
+    return @import("cli_auth.zig").run(allocator, parsed, stdout, stderr);
 }
 
 fn runDaemon(
@@ -410,6 +531,7 @@ fn runDaemon(
                 .port_override = parsed.port_override,
                 .enable_runtime = true,
                 .dispatch = harness_dispatch.dispatch(),
+                .enable_provider_preflight = true,
             }) catch |e| {
                 try stderr.print("organo daemon start: failed: {s}\n", .{@errorName(e)});
                 return 1;
@@ -545,8 +667,29 @@ fn printUsage(w: anytype) !void {
         \\  init                        Bootstrap a notes-root layout
         \\  daemon, d  start|stop|st    Start/stop/inspect the local daemon
         \\  stack,  s  list|show|cfg    Read stacks via the daemon
+        \\  auth,   a  status|<prov>    Report provider availability + auth state
         \\
         \\Run `organo <subcommand>` with no further args for per-subcommand help.
+        \\
+    );
+}
+
+fn printAuthUsage(w: anytype) !void {
+    try w.writeAll(
+        \\Usage: organo auth|a [status|st|<provider>|signout|out <provider>] [flags...]
+        \\
+        \\Actions:
+        \\  status, st                 Show all providers (default).
+        \\  <provider>                 Show one provider (anthropic|openai|google
+        \\                             or harness aliases claude|codex|gemini).
+        \\  signout, out <provider>    Always fails in v1 — organo doesn't own
+        \\                             provider subscription tokens.
+        \\
+        \\Flags (common to every API subcommand):
+        \\  --json,    -j         Pass the daemon JSON through unchanged.
+        \\  --root,    -r <path>  Notes root for local config/token discovery.
+        \\  --port,    -p <n>     Override the daemon port (also: ORGANO_PORT).
+        \\  --verbose, -v         Show request URL on errors.
         \\
     );
 }
@@ -800,4 +943,51 @@ test "parseStackArgs: add missing kind rejected" {
 
 test "parseStackArgs: supersede missing replacement rejected" {
     try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{ "sup", "demo", "0001" }));
+}
+
+// ---------- auth parser tests (milestone 8) ----------
+
+test "parseAuthArgs: bare auth defaults to status" {
+    const a = try parseAuthArgs(&.{});
+    try std.testing.expectEqual(AuthAction.status, a.action);
+    try std.testing.expectEqualStrings("", a.provider_name);
+}
+
+test "parseAuthArgs: explicit status and short alias" {
+    const a = try parseAuthArgs(&.{"status"});
+    try std.testing.expectEqual(AuthAction.status, a.action);
+    const b = try parseAuthArgs(&.{"st"});
+    try std.testing.expectEqual(AuthAction.status, b.action);
+}
+
+test "parseAuthArgs: provider shortcut" {
+    const a = try parseAuthArgs(&.{"anthropic"});
+    try std.testing.expectEqual(AuthAction.provider, a.action);
+    try std.testing.expectEqualStrings("anthropic", a.provider_name);
+}
+
+test "parseAuthArgs: signout + provider" {
+    const a = try parseAuthArgs(&.{ "signout", "openai" });
+    try std.testing.expectEqual(AuthAction.signout, a.action);
+    try std.testing.expectEqualStrings("openai", a.provider_name);
+    const b = try parseAuthArgs(&.{ "out", "claude" });
+    try std.testing.expectEqual(AuthAction.signout, b.action);
+    try std.testing.expectEqualStrings("claude", b.provider_name);
+}
+
+test "parseAuthArgs: signout without provider rejected" {
+    try std.testing.expectError(error.NoSubcommand, parseAuthArgs(&.{"signout"}));
+}
+
+test "parseAuthArgs: --json flag picked up" {
+    const a = try parseAuthArgs(&.{ "status", "--json" });
+    try std.testing.expect(a.flags.json);
+    const b = try parseAuthArgs(&.{ "-j", "claude" });
+    try std.testing.expect(b.flags.json);
+    try std.testing.expectEqual(AuthAction.provider, b.action);
+}
+
+test "Subcommand: auth and short alias a" {
+    try std.testing.expectEqual(Subcommand.auth, Subcommand.fromString("auth").?);
+    try std.testing.expectEqual(Subcommand.auth, Subcommand.fromString("a").?);
 }

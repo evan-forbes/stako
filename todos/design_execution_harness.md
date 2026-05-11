@@ -46,6 +46,8 @@ Confirmed against current docs (May 2026). These are the exact flags v1 will use
 - **Sessions on disk**: not authoritatively documented; assume opaque.
 - **Quirks**: **important** — some shipped builds may not wire `--output-format`. The daemon runs a capability probe and disables the gemini adapter with a clear status message if the flag is missing. Routing an item to gemini in that state lands it in `blocked` with `harness_unavailable`. Gemini support does not block core Claude/Codex acceptance.
 
+> **M8 update (2026-05-10):** Gemini ended up *deferred* in v1, not just probe-gated. The `gemini` CLI was not present in the reference dev environment when M8 landed, and `--output-format stream-json` could not be empirically verified end-to-end. `harness_dispatch.factory("gemini")` deliberately returns `null` so a gemini-routed item lands in `blocked` with `harness_unavailable` (instead of failing inside a partial adapter). The `provider_status` surface returns the google/gemini record with `available=false` and a stable note ("structured stream-json mode unconfirmed; adapter deferred"). A future milestone can flip this by (a) writing a real `gemini_adapter.zig` that maps the streaming JSON to the normalized schema, (b) updating `harness_dispatch.factory()` to return it, and (c) flipping `available=true` in `provider_status.probeGemini` once a real capability probe passes. Until then, `organo auth status` (and `GET /providers`) is the canonical place users see that gemini is intentionally off.
+
 ## Normalized Event Schema
 
 All three adapters convert their CLI's events into this normalized schema. The daemon emits exactly this schema to SSE and writes exactly this schema to the per-item transcript JSONL.

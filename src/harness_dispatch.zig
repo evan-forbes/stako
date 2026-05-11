@@ -28,10 +28,12 @@ const item_mod = @import("item.zig");
 const claude_adapter = @import("claude_adapter.zig");
 const codex_adapter = @import("codex_adapter.zig");
 const fake_adapter = @import("fake_adapter.zig");
+const provider_status = @import("provider_status.zig");
 
 pub const Names = struct {
     pub const claude: []const u8 = "claude";
     pub const codex: []const u8 = "codex";
+    pub const gemini: []const u8 = "gemini";
     pub const fake: []const u8 = "fake";
 };
 
@@ -42,10 +44,28 @@ pub fn providerToHarness(provider: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, provider, "openai")) return Names.codex;
     if (std.mem.eql(u8, provider, "claude")) return Names.claude;
     if (std.mem.eql(u8, provider, "codex")) return Names.codex;
+    if (std.mem.eql(u8, provider, "google")) return Names.gemini;
+    if (std.mem.eql(u8, provider, "gemini")) return Names.gemini;
+    return null;
+}
+
+/// Inverse mapping: harness name → the canonical provider slug used in
+/// `provider_status` / routing. Returns null for unknown harnesses (e.g.
+/// "fake").
+pub fn harnessToProvider(harness: []const u8) ?provider_status.Provider {
+    if (std.mem.eql(u8, harness, Names.claude)) return .anthropic;
+    if (std.mem.eql(u8, harness, Names.codex)) return .openai;
+    if (std.mem.eql(u8, harness, Names.gemini)) return .google;
     return null;
 }
 
 /// Adapter factory. Returns null when the requested harness is unknown.
+///
+/// M8 NOTE: this is purely "do we know how to build the adapter object";
+/// it does NOT include the binary-presence preflight. The supervisor calls
+/// `provider_status.probe(...)` separately so it can distinguish
+/// "harness wholly unknown" from "binary missing on this machine" and emit
+/// the right canonical reason slug.
 pub fn factory(allocator: std.mem.Allocator, harness: []const u8) anyerror!?adapter_mod.Adapter {
     if (std.mem.eql(u8, harness, Names.claude)) {
         return try claude_adapter.create(allocator);
@@ -54,6 +74,10 @@ pub fn factory(allocator: std.mem.Allocator, harness: []const u8) anyerror!?adap
     } else if (std.mem.eql(u8, harness, Names.fake)) {
         return try fake_adapter.create(allocator);
     }
+    // gemini: deliberately not wired into the factory in v1 — the adapter is
+    // deferred (see `provider_status.zig` and design_execution_harness.md).
+    // Returning null here means the routing preflight blocks gemini-routed
+    // items with `harness_unavailable`.
     return null;
 }
 
@@ -165,7 +189,25 @@ pub fn dispatch() runtime_mod.Dispatch {
 test "providerToHarness: anthropic -> claude, openai -> codex" {
     try std.testing.expectEqualStrings("claude", providerToHarness("anthropic").?);
     try std.testing.expectEqualStrings("codex", providerToHarness("openai").?);
+    try std.testing.expectEqualStrings("gemini", providerToHarness("google").?);
+    try std.testing.expectEqualStrings("gemini", providerToHarness("gemini").?);
     try std.testing.expect(providerToHarness("unknown") == null);
+}
+
+test "harnessToProvider: round-trip through known names" {
+    try std.testing.expectEqual(provider_status.Provider.anthropic, harnessToProvider("claude").?);
+    try std.testing.expectEqual(provider_status.Provider.openai, harnessToProvider("codex").?);
+    try std.testing.expectEqual(provider_status.Provider.google, harnessToProvider("gemini").?);
+    try std.testing.expect(harnessToProvider("fake") == null);
+}
+
+test "factory: gemini harness deliberately deferred (returns null)" {
+    const a = std.testing.allocator;
+    const ad = try factory(a, "gemini");
+    if (ad) |x| {
+        x.deinit(a);
+        return error.UnexpectedAdapter;
+    }
 }
 
 test "factory: claude harness returns a claude adapter" {

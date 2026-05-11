@@ -502,3 +502,118 @@ test "daemon: refuses to start when PID file points to a live process" {
         .ephemeral = false,
     }));
 }
+
+// ---------- milestone 8: provider status endpoints ----------
+
+test "daemon: GET /providers lists anthropic, openai, google" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "providers-list");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /providers HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 200), parsed.status);
+    // Body is a JSON {"providers":[...]} list with the three providers
+    // and their harness mappings.
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"providers\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"provider\":\"anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"provider\":\"openai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"provider\":\"google\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"harness\":\"claude\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"harness\":\"codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"harness\":\"gemini\"") != null);
+}
+
+test "daemon: GET /providers/google marks gemini deferred" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "provider-google");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /providers/google HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 200), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"provider\":\"google\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"available\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"blocked_reason\":\"harness_unavailable\"") != null);
+}
+
+test "daemon: GET /providers/gemini harness-alias path resolves" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "provider-gemini-alias");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /providers/gemini HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 200), parsed.status);
+    // Returns the google provider record (gemini is the harness name).
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"provider\":\"google\"") != null);
+}
+
+test "daemon: GET /providers/anthropic surfaces signed_in/signed_out fields" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "provider-anthropic");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /providers/anthropic HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 200), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"provider\":\"anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"harness\":\"claude\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"credential_env\":\"ANTHROPIC_API_KEY\"") != null);
+    // Either signed_in or signed_out — both are fine; we only require the
+    // field to be present.
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"auth\":\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"login_hint\":\"") != null);
+}
+
+test "daemon: GET /providers/bogus returns 404" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "provider-404");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /providers/bogus HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 404), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"code\":\"not_found\"") != null);
+}
+
+test "daemon: GET /providers is a read endpoint (no auth required)" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "providers-noauth");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    // No Authorization header.
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /providers HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 200), parsed.status);
+}

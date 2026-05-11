@@ -488,3 +488,101 @@ test "cli (subprocess): organo stack list against a live daemon" {
     }
     try std.testing.expect(std.mem.indexOf(u8, result.stdout, "demo") != null);
 }
+
+// ---------- milestone 8: auth subcommand ----------
+
+test "cli: auth status renders header + every provider row" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-status");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r = try runCli(a, &.{ "auth", "status", "--root", s.abs_path });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    // Header row.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "PROVIDER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "HARNESS") != null);
+    // One row per provider (substring match).
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "anthropic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "openai") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "google") != null);
+}
+
+test "cli: auth a st short alias matches canonical" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-short");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r = try runCli(a, &.{ "a", "st", "--root", s.abs_path });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "anthropic") != null);
+}
+
+test "cli: auth <provider> renders single-provider detail" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-one");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r = try runCli(a, &.{ "auth", "google", "--root", s.abs_path });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "provider:        google") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "harness:       gemini") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "available:     false") != null);
+}
+
+test "cli: auth status --json passes daemon body through unchanged" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-json");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r = try runCli(a, &.{ "auth", "status", "--root", s.abs_path, "-j" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "\"providers\":[") != null);
+    // No human header in JSON mode.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "PROVIDER\n") == null);
+}
+
+test "cli: auth signout always exits non-zero with helpful note" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-signout");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    // No serve() — signout never hits the daemon.
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r = try runCli(a, &.{ "auth", "signout", "anthropic", "--root", s.abs_path });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 1), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "signout not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "anthropic") != null);
+}

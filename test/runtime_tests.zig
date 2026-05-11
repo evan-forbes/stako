@@ -1113,3 +1113,158 @@ test "runtime: daemon-owned supervisor drives a seeded item to completed without
         return error.RuntimeFileShouldBeAbsent;
     }
 }
+
+// ---------- milestone 8: provider preflight integration ----------
+
+test "m8 routing: gemini-routed item blocks with harness_unavailable when preflight enabled" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "gemini-preflight");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    // Stack allows gemini explicitly; the item targets google. With
+    // `enable_provider_preflight=true`, the supervisor consults
+    // provider_status which marks gemini deferred → harness_unavailable.
+    const dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "demo" });
+    defer a.free(dir);
+    try std.fs.cwd().makePath(dir);
+    {
+        const cfg = try std.fs.path.join(a, &.{ dir, "stack.toml" });
+        defer a.free(cfg);
+        var f = try std.fs.cwd().createFile(cfg, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\description = "gemini test"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\paused = false
+            \\continuity = "fresh"
+            \\max_concurrent_per_stack = 1
+            \\allowed_harnesses = ["gemini"]
+            \\
+        );
+    }
+    const body =
+        \\id = "0001"
+        \\slug = "hi"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\provider = "google"
+        \\match = "exact"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "hi", body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = runtime_mod.fakeDispatch(),
+        .enable_provider_preflight = true,
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-hi/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "blocked_reason = \"harness_unavailable\"") != null);
+}
+
+test "m8 routing: preflight disabled allows the fake-harness path to run as before" {
+    // Regression guard: M6/M7 tests that wire scripted dispatch with
+    // `enable_provider_preflight=false` (the default) must keep working
+    // even when the routed harness is one of the known providers. This
+    // exercises the same harness name as the M7 tests use through
+    // factoryProd, but with the fake dispatch and preflight off.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "preflight-off");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    const dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "demo" });
+    defer a.free(dir);
+    try std.fs.cwd().makePath(dir);
+    {
+        const cfg = try std.fs.path.join(a, &.{ dir, "stack.toml" });
+        defer a.free(cfg);
+        var f = try std.fs.cwd().createFile(cfg, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\description = "preflight off"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\paused = false
+            \\continuity = "fresh"
+            \\max_concurrent_per_stack = 1
+            \\allowed_harnesses = ["claude"]
+            \\
+        );
+    }
+    const body =
+        \\id = "0001"
+        \\slug = "hi"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\provider = "anthropic"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "hi", body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    // Note: fakeDispatch's factory returns a fake adapter for any
+    // harness name, including "claude". With preflight OFF we should
+    // see the item dispatch (and complete, since `/usr/bin/true` exits
+    // with status 0 and our fake adapter emits no events but reports
+    // session_ended.completed).
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = runtime_mod.fakeDispatch(),
+        .enable_provider_preflight = false,
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-hi/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    // The item should NOT be blocked (preflight is off). It should have
+    // transitioned to running (and may now be either running or
+    // completed depending on scheduling — both are acceptable as long
+    // as it isn't `blocked`).
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") == null);
+}
