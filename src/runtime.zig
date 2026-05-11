@@ -16,6 +16,7 @@ const audit = @import("audit.zig");
 const sse_mod = @import("sse.zig");
 const adapter_mod = @import("adapter.zig");
 const fake_adapter = @import("fake_adapter.zig");
+const harness_dispatch = @import("harness_dispatch.zig");
 const runtime_file = @import("runtime_file.zig");
 
 pub const AdapterFactory = *const fn (allocator: std.mem.Allocator, harness: []const u8) anyerror!?adapter_mod.Adapter;
@@ -258,12 +259,44 @@ pub const Supervisor = struct {
     };
 
     fn routingPreflight(self: *Supervisor, cfg: *const stack_config.StackConfig, item: *const item_mod.Item) !PreflightDecision {
-        // Resolve harness. v1: route to the first allowed harness on the
-        // stack, or to `fake` when no allowlist is set (test-friendly).
+        // Resolve harness.
+        //
+        // v1 routing precedence:
+        //   1. `item.target.provider` is mapped to a harness name (e.g.
+        //      "anthropic" → "claude", "openai" → "codex"). If that name
+        //      is in `allowed_harnesses` (or no allowlist is set), it
+        //      wins.
+        //   2. Otherwise, the first allowed harness on the stack is used.
+        //   3. Otherwise (no allowlist), default to "fake" (test-friendly).
+        //
+        // An empty allowlist (`[]`) always blocks with `harness_denied`,
+        // matching the M6 contract.
         var harness_name: []const u8 = "fake";
         if (cfg.allowed_harnesses) |list| {
             if (list.len == 0) return .{ .blocked = "harness_denied" };
             harness_name = list[0];
+        }
+        // Item-level provider preference.
+        if (item.target) |t| {
+            if (t.provider) |p| {
+                if (harness_dispatch.providerToHarness(p)) |mapped| {
+                    if (cfg.allowed_harnesses) |list| {
+                        var ok = false;
+                        for (list) |h| if (std.mem.eql(u8, h, mapped)) {
+                            ok = true;
+                            break;
+                        };
+                        if (ok) harness_name = mapped else {
+                            // Item asked for a specific provider but the
+                            // stack denies it. Block, don't silently fall
+                            // back to a different harness.
+                            return .{ .blocked = "harness_denied" };
+                        }
+                    } else {
+                        harness_name = mapped;
+                    }
+                }
+            }
         }
         // Stack-level allowed_harnesses check (redundant with the above for
         // v1; explicit so future per-item harness override has a hook).

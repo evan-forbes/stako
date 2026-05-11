@@ -23,6 +23,7 @@ const std = @import("std");
 const init_mod = @import("init.zig");
 const daemon_mod = @import("daemon.zig");
 const cli_stack = @import("cli_stack.zig");
+const harness_dispatch = @import("harness_dispatch.zig");
 
 pub const UsageError = error{
     NoSubcommand,
@@ -408,6 +409,7 @@ fn runDaemon(
                 .notes_root = parsed.root,
                 .port_override = parsed.port_override,
                 .enable_runtime = true,
+                .dispatch = harness_dispatch.dispatch(),
             }) catch |e| {
                 try stderr.print("organo daemon start: failed: {s}\n", .{@errorName(e)});
                 return 1;
