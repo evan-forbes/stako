@@ -407,13 +407,15 @@ fn runDaemon(
             var d = daemon_mod.start(allocator, .{
                 .notes_root = parsed.root,
                 .port_override = parsed.port_override,
+                .enable_runtime = true,
             }) catch |e| {
                 try stderr.print("organo daemon start: failed: {s}\n", .{@errorName(e)});
                 return 1;
             };
             defer d.deinit();
-            // Mutations come up here: spawn the queue worker now that `d`
-            // has a stable address.
+            // Mutations + the runtime supervisor come up here, now that
+            // `d` has a stable address (workers hold a pointer back to
+            // the heap-allocated supervisor and the queue audit_writer).
             d.startWorker() catch |e| {
                 try stderr.print("organo daemon start: failed to start mutation worker: {s}\n", .{@errorName(e)});
                 return 1;

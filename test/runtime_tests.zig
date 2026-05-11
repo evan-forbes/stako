@@ -1006,3 +1006,110 @@ test "daemon SSE endpoint: when wired, streams a published event" {
     // Close client; the daemon thread will shut us down on deinit.
     stream.close();
 }
+
+test "runtime: daemon-owned supervisor drives a seeded item to completed without tickStack" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "daemon-driven");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    // Seed a stack + queued prompt item BEFORE starting the daemon, so
+    // the supervisor's first poll picks the item up on its own.
+    try seedStack(a, s.abs_path, "demo", false);
+    const item_body =
+        \\id = "0001"
+        \\slug = "hello"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "hello", item_body);
+
+    // Wire the test-side fake-cat dispatch so the harness produces a
+    // deterministic transcript.
+    const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
+    defer a.free(fixture);
+    const script = try absFixturePath(a, "harness/cat_jsonl.sh");
+    defer a.free(script);
+    const cs = CatScript{ .fixture_abs = fixture, .script_abs = script };
+    GLOBAL_CAT_SCRIPT = &cs;
+    defer GLOBAL_CAT_SCRIPT = null;
+
+    // Start the daemon with the runtime supervisor enabled. Per the M5
+    // contract, startWorker is called AFTER the daemon is at its final
+    // address; the supervisor depends on the same invariant.
+    var d = try daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .enable_runtime = true,
+        .dispatch = fakeDispatchCat(),
+    });
+    defer d.deinit();
+    try d.startWorker();
+
+    // Background-serve so /healthz stays available; we never hit any
+    // mutation endpoint in this test.
+    const ServeCtx = struct {
+        d: *daemon_mod.Daemon,
+    };
+    const serveFn = struct {
+        fn run(ctx: *ServeCtx) void {
+            // serveUntilShutdown returns when the daemon is asked to stop.
+            daemon_mod.serveUntilShutdown(ctx.d) catch {};
+        }
+    }.run;
+    var sc = ServeCtx{ .d = &d };
+    const th = try std.Thread.spawn(.{}, serveFn, .{&sc});
+    defer {
+        d.requestShutdown();
+        th.join();
+    }
+
+    // Wait until the item reaches `completed`, with a tight wall-clock
+    // cap (5s). Polling the meta.toml is cheap and avoids any need to
+    // call `tickStack` from the test.
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-hello/meta.toml" });
+    defer a.free(meta_path);
+
+    const deadline_ms: i64 = std.time.milliTimestamp() + 5000;
+    var saw_completed = false;
+    while (std.time.milliTimestamp() < deadline_ms) {
+        var mf = std.fs.cwd().openFile(meta_path, .{}) catch {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        defer mf.close();
+        const mstat = try mf.stat();
+        const mbuf = try a.alloc(u8, mstat.size);
+        defer a.free(mbuf);
+        _ = try mf.readAll(mbuf);
+        if (std.mem.indexOf(u8, mbuf, "status = \"completed\"") != null) {
+            saw_completed = true;
+            break;
+        }
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(saw_completed);
+
+    // Transcript was written by the daemon-owned session manager.
+    const item_dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-hello" });
+    defer a.free(item_dir);
+    const t_buf = try fake.readTranscript(a, item_dir);
+    defer a.free(t_buf);
+    try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"kind\":\"session_ended\"") != null);
+
+    // Runtime file was cleaned up.
+    const rp = try runtime_file.read(a, s.abs_path, "demo", "0001");
+    if (rp) |p| {
+        var pp = p;
+        defer pp.deinit();
+        return error.RuntimeFileShouldBeAbsent;
+    }
+}

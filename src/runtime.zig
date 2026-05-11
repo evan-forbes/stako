@@ -127,6 +127,33 @@ pub const Supervisor = struct {
         return w;
     }
 
+    /// Discover every stack under `<notes_root>/stacks/` and start a
+    /// worker thread for each. Idempotent. Used by the daemon at startup
+    /// to bring the runtime online after the audit writer + mutation
+    /// queue have stable addresses.
+    pub fn startAllWorkers(self: *Supervisor) !void {
+        var reader = try storage.Reader.init(self.allocator, self.opts.notes_root_abs);
+        defer reader.deinit();
+        const names = try reader.listStacks();
+        defer reader.freeStackList(names);
+        for (names) |n| {
+            const w = try self.ensureWorker(n);
+            try w.start();
+        }
+    }
+
+    /// Wake every worker so the next iteration picks up newly mutated
+    /// state. Cheap; the daemon calls this after each accepted mutation
+    /// so users don't have to wait for the poll interval to elapse.
+    pub fn wakeAllWorkers(self: *Supervisor) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var it = self.workers.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.wake();
+        }
+    }
+
     /// Run one tick on `stack_name`. Walks the items list in id order,
     /// applies routing preflight, and dispatches eligible items through
     /// the session manager.
@@ -335,6 +362,11 @@ pub const Worker = struct {
     wake_pending: bool = false,
     shutdown: bool = false,
     thread: ?std.Thread = null,
+    /// Poll interval when idle. The worker re-ticks at this cadence so
+    /// items appended via the mutation queue (which doesn't yet wake
+    /// workers explicitly) make forward progress. Tests can override by
+    /// calling `wake()` to drive a tick immediately.
+    poll_interval_ns: u64 = 100 * std.time.ns_per_ms,
 
     pub fn deinit(self: *Worker) void {
         self.requestShutdown();
@@ -361,14 +393,21 @@ pub const Worker = struct {
 
     pub fn start(self: *Worker) !void {
         if (self.thread != null) return;
+        // Prime an initial tick so a stack that already has work picks it
+        // up without waiting for the first poll interval.
+        self.wake_pending = true;
         self.thread = try std.Thread.spawn(.{}, workerMain, .{self});
     }
 
     fn workerMain(self: *Worker) void {
         while (true) {
             self.mutex.lock();
+            // Wait until either: shutdown, a wake, or the poll interval
+            // elapses. The timed wait keeps the worker live for items
+            // added via the mutation queue (which doesn't yet wake us
+            // directly).
             while (!self.wake_pending and !self.shutdown) {
-                self.cv.wait(&self.mutex);
+                self.cv.timedWait(&self.mutex, self.poll_interval_ns) catch break;
             }
             if (self.shutdown) {
                 self.mutex.unlock();

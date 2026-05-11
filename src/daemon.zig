@@ -28,6 +28,7 @@ const vcs = @import("vcs.zig");
 const mutations_mod = @import("mutations.zig");
 const mutation_queue = @import("mutation_queue.zig");
 const sse_mod = @import("sse.zig");
+const runtime_mod = @import("runtime.zig");
 
 pub const StartOptions = struct {
     /// Notes-root directory (path; resolved internally).
@@ -44,6 +45,19 @@ pub const StartOptions = struct {
     /// When true, daemon startup runs `vcs.assertNoMergeConflicts`. Tests
     /// that don't initialise a real repo can opt out.
     check_repo_conflicts: bool = true,
+    /// When true, `startWorker` constructs a runtime `Supervisor`, reconciles
+    /// any restart-orphan runtime files, owns an SSE `Hub`, and starts a
+    /// per-stack `Worker` for every stack discovered under
+    /// `<notes-root>/stacks/`. Defaults to false so milestone-3/5 tests that
+    /// drive only the HTTP read/write surface aren't affected.
+    enable_runtime: bool = false,
+    /// Harness dispatch used by the supervisor. Only meaningful when
+    /// `enable_runtime` is true. Defaults to the fake adapter; M7 wires
+    /// real Claude/Codex factories.
+    dispatch: ?runtime_mod.Dispatch = null,
+    /// Global concurrency cap passed to the session manager. Ignored when
+    /// `enable_runtime` is false.
+    max_concurrent_total: usize = 8,
 };
 
 pub const StartError = error{
@@ -96,16 +110,40 @@ pub const Daemon = struct {
     /// in. In M6, exposed so tests can publish events independently of a
     /// real runtime.
     sse_hub: ?*sse_mod.Hub = null,
+    /// Heap-allocated hub owned by the daemon when `enable_runtime` is on.
+    /// The supervisor and SSE handlers borrow it via `sse_hub`.
+    sse_hub_owned: ?*sse_mod.Hub = null,
+    /// Heap-allocated runtime supervisor owned by the daemon. Per-stack
+    /// `Worker` threads point back to this address, so the supervisor must
+    /// live on the heap (moving a Daemon-by-value would dangle them).
+    /// Constructed in `startWorker` when `enable_runtime` is on.
+    supervisor: ?*runtime_mod.Supervisor = null,
 
     /// Long-lived SSE connection threads. Tracked so `deinit` can join.
     sse_threads_mu: std.Thread.Mutex = .{},
     sse_threads: std.ArrayList(std.Thread) = .{},
     /// SSE socket handles, for forced shutdown at daemon stop.
     sse_handles: std.ArrayList(std.posix.socket_t) = .{},
+    /// Saved at start, used by `startWorker` to construct the supervisor.
+    runtime_enabled: bool = false,
+    runtime_dispatch: ?runtime_mod.Dispatch = null,
+    runtime_max_concurrent_total: usize = 8,
 
     pub fn deinit(self: *Daemon) void {
-        // Tear down the queue first so the worker thread joins before we
-        // close the audit writer it borrows.
+        // Tear-down order matters:
+        //   1. Supervisor (joins worker threads and the session manager;
+        //      sessions submit terminal transitions through the queue so
+        //      the queue must still be alive at this point).
+        //   2. Mutation queue (joins its worker thread).
+        //   3. SSE connection threads (the hub still publishes through the
+        //      session manager, so we wait until after step 1 to close
+        //      their sockets).
+        //   4. Hub, then audit writer, server, etc.
+        if (self.supervisor) |sup| {
+            sup.deinit();
+            self.allocator.destroy(sup);
+            self.supervisor = null;
+        }
         self.queue.deinit();
         // Force-close every live SSE connection so its worker thread
         // returns from `stream.read`, then drain.
@@ -120,6 +158,13 @@ pub const Daemon = struct {
         self.sse_threads.deinit(self.allocator);
         self.sse_handles.deinit(self.allocator);
         self.sse_threads_mu.unlock();
+        if (self.sse_hub_owned) |h| {
+            h.deinit();
+            self.allocator.destroy(h);
+            self.sse_hub_owned = null;
+            // sse_hub is a borrow; clear it so stale reads can't happen.
+            self.sse_hub = null;
+        }
         self.audit_writer.deinit();
         self.server.deinit();
         self.allocator.free(self.token.bytes);
@@ -140,6 +185,11 @@ pub const Daemon = struct {
 
     pub fn requestShutdown(self: *Daemon) void {
         self.shutdown_requested.store(true, .seq_cst);
+        // Ask the runtime to stop pumping work. The supervisor signals
+        // every worker and its session manager, but does NOT join them
+        // here — joining happens in deinit so callers can drain ongoing
+        // requests gracefully.
+        if (self.supervisor) |sup| sup.requestShutdown();
         // Close the listening socket so the blocked accept() in
         // `serveUntilShutdown` returns immediately. The server struct is left
         // in an unusable state, which is fine because we are shutting down.
@@ -159,9 +209,50 @@ pub const Daemon = struct {
     /// audit event. Must be called AFTER the caller has stored the returned
     /// `Daemon` at its final address — the queue worker holds a pointer to
     /// `daemon.audit_writer`, so moving the Daemon after this point is UB.
+    ///
+    /// When `enable_runtime` was requested at `start()` time, this also
+    /// constructs the runtime `Supervisor`, runs the restart-orphan sweep,
+    /// owns a fresh SSE `Hub`, and starts one `Worker` thread per stack
+    /// discovered under `<notes-root>/stacks/`. The supervisor borrows the
+    /// daemon's audit writer + queue, so it depends on this same
+    /// final-address contract.
     pub fn startWorker(self: *Daemon) !void {
         self.queue.audit_writer = &self.audit_writer;
         try self.queue.start();
+        if (self.runtime_enabled) {
+            // Own an SSE Hub the supervisor + handlers share.
+            const hub_p = try self.allocator.create(sse_mod.Hub);
+            hub_p.* = sse_mod.Hub.init(self.allocator);
+            self.sse_hub_owned = hub_p;
+            self.sse_hub = hub_p;
+            errdefer {
+                hub_p.deinit();
+                self.allocator.destroy(hub_p);
+                self.sse_hub_owned = null;
+                self.sse_hub = null;
+            }
+
+            const dispatch = self.runtime_dispatch orelse runtime_mod.fakeDispatch();
+            const sup_p = try self.allocator.create(runtime_mod.Supervisor);
+            sup_p.* = runtime_mod.Supervisor.init(self.allocator, .{
+                .notes_root_abs = self.notes_root_abs,
+                .queue = &self.queue,
+                .audit_writer = &self.audit_writer,
+                .hub = hub_p,
+                .dispatch = dispatch,
+                .max_concurrent_total = self.runtime_max_concurrent_total,
+            });
+            errdefer {
+                sup_p.deinit();
+                self.allocator.destroy(sup_p);
+            }
+            self.supervisor = sup_p;
+            // Restart-sweep before any worker thread starts so we never
+            // race with the supervisor's own ticking over a stale runtime
+            // file (per design step 10).
+            sup_p.reconcileOrphans() catch {};
+            try sup_p.startAllWorkers();
+        }
         self.audit_writer.append(.{
             .identity = "system",
             .action = .daemon_started,
@@ -247,6 +338,9 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
         .audit_writer = audit_writer,
         .queue = queue,
         .enable_git = opts.enable_git,
+        .runtime_enabled = opts.enable_runtime,
+        .runtime_dispatch = opts.dispatch,
+        .runtime_max_concurrent_total = opts.max_concurrent_total,
     };
     d.logLine("[{d}] daemon started on 127.0.0.1:{d}", .{ std.time.timestamp(), bound_port });
     return d;
