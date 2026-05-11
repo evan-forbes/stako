@@ -31,6 +31,7 @@ const sse_mod = @import("sse.zig");
 const runtime_mod = @import("runtime.zig");
 const provider_status = @import("provider_status.zig");
 const html = @import("html.zig");
+const policy = @import("policy.zig");
 
 pub const StartOptions = struct {
     /// Notes-root directory (path; resolved internally).
@@ -250,6 +251,8 @@ pub const Daemon = struct {
                 .dispatch = dispatch,
                 .max_concurrent_total = self.runtime_max_concurrent_total,
                 .enable_provider_preflight = self.runtime_enable_provider_preflight,
+                .policy_check_provider = runtimePolicyCheck,
+                .policy_check_ctx = @ptrCast(self),
             });
             errdefer {
                 sup_p.deinit();
@@ -561,6 +564,24 @@ fn isMutationRoute(r: Route) bool {
     };
 }
 
+/// Map a mutation route to the `policy.Action` that gates it. Returns
+/// `null` for non-mutation routes (the caller short-circuits before the
+/// policy check anyway). Keep in lockstep with `isMutationRoute`.
+fn routeToPolicyAction(r: Route) ?policy.Action {
+    return switch (r) {
+        .stacks_create => .create_stack,
+        .stack_config_post => .update_stack_config,
+        .items_append => .append_item,
+        .item_insert => .insert_item,
+        .item_retry => .retry_item,
+        .item_cancel => .cancel_item,
+        .item_supersede => .supersede_item,
+        .stack_pause => .pause_stack,
+        .stack_resume => .resume_stack,
+        else => null,
+    };
+}
+
 /// New entry point introduced for SSE: same as `route` but threads through
 /// the connection-ownership flag so the SSE handler can detach.
 fn routeWithOwnership(self: *Daemon, req: *std.http.Server.Request, conn: std.net.Server.Connection, conn_owned: *bool) !void {
@@ -612,15 +633,65 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
                     try respondError(req, .validation_failed, "request body too large", &.{});
                     return;
                 }
+                // Audit the denial: missing identity assertion.
+                auditDenied(self, "(anonymous)", policyActionToAudit(routeToPolicyAction(m.route) orelse .append_item), m.stack, m.item, "identity_required");
                 try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
                 return;
             };
             if (form_attempt) |fb| {
                 form_body = fb;
             } else {
+                auditDenied(self, "(anonymous)", policyActionToAudit(routeToPolicyAction(m.route) orelse .append_item), m.stack, m.item, "identity_required");
                 try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
                 return;
             }
+        }
+        // Capability policy. The token has verified — the local-bearer-token
+        // path resolves to identity "local". When `[identity.local]` is not
+        // declared, the policy grants `*` (backwards-compat with M3–M9).
+        const id = policy.resolveLocal(&self.config);
+        const action = routeToPolicyAction(m.route).?;
+        const target: policy.Target = switch (action) {
+            .create_stack => .{ .stack_create = m.stack },
+            else => .{ .stack = m.stack },
+        };
+        const decision = policy.evaluate(id, action, target);
+        switch (decision) {
+            .allow => {},
+            .identity_required => unreachable, // already handled above
+            .capability_denied => {
+                auditDenied(self, id.name, policyActionToAudit(action), m.stack, m.item, "capability_denied");
+                // Compute the canonical slug here for the error body. The
+                // `policy.evaluate` decision intentionally doesn't return
+                // one (any natural composition would dangle when the
+                // function returns), so the caller renders it.
+                var cap_buf: [256]u8 = undefined;
+                const cap_slug: []const u8 = blk: {
+                    switch (action) {
+                        .create_stack => break :blk "stack.create",
+                        .append_item, .insert_item, .retry_item, .cancel_item, .supersede_item, .pause_stack, .resume_stack, .update_stack_config => {
+                            const verb: []const u8 = switch (action) {
+                                .append_item => "append",
+                                .insert_item => "insert",
+                                .retry_item => "retry",
+                                .cancel_item => "cancel",
+                                .supersede_item => "supersede",
+                                .pause_stack => "pause",
+                                .resume_stack => "resume",
+                                .update_stack_config => "config",
+                                else => unreachable,
+                            };
+                            break :blk std.fmt.bufPrint(&cap_buf, "stack.{s}.{s}", .{ m.stack, verb }) catch "stack.?.?";
+                        },
+                        .dispatch_harness => break :blk "provider.?",
+                    }
+                };
+                try respondError(req, .capability_denied, "identity lacks required capability", &.{
+                    .{ .key = "identity", .value = id.name },
+                    .{ .key = "capability", .value = cap_slug },
+                });
+                return;
+            },
         }
     }
 
@@ -777,6 +848,65 @@ fn hexNibble(c: u8) ?u8 {
         'A'...'F' => c - 'A' + 10,
         else => null,
     };
+}
+
+/// Policy callback handed to the runtime supervisor: gates harness
+/// dispatch by checking the local identity's `provider.<slug>` capability.
+/// In v1 the only mutator is `local`; once items carry a `created_by`
+/// identity field this callback grows that lookup.
+fn runtimePolicyCheck(ctx: ?*anyopaque, provider_slug: []const u8) bool {
+    const self_any = ctx orelse return true;
+    const self: *Daemon = @ptrCast(@alignCast(self_any));
+    const id = policy.resolveLocal(&self.config);
+    const decision = policy.evaluate(id, .dispatch_harness, .{ .provider = provider_slug });
+    return decision == .allow;
+}
+
+/// Translate a `policy.Action` to the matching `audit.Action` so denied
+/// requests record the same vocabulary as allowed ones.
+fn policyActionToAudit(a: policy.Action) audit.Action {
+    return switch (a) {
+        .create_stack => .create_stack,
+        .append_item => .append_item,
+        .insert_item => .insert_item,
+        .retry_item => .retry_item,
+        .cancel_item => .cancel_item,
+        .supersede_item => .supersede_item,
+        .pause_stack => .pause_stack,
+        .resume_stack => .resume_stack,
+        .update_stack_config => .update_stack_config,
+        .dispatch_harness => .dispatch_harness,
+    };
+}
+
+/// Append a single denial line to the audit log. Best-effort: failures
+/// here never propagate because they'd convert a 401/403 into a 500.
+fn auditDenied(
+    self: *Daemon,
+    identity: []const u8,
+    action: audit.Action,
+    stack: []const u8,
+    item: []const u8,
+    reason: []const u8,
+) void {
+    // Build a target string. Same convention as `mutations.zig`:
+    //   `stack/<name>` for stack-scoped actions, `stack/<name>/item/<id>`
+    //   for item-scoped actions, `daemon` for no-context calls.
+    var target_buf: [256]u8 = undefined;
+    const target: []const u8 = blk: {
+        if (stack.len == 0) break :blk "daemon";
+        if (item.len == 0) {
+            break :blk std.fmt.bufPrint(&target_buf, "stack/{s}", .{stack}) catch "daemon";
+        }
+        break :blk std.fmt.bufPrint(&target_buf, "stack/{s}/item/{s}", .{ stack, item }) catch "daemon";
+    };
+    self.audit_writer.append(.{
+        .identity = identity,
+        .action = action,
+        .target = target,
+        .outcome = .denied,
+        .reason = reason,
+    }) catch {};
 }
 
 fn verifyAuth(self: *Daemon, req: *std.http.Server.Request) bool {

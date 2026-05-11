@@ -1,0 +1,383 @@
+//! Capability policy evaluator (milestone 10).
+//!
+//! Resolves `(identity, action, target) -> allow | deny(reason)` for every
+//! sensitive daemon action. See `todos/design_authorization.md` for the
+//! motivation and `todos/design_errors_and_audit.md` for the failure
+//! vocabulary (`identity_required` 401, `capability_denied` 403).
+//!
+//! ## Capability slug schema
+//!
+//! - `*` — wildcard, all actions allowed (typical local-user default).
+//! - `stack.create` — create new stacks.
+//! - `stack.<name>.<verb>` — per-stack action where `<verb>` ∈
+//!   `append`, `insert`, `retry`, `cancel`, `supersede`, `pause`, `resume`,
+//!   `config`. The name may be `*` (any stack). The verb may be `*`
+//!   (any verb on the named stack).
+//! - `provider.<name>` — dispatch through a provider; `<name>` ∈
+//!   `anthropic`, `openai`, `google`. The name may be `*` (any provider).
+//!
+//! Unknown slugs are ignored (forward-compat: new capabilities can ship
+//! without breaking older daemons that haven't learned them yet, since
+//! the policy is allow-list semantics — an unknown grant simply doesn't
+//! match anything).
+//!
+//! ## Identity model
+//!
+//! Identities are declared as `[identity.<name>]` tables in
+//! `.organo/config.toml` (or `config.local.toml`). The `capabilities`
+//! array is the only field that matters for the policy evaluator.
+//!
+//! The local mutation token (`.organo/local_token`) always resolves to
+//! the `local` identity. If the user has not declared `[identity.local]`
+//! in their config files, the policy defaults to full access (`*`) so
+//! the v1 single-user flow keeps working without ceremony. Once a user
+//! *does* declare `[identity.local]`, their list is authoritative — they
+//! get exactly the capabilities they wrote, no implicit `*`.
+//!
+//! Future MCP/scheduled-job identities follow the same pattern: declare
+//! the table, list the capabilities, present the matching credential
+//! (out of scope for v1 — only the local token is wired).
+//!
+//! ## Out of scope (per the plan)
+//!
+//! - MCP transport layer.
+//! - Container isolation.
+//! - Capability inference from prompt content.
+//! - Time-bound capabilities.
+
+const std = @import("std");
+const config_mod = @import("config.zig");
+
+/// Sensitive actions the policy evaluator gates. Matches the audit action
+/// vocabulary so denials and allowances share one set of slugs.
+pub const Action = enum {
+    create_stack,
+    append_item,
+    insert_item,
+    retry_item,
+    cancel_item,
+    supersede_item,
+    pause_stack,
+    resume_stack,
+    update_stack_config,
+    /// A harness/provider dispatch attempt; gated by `provider.<name>`.
+    dispatch_harness,
+
+    pub fn slug(self: Action) []const u8 {
+        return switch (self) {
+            .create_stack => "create_stack",
+            .append_item => "append_item",
+            .insert_item => "insert_item",
+            .retry_item => "retry_item",
+            .cancel_item => "cancel_item",
+            .supersede_item => "supersede_item",
+            .pause_stack => "pause_stack",
+            .resume_stack => "resume_stack",
+            .update_stack_config => "update_stack_config",
+            .dispatch_harness => "dispatch_harness",
+        };
+    }
+
+    /// The stack-action "verb" portion of a capability slug
+    /// (`stack.<name>.<verb>`). Not applicable to `create_stack` or
+    /// `dispatch_harness`.
+    fn stackVerb(self: Action) ?[]const u8 {
+        return switch (self) {
+            .append_item => "append",
+            .insert_item => "insert",
+            .retry_item => "retry",
+            .cancel_item => "cancel",
+            .supersede_item => "supersede",
+            .pause_stack => "pause",
+            .resume_stack => "resume",
+            .update_stack_config => "config",
+            .create_stack, .dispatch_harness => null,
+        };
+    }
+};
+
+/// Target descriptor. Different actions look at different fields; the
+/// evaluator picks the right subset.
+pub const Target = union(enum) {
+    /// `create_stack` target: the new stack name.
+    stack_create: []const u8,
+    /// Per-stack mutation target.
+    stack: []const u8,
+    /// Per-provider dispatch target. The provider slug must be one of
+    /// `anthropic`, `openai`, `google` (or `*` to match any).
+    provider: []const u8,
+};
+
+pub const Decision = union(enum) {
+    allow: void,
+    /// `identity_required` (401) — no identity resolved at all.
+    identity_required: void,
+    /// `capability_denied` (403) — identity resolved but lacks the cap.
+    /// The caller computes the human-friendly slug for the error
+    /// response; the evaluator does not return a slice because the
+    /// natural way to compose one (`std.fmt.bufPrint` on a stack
+    /// buffer) would dangle the moment `evaluate` returns.
+    capability_denied: void,
+};
+
+/// Resolve an asserted identity name + verify the supplied credential.
+///
+/// In v1 the daemon only accepts the local mutation token, which always
+/// resolves to the `local` identity. Future MCP/scheduled flows extend
+/// this function with their own identity → credential lookup.
+pub const IdentityResolution = struct {
+    /// Resolved identity name. `"local"` for the loopback user.
+    name: []const u8,
+    /// Whether the user declared `[identity.local]` themselves. When
+    /// false (the default), the policy evaluator grants full access for
+    /// backwards-compat with the milestone-3 single-token mechanism.
+    explicitly_declared: bool,
+    /// The identity entry from config, if declared. Borrowed; same
+    /// lifetime as the `Config` it came from.
+    entry: ?*const config_mod.Identity,
+};
+
+/// Resolve the local-bearer-token credential to the `local` identity.
+/// Always returns `local` — the token is the only v1 authenticator. The
+/// caller is expected to have already verified the token against
+/// `local_token.Token.verify` before reaching this function.
+pub fn resolveLocal(cfg: *const config_mod.Config) IdentityResolution {
+    if (cfg.findIdentity("local")) |e| {
+        return .{ .name = "local", .explicitly_declared = true, .entry = e };
+    }
+    return .{ .name = "local", .explicitly_declared = false, .entry = null };
+}
+
+/// Evaluate the policy. The `identity` may be `null`, in which case the
+/// decision is `identity_required` — the caller renders that as HTTP 401
+/// and an audit-log denial entry.
+pub fn evaluate(
+    identity: ?IdentityResolution,
+    action: Action,
+    target: Target,
+) Decision {
+    const id = identity orelse return .{ .identity_required = {} };
+
+    // Backwards-compat: the local identity, when not explicitly declared
+    // in config, retains full access. Existing milestone-3..9 deployments
+    // never wrote `[identity.local]`; their behavior must not regress.
+    if (!id.explicitly_declared) return .{ .allow = {} };
+
+    const caps = if (id.entry) |e| (e.capabilities orelse &.{}) else &.{};
+
+    // The capability slugs we're looking to match. For `create_stack`
+    // the probe is fixed; for stack verbs we iterate the four
+    // specificity tiers; for `dispatch_harness` we iterate three.
+    var probe_buf: [4][]const u8 = undefined;
+    var probes: []const []const u8 = &.{};
+
+    var stack_specific_buf: [128]u8 = undefined;
+    var stack_wild_verb_buf: [64]u8 = undefined;
+    var stack_specific_wild_buf: [128]u8 = undefined;
+    switch (action) {
+        .create_stack => {
+            probe_buf[0] = "stack.create";
+            probe_buf[1] = "*";
+            probes = probe_buf[0..2];
+        },
+        .dispatch_harness => {
+            const provider = switch (target) {
+                .provider => |p| p,
+                else => return .{ .capability_denied = {} },
+            };
+            const specific = std.fmt.bufPrint(&stack_specific_buf, "provider.{s}", .{provider}) catch return .{ .capability_denied = {} };
+            probe_buf[0] = specific;
+            probe_buf[1] = "provider.*";
+            probe_buf[2] = "*";
+            probes = probe_buf[0..3];
+        },
+        else => {
+            const verb = action.stackVerb() orelse return .{ .capability_denied = {} };
+            const stack_name = switch (target) {
+                .stack => |s| s,
+                .stack_create => |s| s,
+                else => return .{ .capability_denied = {} },
+            };
+            const specific = std.fmt.bufPrint(&stack_specific_buf, "stack.{s}.{s}", .{ stack_name, verb }) catch return .{ .capability_denied = {} };
+            const specific_wild = std.fmt.bufPrint(&stack_specific_wild_buf, "stack.{s}.*", .{stack_name}) catch return .{ .capability_denied = {} };
+            const wild_verb = std.fmt.bufPrint(&stack_wild_verb_buf, "stack.*.{s}", .{verb}) catch return .{ .capability_denied = {} };
+            probe_buf[0] = specific;
+            probe_buf[1] = specific_wild;
+            probe_buf[2] = wild_verb;
+            probe_buf[3] = "*";
+            probes = probe_buf[0..4];
+        },
+    }
+
+    for (caps) |c| {
+        if (std.mem.eql(u8, c, "*")) return .{ .allow = {} };
+        for (probes) |p| if (std.mem.eql(u8, c, p)) return .{ .allow = {} };
+    }
+    return .{ .capability_denied = {} };
+}
+
+// ---------- unit tests ----------
+
+const testing = std.testing;
+
+fn cfgFromToml(allocator: std.mem.Allocator, src: []const u8) !config_mod.Config {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".organo");
+    var f = try tmp.dir.createFile(".organo/config.toml", .{ .truncate = true });
+    defer f.close();
+    try f.writeAll(src);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    return config_mod.loadFromRoot(allocator, abs);
+}
+
+test "evaluate: no identity → identity_required" {
+    const d = evaluate(null, .append_item, .{ .stack = "default" });
+    try testing.expect(d == .identity_required);
+}
+
+test "evaluate: undeclared local identity has full access (backwards-compat)" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a, ""); // no identity tables
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(!id.explicitly_declared);
+    try testing.expectEqualStrings("local", id.name);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "default" }) == .allow);
+    try testing.expect(evaluate(id, .create_stack, .{ .stack_create = "anything" }) == .allow);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "openai" }) == .allow);
+}
+
+test "evaluate: explicit `*` capability allows everything" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["*"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(id.explicitly_declared);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "default" }) == .allow);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "anthropic" }) == .allow);
+}
+
+test "evaluate: stack.<name>.<verb> matches the exact action+stack" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["stack.demo.append"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "demo" }) == .allow);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "other" }) == .capability_denied);
+    try testing.expect(evaluate(id, .cancel_item, .{ .stack = "demo" }) == .capability_denied);
+}
+
+test "evaluate: stack.*.<verb> matches any stack for that verb" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["stack.*.cancel"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(evaluate(id, .cancel_item, .{ .stack = "x" }) == .allow);
+    try testing.expect(evaluate(id, .cancel_item, .{ .stack = "y" }) == .allow);
+    try testing.expect(evaluate(id, .pause_stack, .{ .stack = "x" }) == .capability_denied);
+}
+
+test "evaluate: stack.<name>.* matches any verb for that stack" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["stack.demo.*"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "demo" }) == .allow);
+    try testing.expect(evaluate(id, .pause_stack, .{ .stack = "demo" }) == .allow);
+    try testing.expect(evaluate(id, .update_stack_config, .{ .stack = "demo" }) == .allow);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "other" }) == .capability_denied);
+}
+
+test "evaluate: create_stack requires stack.create or *" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["stack.*.append"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    const d = evaluate(id, .create_stack, .{ .stack_create = "newone" });
+    try testing.expect(d == .capability_denied);
+
+    var cfg2 = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["stack.create"]
+        \\
+    );
+    defer cfg2.deinit();
+    const id2 = resolveLocal(&cfg2);
+    try testing.expect(evaluate(id2, .create_stack, .{ .stack_create = "newone" }) == .allow);
+}
+
+test "evaluate: provider.<name> gates dispatch_harness" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["provider.anthropic"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "anthropic" }) == .allow);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "openai" }) == .capability_denied);
+}
+
+test "evaluate: provider.* matches any provider" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["provider.*"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "anthropic" }) == .allow);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "openai" }) == .allow);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "google" }) == .allow);
+}
+
+test "evaluate: empty capabilities array denies everything" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = []
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "default" }) == .capability_denied);
+    try testing.expect(evaluate(id, .create_stack, .{ .stack_create = "x" }) == .capability_denied);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "anthropic" }) == .capability_denied);
+}
+
+test "evaluate: unknown capability slugs are silently ignored" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["future.capability.we.dont.know", "stack.demo.append"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "demo" }) == .allow);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "other" }) == .capability_denied);
+}

@@ -59,6 +59,14 @@ pub const Options = struct {
     /// scripted/no-binary dispatch (M6 fake, M7 cat_jsonl) leave this
     /// off so the scripted subprocess actually runs.
     enable_provider_preflight: bool = false,
+    /// Optional capability check applied at routing preflight (M10).
+    /// Called with the resolved provider slug (e.g. "anthropic"); returns
+    /// true to allow dispatch, false to block with `capability_denied`.
+    /// When null, the routing layer behaves exactly as in M6–M8 (no
+    /// capability check). The daemon installs a closure here that
+    /// evaluates `policy.evaluate(local-identity, dispatch_harness, ...)`.
+    policy_check_provider: ?*const fn (ctx: ?*anyopaque, provider_slug: []const u8) bool = null,
+    policy_check_ctx: ?*anyopaque = null,
 };
 
 pub const Supervisor = struct {
@@ -383,6 +391,24 @@ pub const Supervisor = struct {
                 // can prompt the user instead of failing inside a
                 // subprocess. `unknown` is treated as "go ahead and try".
                 if (status.auth == .signed_out) return .{ .blocked = "auth_missing" };
+            }
+        }
+
+        // Capability policy on the routed provider (M10). The check
+        // applies whether or not provider_preflight is enabled so test
+        // suites that use the "fake" harness still exercise the policy
+        // path — `harnessToProvider("fake")` is None, so the check is a
+        // no-op for that harness.
+        if (self.opts.policy_check_provider) |check| {
+            if (harness_dispatch.harnessToProvider(harness_name)) |provider| {
+                const slug = switch (provider) {
+                    .anthropic => "anthropic",
+                    .openai => "openai",
+                    .google => "google",
+                };
+                if (!check(self.opts.policy_check_ctx, slug)) {
+                    return .{ .blocked = "capability_denied" };
+                }
             }
         }
 
