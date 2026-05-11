@@ -11,11 +11,17 @@ pub const item = @import("item.zig");
 pub const stack_config = @import("stack_config.zig");
 pub const init = @import("init.zig");
 pub const cli = @import("cli.zig");
+pub const config = @import("config.zig");
+pub const local_token = @import("local_token.zig");
+pub const errors = @import("errors.zig");
+pub const storage = @import("storage.zig");
+pub const daemon = @import("daemon.zig");
 
 pub const Status = state.Status;
 pub const Kind = item.Kind;
 pub const Item = item.Item;
 pub const StackConfig = stack_config.StackConfig;
+pub const Config = config.Config;
 
 pub fn bufferedPrint() !void {
     var stdout_buffer: [1024]u8 = undefined;

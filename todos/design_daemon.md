@@ -18,9 +18,12 @@ The organo daemon is the single process that owns the stack runtime, exposes it 
 
 ## To Decide
 
-- HTTP framework / library in Zig — pick an existing one or build minimally on the standard library.
 - HTML templating approach: hand-written string formatting, embedded template engine, or compile-time templates (Zig comptime).
 - Whether daemon-owned provider credentials are ever worth supporting beyond official-CLI reuse and API-key config.
+
+### Resolved (was: To Decide)
+
+- **HTTP framework** (milestone 3): build minimally on `std.http.Server` from the Zig standard library, accepting connections via `std.net.Server` and dispatching with a small hand-written router. No external HTTP dependency in v1. Rationale: the surface area is small (loopback only, well under a dozen endpoints), `std.http` covers HTTP/1.1 request parsing and response framing, and avoiding a `build.zig.zon` dependency keeps the toolchain self-contained for now. If/when SSE or multipart needs grow past what the stdlib types support cleanly, revisit.
 
 ### Resolved (was: To Decide)
 

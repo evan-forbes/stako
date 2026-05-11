@@ -1,9 +1,11 @@
 //! CLI subcommand routing for the `organo` binary.
 //!
-//! Milestone 2 only routes `init`. Later milestones add `daemon`, `stack`, etc.
+//! Milestones 2–3 route `init` and `daemon`. Later milestones add `stack`,
+//! etc.
 
 const std = @import("std");
 const init_mod = @import("init.zig");
+const daemon_mod = @import("daemon.zig");
 
 pub const UsageError = error{
     NoSubcommand,
@@ -14,12 +16,68 @@ pub const UsageError = error{
 
 pub const Subcommand = enum {
     init,
+    daemon,
 
     pub fn fromString(s: []const u8) ?Subcommand {
         if (std.mem.eql(u8, s, "init")) return .init;
+        if (std.mem.eql(u8, s, "daemon")) return .daemon;
         return null;
     }
 };
+
+pub const DaemonAction = enum {
+    start,
+    stop,
+    status,
+
+    pub fn fromString(s: []const u8) ?DaemonAction {
+        if (std.mem.eql(u8, s, "start")) return .start;
+        if (std.mem.eql(u8, s, "stop")) return .stop;
+        if (std.mem.eql(u8, s, "status")) return .status;
+        return null;
+    }
+};
+
+pub const DaemonArgs = struct {
+    action: DaemonAction,
+    root: []const u8 = ".",
+    /// Override `daemon.port` from config.
+    port_override: ?u16 = null,
+    /// When true, run the daemon in the foreground instead of forking.
+    /// Milestone 3 only supports foreground for testability and
+    /// simplicity; backgrounding lands when the supervisor matures.
+    foreground: bool = true,
+};
+
+pub fn parseDaemonArgs(args: []const []const u8) UsageError!DaemonArgs {
+    if (args.len == 0) return error.NoSubcommand;
+    const action = DaemonAction.fromString(args[0]) orelse return error.UnknownSubcommand;
+    var out: DaemonArgs = .{ .action = action };
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--root")) {
+            if (i + 1 >= args.len) return error.BadFlagValue;
+            i += 1;
+            out.root = args[i];
+        } else if (std.mem.startsWith(u8, a, "--root=")) {
+            out.root = a["--root=".len..];
+            if (out.root.len == 0) return error.BadFlagValue;
+        } else if (std.mem.eql(u8, a, "--port")) {
+            if (i + 1 >= args.len) return error.BadFlagValue;
+            i += 1;
+            out.port_override = std.fmt.parseInt(u16, args[i], 10) catch return error.BadFlagValue;
+        } else if (std.mem.startsWith(u8, a, "--port=")) {
+            const v = a["--port=".len..];
+            out.port_override = std.fmt.parseInt(u16, v, 10) catch return error.BadFlagValue;
+        } else if (std.mem.eql(u8, a, "--foreground")) {
+            out.foreground = true;
+        } else {
+            return error.BadFlagValue;
+        }
+    }
+    return out;
+}
 
 pub const InitArgs = struct {
     /// Defaults to "." (cwd) when --root is absent.
@@ -86,7 +144,99 @@ pub fn dispatch(
     const rest = argv[1..];
     switch (sub) {
         .init => return try runInit(allocator, rest, stdout, stderr),
+        .daemon => return try runDaemon(allocator, rest, stdout, stderr),
     }
+}
+
+fn runDaemon(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const parsed = parseDaemonArgs(args) catch |e| {
+        try stderr.print("organo daemon: {s}\n", .{@errorName(e)});
+        try printDaemonUsage(stderr);
+        return 2;
+    };
+
+    switch (parsed.action) {
+        .start => {
+            var d = daemon_mod.start(allocator, .{
+                .notes_root = parsed.root,
+                .port_override = parsed.port_override,
+            }) catch |e| {
+                try stderr.print("organo daemon start: failed: {s}\n", .{@errorName(e)});
+                return 1;
+            };
+            defer d.deinit();
+            try stdout.print("organo daemon: listening on 127.0.0.1:{d}\n", .{d.bound_port});
+            try stdout.flush();
+            try stderr.flush();
+            // Foreground accept loop until SIGTERM.
+            g_daemon_for_signals = &d;
+            defer g_daemon_for_signals = null;
+            installSignalHandlers();
+            // Best-effort: serve until interrupted.
+            daemon_mod.serveUntilShutdown(&d) catch |e| {
+                try stderr.print("organo daemon: serve loop ended: {s}\n", .{@errorName(e)});
+            };
+            // Clean up PID file on graceful exit.
+            if (d.pid_written) {
+                daemon_mod.removePidFile(allocator, d.notes_root_abs) catch {};
+            }
+            return 0;
+        },
+        .stop => {
+            const result = daemon_mod.stop(allocator, parsed.root, 5) catch |e| {
+                try stderr.print("organo daemon stop: failed: {s}\n", .{@errorName(e)});
+                return 1;
+            };
+            switch (result) {
+                .not_running => try stdout.writeAll("organo daemon: not running\n"),
+                .stopped => try stdout.writeAll("organo daemon: stopped\n"),
+                .timeout => {
+                    try stdout.writeAll("organo daemon: process did not exit within grace; pid file left for inspection\n");
+                    return 1;
+                },
+            }
+            return 0;
+        },
+        .status => {
+            const info = daemon_mod.readPidFile(allocator, parsed.root) catch |e| {
+                try stderr.print("organo daemon status: failed: {s}\n", .{@errorName(e)});
+                return 1;
+            };
+            if (info) |pi| {
+                if (daemon_mod.isProcessAlive(pi.pid)) {
+                    const uptime = std.time.timestamp() - pi.started_at;
+                    try stdout.print("organo daemon: running (pid {d}, port {d}, uptime {d}s)\n", .{ pi.pid, pi.port, uptime });
+                } else {
+                    try stdout.print("organo daemon: stale pid file (pid {d} not alive)\n", .{pi.pid});
+                }
+            } else {
+                try stdout.writeAll("organo daemon: stopped\n");
+            }
+            return 0;
+        },
+    }
+}
+
+var g_daemon_for_signals: ?*daemon_mod.Daemon = null;
+
+fn installSignalHandlers() void {
+    if (@import("builtin").os.tag == .windows) return;
+    var sa: std.posix.Sigaction = .{
+        .handler = .{ .handler = handleTermSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+}
+
+fn handleTermSignal(_: c_int) callconv(.c) void {
+    if (g_daemon_for_signals) |d| d.requestShutdown();
 }
 
 fn runInit(
@@ -126,6 +276,19 @@ fn printUsage(w: anytype) !void {
         \\
         \\Subcommands:
         \\  init    Bootstrap a notes-root layout (see `organo init --help`)
+        \\  daemon  Start/stop/inspect the local daemon (see `organo daemon --help`)
+        \\
+    );
+}
+
+fn printDaemonUsage(w: anytype) !void {
+    try w.writeAll(
+        \\Usage: organo daemon <start|stop|status> [--root <path>] [--port <n>]
+        \\
+        \\Actions:
+        \\  start    Bind loopback, serve HTTP read endpoints.
+        \\  stop     Send SIGTERM to the running daemon.
+        \\  status   Report running/stopped, pid, port, uptime.
         \\
     );
 }
@@ -196,5 +359,17 @@ test "parseInitArgs: --root missing value rejected" {
 
 test "Subcommand.fromString" {
     try std.testing.expect(Subcommand.fromString("init") != null);
-    try std.testing.expect(Subcommand.fromString("daemon") == null);
+    try std.testing.expect(Subcommand.fromString("daemon") != null);
+    try std.testing.expect(Subcommand.fromString("nope") == null);
+}
+
+test "parseDaemonArgs: actions" {
+    const a = try parseDaemonArgs(&.{"start"});
+    try std.testing.expectEqual(DaemonAction.start, a.action);
+    const b = try parseDaemonArgs(&.{ "stop", "--root=/tmp/x" });
+    try std.testing.expectEqual(DaemonAction.stop, b.action);
+    try std.testing.expectEqualStrings("/tmp/x", b.root);
+    const c = try parseDaemonArgs(&.{ "start", "--port", "8080" });
+    try std.testing.expectEqual(@as(?u16, 8080), c.port_override);
+    try std.testing.expectError(error.UnknownSubcommand, parseDaemonArgs(&.{"foo"}));
 }

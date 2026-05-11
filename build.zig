@@ -167,6 +167,23 @@ pub fn build(b: *std.Build) void {
     const run_init_tests = b.addRunArtifact(init_tests);
     run_init_tests.setCwd(b.path("."));
 
+    // Milestone 3: daemon read-path tests. Spawns the daemon against a
+    // temporary notes root constructed from milestone-1 item fixtures and
+    // milestone-2's stack_config defaults. Tests run from the build root
+    // so fixture paths resolve.
+    const daemon_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/daemon_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "organo", .module = mod },
+            },
+        }),
+    });
+    const run_daemon_tests = b.addRunArtifact(daemon_tests);
+    run_daemon_tests.setCwd(b.path("."));
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -175,6 +192,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_item_format_tests.step);
     test_step.dependOn(&run_init_tests.step);
+    test_step.dependOn(&run_daemon_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
