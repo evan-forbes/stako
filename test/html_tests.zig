@@ -447,3 +447,250 @@ test "daemon: HTML routes don't bypass auth gate (no auth required for GET)" {
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
 }
+
+// ---------- mutation-control rendering (plan step 6) ----------
+
+test "renderStack: pause form rendered when local_token set and stack running" {
+    const a = std.testing.allocator;
+    var root = try SmokeRoot.create(a, "stack-controls-pause");
+    defer root.deinit();
+    var reader = try storage.Reader.init(a, root.abs_path);
+    defer reader.deinit();
+    var cfg = try reader.readStackConfig("smoke");
+    defer cfg.deinit();
+    const items = try reader.listItems("smoke");
+    defer reader.freeItemList(items);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderStack(a, &out, .{
+        .name = "smoke",
+        .config = &cfg,
+        .items = items,
+        .running_count = 1,
+        .local_token = "deadbeefdeadbeefdeadbeefdeadbeef",
+    });
+    // The Controls section surfaces, the form posts to .../pause, and the
+    // hidden field carries the local token verbatim.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<section class=\"controls\">") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/pause\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items,
+        "name=\"_token\" value=\"deadbeefdeadbeefdeadbeefdeadbeef\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Pause stack") != null);
+    // Resume form must NOT appear when the stack isn't paused.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/resume\"") == null);
+}
+
+test "renderStack: no controls when local_token omitted" {
+    const a = std.testing.allocator;
+    var root = try SmokeRoot.create(a, "stack-controls-none");
+    defer root.deinit();
+    var reader = try storage.Reader.init(a, root.abs_path);
+    defer reader.deinit();
+    var cfg = try reader.readStackConfig("smoke");
+    defer cfg.deinit();
+    const items = try reader.listItems("smoke");
+    defer reader.freeItemList(items);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderStack(a, &out, .{
+        .name = "smoke",
+        .config = &cfg,
+        .items = items,
+        .running_count = 0,
+    });
+    // Default-rendered page (e.g. without a loopback token) shows no
+    // mutation forms. The existing committed snapshot pins this same path.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<form") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "_token") == null);
+}
+
+test "renderItem: cancel form rendered for queued item" {
+    const a = std.testing.allocator;
+    var root = try SmokeRoot.create(a, "item-controls-cancel");
+    defer root.deinit();
+    var reader = try storage.Reader.init(a, root.abs_path);
+    defer reader.deinit();
+    var item = try reader.readItem("smoke", "0002"); // queued
+    defer item.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderItem(a, &out, .{
+        .stack = "smoke",
+        .item = &item,
+        .prompt_body = null,
+        .transcript_jsonl = null,
+        .enable_sse = false,
+        .local_token = "0123456789abcdef0123456789abcdef",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/items/0002/cancel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items,
+        "name=\"_token\" value=\"0123456789abcdef0123456789abcdef\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Cancel item") != null);
+    // Retry button doesn't apply to queued items.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Retry item") == null);
+}
+
+test "renderItem: no controls for running item (mutation layer rejects mid-run cancel)" {
+    // Plan text mentions "Cancel running item" but `mutations.applyTransition`
+    // rejects cancel-from-running, so we surface nothing instead of showing
+    // a button that the daemon would reject. Documents the truth-table
+    // alignment between html.zig and mutations.zig.
+    const a = std.testing.allocator;
+    var root = try SmokeRoot.create(a, "item-controls-running");
+    defer root.deinit();
+    var reader = try storage.Reader.init(a, root.abs_path);
+    defer reader.deinit();
+    var item = try reader.readItem("smoke", "0001"); // running
+    defer item.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderItem(a, &out, .{
+        .stack = "smoke",
+        .item = &item,
+        .prompt_body = null,
+        .transcript_jsonl = null,
+        .enable_sse = false,
+        .local_token = "0123456789abcdef0123456789abcdef",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<form") == null);
+}
+
+test "renderItem: hostile token never breaks out of hidden-input attribute" {
+    // Defense-in-depth: the local token is a hex string by construction
+    // (see `local_token.zig`), but the renderer still runs every dynamic
+    // insertion through `escape`. Feed a quote-laden bogus token and
+    // confirm no raw quote survives inside the hidden field — otherwise
+    // a hostile token could break out of the attribute and inject markup.
+    const a = std.testing.allocator;
+    var root = try SmokeRoot.create(a, "item-token-escape");
+    defer root.deinit();
+    var reader = try storage.Reader.init(a, root.abs_path);
+    defer reader.deinit();
+    var item = try reader.readItem("smoke", "0002");
+    defer item.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderItem(a, &out, .{
+        .stack = "smoke",
+        .item = &item,
+        .prompt_body = null,
+        .transcript_jsonl = null,
+        .enable_sse = false,
+        .local_token = "x\"><script>alert(1)</script>",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<script>alert(1)</script>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "&lt;script&gt;") != null);
+}
+
+// ---------- mutation-token rejection (plan step 7) ----------
+
+test "daemon: POST /pause without form token returns 401 identity_required" {
+    // Plan step 7: "Mutation-token rejection test for browser POST helpers."
+    // A browser-form POST without the embedded `_token` field MUST be
+    // rejected by the same auth gate that protects `Authorization: Bearer`
+    // callers — otherwise the token-protection claim on plan acceptance
+    // criterion 5 is vacuous.
+    const a = std.testing.allocator;
+    var root = try buildInitializedRoot(a, "pause-no-token");
+    defer root.deinit();
+    var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
+    defer drv.deinit();
+    try drv.serve(1);
+
+    // Empty body; form path is recognised by the content-type header.
+    const body = "";
+    const req = try std.fmt.allocPrint(a,
+        "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body });
+    defer a.free(req);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 401), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"code\":\"identity_required\"") != null);
+}
+
+test "daemon: POST /pause with valid form token succeeds" {
+    // Plan step 6 acceptance: "Browser mutation POSTs are token-protected."
+    // The complement to the rejection test — with the correct `_token`
+    // form field the same endpoint accepts the request and the mutation
+    // queue records the pause. Uses the daemon's in-memory token.
+    const a = std.testing.allocator;
+    var root = try buildInitializedRoot(a, "pause-with-token");
+    defer root.deinit();
+    var drv: Driver = .{ .allocator = a, .daemon = try daemon_mod.start(a, .{
+        .notes_root = root.abs_path,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .check_repo_conflicts = false,
+    }) };
+    defer drv.deinit();
+    try drv.daemon.startWorker();
+    try drv.serve(1);
+
+    const body = try std.fmt.allocPrint(a, "_token={s}", .{drv.daemon.token.bytes});
+    defer a.free(body);
+    const req = try std.fmt.allocPrint(a,
+        "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body });
+    defer a.free(req);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 200), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"ok\":true") != null);
+}
+
+test "daemon: HTML stack page embeds working pause form" {
+    // End-to-end: GET the HTML stack page, scrape the hidden `_token`
+    // value from the rendered form, then POST the same form body back to
+    // the daemon. Confirms the embedded token is verbatim what the
+    // daemon's auth check accepts (i.e. no encoding drift between
+    // `html.zig` and `verifyAuthFormBody`).
+    const a = std.testing.allocator;
+    var root = try buildInitializedRoot(a, "html-form-roundtrip");
+    defer root.deinit();
+    var drv: Driver = .{ .allocator = a, .daemon = try daemon_mod.start(a, .{
+        .notes_root = root.abs_path,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .check_repo_conflicts = false,
+    }) };
+    defer drv.deinit();
+    try drv.daemon.startWorker();
+    try drv.serve(2);
+
+    // Step 1: render the HTML stack page.
+    const get_req = "GET /stacks/smoke HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n";
+    const get_resp = try httpRequestRaw(a, drv.daemon.bound_port, get_req);
+    defer a.free(get_resp);
+    const get_parsed = splitResponse(get_resp);
+    try std.testing.expectEqual(@as(u16, 200), get_parsed.status);
+
+    // Extract `name="_token" value="<hex>"`.
+    const token_key = "name=\"_token\" value=\"";
+    const idx = std.mem.indexOf(u8, get_parsed.body, token_key) orelse return error.TestUnexpectedResult;
+    const after = get_parsed.body[idx + token_key.len ..];
+    const end = std.mem.indexOfScalar(u8, after, '"') orelse return error.TestUnexpectedResult;
+    const token = after[0..end];
+    try std.testing.expectEqualStrings(drv.daemon.token.bytes, token);
+
+    // Step 2: replay the form body with that token.
+    const body = try std.fmt.allocPrint(a, "_token={s}", .{token});
+    defer a.free(body);
+    const post_req = try std.fmt.allocPrint(a,
+        "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body });
+    defer a.free(post_req);
+    const post_resp = try httpRequestRaw(a, drv.daemon.bound_port, post_req);
+    defer a.free(post_resp);
+    const post_parsed = splitResponse(post_resp);
+    try std.testing.expectEqual(@as(u16, 200), post_parsed.status);
+}

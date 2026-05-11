@@ -97,6 +97,10 @@ pub const STYLE_CSS: []const u8 =
     \\.transcript-kind { font-weight: 600; color: var(--accent); }
     \\.transcript-ts { color: var(--muted); font-size: .8rem; }
     \\footer { color: var(--muted); font-size: .85rem; margin-top: 2rem; border-top: 1px solid var(--border); padding-top: .5rem; }
+    \\section.controls { margin: .5rem 0 1rem 0; }
+    \\section.controls form { display: inline-block; margin-right: .5rem; }
+    \\section.controls button { padding: .3rem .8rem; font-size: .9rem; border: 1px solid var(--border); background: #fff; color: var(--fg); border-radius: .25rem; cursor: pointer; }
+    \\section.controls button:hover { background: #f0f0f0; }
 ;
 
 /// Page header written by every renderer. `title` is escaped.
@@ -145,6 +149,12 @@ pub const StackPageInput = struct {
     config: *const stack_config.StackConfig,
     items: []const storage.ItemSummary,
     running_count: usize = 0,
+    /// When non-null, render the pause/resume mutation form embedding this
+    /// local mutation token as a hidden `_token` field. The token MUST only
+    /// be embedded when the request came over the loopback interface — the
+    /// caller is responsible for that gate. Pages render without the form
+    /// when null (used by snapshot tests and JSON callers).
+    local_token: ?[]const u8 = null,
 };
 
 /// Render `/stacks/<name>`.
@@ -163,6 +173,14 @@ pub fn renderStack(
     try w.writeAll("<header><h1>");
     try escape(w, input.name);
     try w.writeAll("</h1></header>");
+
+    // Mutation controls — pause/resume the stack. Rendered only when a
+    // local mutation token is supplied (loopback-only path). Plain HTML
+    // `<form method="POST">` so the page works without JS; the hidden
+    // `_token` field carries the local mutation token end-to-end.
+    if (input.local_token) |tok| {
+        try writeStackControls(w, input.name, input.config.paused, tok);
+    }
 
     // Config summary.
     try w.writeAll("<h2>Config</h2><dl class=\"kv\">");
@@ -220,6 +238,59 @@ pub fn renderStack(
     try writeFooter(w);
 }
 
+/// Emit pause/resume controls for a stack. Exactly one button surfaces per
+/// page: resume when the stack is paused, pause otherwise. The form posts
+/// `application/x-www-form-urlencoded` with a hidden `_token` field — the
+/// daemon accepts that as an alternative to `Authorization: Bearer` so
+/// vanilla HTML forms work (no JS required).
+fn writeStackControls(w: anytype, name: []const u8, paused: bool, token: []const u8) !void {
+    try w.writeAll("<section class=\"controls\"><h2>Controls</h2>");
+    const action_path: []const u8 = if (paused) "resume" else "pause";
+    const button_label: []const u8 = if (paused) "Resume stack" else "Pause stack";
+    try w.writeAll("<form method=\"POST\" action=\"/stacks/");
+    try escape(w, name);
+    try w.writeAll("/");
+    try w.writeAll(action_path);
+    try w.writeAll("\"><input type=\"hidden\" name=\"_token\" value=\"");
+    try escape(w, token);
+    try w.writeAll("\"><button type=\"submit\">");
+    try w.writeAll(button_label);
+    try w.writeAll("</button></form></section>");
+}
+
+/// Emit cancel/retry controls for an item. Buttons surface only for
+/// statuses where the mutation layer accepts the transition: cancel for
+/// queued/paused/blocked, retry for blocked. Statuses outside those sets
+/// show no form. See `mutations.applyTransition` for the truth table.
+fn writeItemControls(w: anytype, stack: []const u8, id: []const u8, status: []const u8, token: []const u8) !void {
+    const show_cancel = std.mem.eql(u8, status, "queued") or
+        std.mem.eql(u8, status, "paused") or
+        std.mem.eql(u8, status, "blocked");
+    const show_retry = std.mem.eql(u8, status, "blocked");
+    if (!show_cancel and !show_retry) return;
+
+    try w.writeAll("<section class=\"controls\"><h2>Controls</h2>");
+    if (show_cancel) {
+        try w.writeAll("<form method=\"POST\" action=\"/stacks/");
+        try escape(w, stack);
+        try w.writeAll("/items/");
+        try escape(w, id);
+        try w.writeAll("/cancel\"><input type=\"hidden\" name=\"_token\" value=\"");
+        try escape(w, token);
+        try w.writeAll("\"><button type=\"submit\">Cancel item</button></form>");
+    }
+    if (show_retry) {
+        try w.writeAll("<form method=\"POST\" action=\"/stacks/");
+        try escape(w, stack);
+        try w.writeAll("/items/");
+        try escape(w, id);
+        try w.writeAll("/retry\"><input type=\"hidden\" name=\"_token\" value=\"");
+        try escape(w, token);
+        try w.writeAll("\"><button type=\"submit\">Retry item</button></form>");
+    }
+    try w.writeAll("</section>");
+}
+
 fn writeStatusBadge(w: anytype, status: []const u8) !void {
     try w.writeAll("<span class=\"badge status-");
     try escape(w, status);
@@ -242,6 +313,10 @@ pub const ItemPageInput = struct {
     /// transcript and status badge update live. The script is opt-in so
     /// snapshot tests can render a JS-free page.
     enable_sse: bool = false,
+    /// When non-null, render cancel/retry controls embedding this local
+    /// mutation token as a hidden `_token` field. Same loopback-only
+    /// invariant as `StackPageInput.local_token`.
+    local_token: ?[]const u8 = null,
 };
 
 pub fn renderItem(
@@ -336,6 +411,14 @@ pub fn renderItem(
         try w.writeAll("</dd>");
     }
     try w.writeAll("</dl>");
+
+    // Mutation controls — cancel/retry. Rendered only when a local token is
+    // supplied (loopback-only path). Plain HTML forms; the hidden `_token`
+    // field carries the local mutation token. See `writeItemControls` for
+    // the per-status truth table.
+    if (input.local_token) |tok| {
+        try writeItemControls(w, input.stack, input.item.id, input.item.status.toString(), tok);
+    }
 
     // Prompt body.
     if (input.prompt_body) |body| {

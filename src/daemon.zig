@@ -592,11 +592,35 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         return;
     }
 
-    // Auth check on mutation routes.
+    // Auth check on mutation routes. Two paths:
+    //   1. `Authorization: Bearer <token>` header — used by programmatic
+    //      JSON callers and tests. This is the only path that lets the
+    //      downstream handler read the body itself.
+    //   2. `application/x-www-form-urlencoded` body with a `_token=...`
+    //      field — used by the browser mutation forms rendered on the HTML
+    //      pages (see `html.writeStackControls` and `writeItemControls`).
+    //      Plain `<form method="POST">` cannot set custom headers, so a
+    //      body-side credential is the only way to keep those flows JS-
+    //      free. When taken, the body is consumed here; the dispatch
+    //      below uses a form-aware handler that does not re-read it.
+    var form_body: ?[]u8 = null;
+    defer if (form_body) |b| self.allocator.free(b);
     if (isMutationRoute(m.route)) {
         if (!verifyAuth(self, req)) {
-            try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
-            return;
+            const form_attempt = verifyAuthFormBody(self, req) catch |e| {
+                if (e == error.BodyTooLarge) {
+                    try respondError(req, .validation_failed, "request body too large", &.{});
+                    return;
+                }
+                try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
+                return;
+            };
+            if (form_attempt) |fb| {
+                form_body = fb;
+            } else {
+                try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
+                return;
+            }
         }
     }
 
@@ -610,16 +634,31 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         .stack_config_get => try respondStackConfigGet(self, req, m.stack),
         .stack_items_list => try respondStackItemsList(self, req, m.stack),
         .stack_item_get => if (wants_html) try respondItemHtml(self, req, m.stack, m.item) else try respondStackItemGet(self, req, m.stack, m.item),
-        // Mutations.
+        // Mutations. When `form_body` is set, the auth path consumed a
+        // form-encoded body for us; the small subset of mutation routes
+        // surfaced as browser controls dispatches to no-body shims that
+        // skip re-reading the request.
         .stacks_create => try handleCreateStack(self, req),
         .stack_config_post => try handleConfigPost(self, req, m.stack),
         .items_append => try handleAppendItem(self, req, m.stack),
         .item_insert => try handleInsertItem(self, req, m.stack, m.item),
-        .item_retry => try handleTransition(self, req, m.stack, m.item, .retry),
-        .item_cancel => try handleTransition(self, req, m.stack, m.item, .cancel),
+        .item_retry => if (form_body != null)
+            try handleTransitionFormPath(self, req, m.stack, m.item, .retry)
+        else
+            try handleTransition(self, req, m.stack, m.item, .retry),
+        .item_cancel => if (form_body != null)
+            try handleTransitionFormPath(self, req, m.stack, m.item, .cancel)
+        else
+            try handleTransition(self, req, m.stack, m.item, .cancel),
         .item_supersede => try handleTransition(self, req, m.stack, m.item, .supersede),
-        .stack_pause => try handlePauseResume(self, req, m.stack, true),
-        .stack_resume => try handlePauseResume(self, req, m.stack, false),
+        .stack_pause => if (form_body != null)
+            try handlePauseResumeFormPath(self, req, m.stack, true)
+        else
+            try handlePauseResume(self, req, m.stack, true),
+        .stack_resume => if (form_body != null)
+            try handlePauseResumeFormPath(self, req, m.stack, false)
+        else
+            try handlePauseResume(self, req, m.stack, false),
         .stack_events_sse => try respondError(req, .internal, "SSE must be routed via routeWithOwnership", &.{}),
         // Provider status (M8).
         .providers_list => try respondProvidersList(self, req),
@@ -649,6 +688,94 @@ fn promoteToMutation(r: Route) Route {
         .stack_config_get => .stack_config_post,
         .stack_items_list => .items_append,
         else => r,
+    };
+}
+
+/// Browser-form auth path. When the request carries
+/// `application/x-www-form-urlencoded`, read the body and look for a
+/// `_token=<hex>` field; verify it against the local mutation token. On a
+/// match, return the read body (caller frees) so the caller can `defer free`
+/// it. On any miss (wrong content-type, missing/invalid token, parse error),
+/// return null. Body-read errors bubble up via the function's error union so
+/// the caller can map them to a 4xx without conflating "auth missed" with
+/// "body too large".
+///
+/// Only the `_token` field is consumed; the surfaced mutation forms
+/// (pause/resume/cancel/retry) carry no other required fields. If we ever
+/// surface a richer form, this helper grows additional field accessors —
+/// JSON-shape mutation handlers still go through `Authorization: Bearer`.
+fn verifyAuthFormBody(self: *Daemon, req: *std.http.Server.Request) !?[]u8 {
+    // Reject anything that isn't form-encoded.
+    var matched_ct = false;
+    var hdrs = req.iterateHeaders();
+    while (hdrs.next()) |h| {
+        if (asciiEqlIgnoreCase(h.name, "content-type")) {
+            // Match the media type even if charset/boundary parameters
+            // are present (e.g. `application/x-www-form-urlencoded; charset=utf-8`).
+            const v = h.value;
+            const semi = std.mem.indexOfScalar(u8, v, ';') orelse v.len;
+            const mt = std.mem.trim(u8, v[0..semi], " \t");
+            if (asciiEqlIgnoreCase(mt, "application/x-www-form-urlencoded")) matched_ct = true;
+            break;
+        }
+    }
+    if (!matched_ct) return null;
+
+    const body = try readRequestBody(self, req);
+    errdefer self.allocator.free(body);
+
+    // Iterate `k=v&k=v` pairs and look for `_token`. Stop on first match.
+    var ok = false;
+    var it = std.mem.splitScalar(u8, body, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const val = pair[eq + 1 ..];
+        if (!std.mem.eql(u8, key, "_token")) continue;
+        // The token is hex (per `local_token.zig`); no percent-decoding
+        // required for the canonical shape. We still tolerate `+` (URL-
+        // encoded space) and `%XX` to keep the parser forgiving against
+        // any wrapping helpers a browser/tester might apply.
+        const decoded = formUrlDecode(self.allocator, val) catch return null;
+        defer self.allocator.free(decoded);
+        if (self.token.verify(decoded)) ok = true;
+        break;
+    }
+    if (!ok) {
+        self.allocator.free(body);
+        return null;
+    }
+    return body;
+}
+
+/// Decode an `application/x-www-form-urlencoded` value: `+` → space,
+/// `%XX` → byte. Returns a fresh allocation.
+fn formUrlDecode(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '+') {
+            try out.append(allocator, ' ');
+        } else if (c == '%' and i + 2 < s.len) {
+            const hi = hexNibble(s[i + 1]) orelse return error.InvalidEscape;
+            const lo = hexNibble(s[i + 2]) orelse return error.InvalidEscape;
+            try out.append(allocator, (hi << 4) | lo);
+            i += 2;
+        } else {
+            try out.append(allocator, c);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn hexNibble(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
     };
 }
 
@@ -985,6 +1112,9 @@ fn respondStackHtml(self: *Daemon, req: *std.http.Server.Request, name: []const 
         .config = &cfg,
         .items = items,
         .running_count = running_count,
+        // Daemon is loopback-only (see `isLoopbackHost`), so embedding the
+        // mutation token in HTML served to the browser stays local.
+        .local_token = self.token.bytes,
     }) catch {
         try respondError(req, .internal, "failed to render stack", &.{});
         return;
@@ -1060,6 +1190,10 @@ fn respondItemHtml(
         .prompt_body = prompt_body,
         .transcript_jsonl = transcript_jsonl,
         .enable_sse = enable_sse,
+        // Loopback-only daemon: safe to embed the local mutation token in
+        // the rendered page (cancel/retry forms include it as a hidden
+        // field; see `writeItemControls`).
+        .local_token = self.token.bytes,
     }) catch {
         try respondError(req, .internal, "failed to render item", &.{});
         return;
@@ -1582,6 +1716,64 @@ fn handlePauseResume(self: *Daemon, req: *std.http.Server.Request, stack: []cons
     self.queue.submitAndWait(&request);
     if (request.err) |k| {
         try respondMutationError(req, k, stack, "");
+        return;
+    }
+    defer if (request.output) |*o| o.deinit();
+    try respondMutationOk(req, self.allocator, &request);
+}
+
+/// Pause/resume entry point invoked when the browser-form auth path
+/// already consumed the request body (see `verifyAuthFormBody`). The body
+/// only ever carries `_token`, so there's nothing to re-parse — we just
+/// submit the mutation.
+fn handlePauseResumeFormPath(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, paused: bool) !void {
+    var request = mutation_queue.Request{
+        .kind = if (paused) .{ .pause_stack = .{ .stack = stack } } else .{ .resume_stack = .{ .stack = stack } },
+        .ident = .{ .api_path = if (paused) "POST /stacks/{name}/pause" else "POST /stacks/{name}/resume" },
+    };
+    self.queue.submitAndWait(&request);
+    if (request.err) |k| {
+        try respondMutationError(req, k, stack, "");
+        return;
+    }
+    defer if (request.output) |*o| o.deinit();
+    try respondMutationOk(req, self.allocator, &request);
+}
+
+/// Cancel/retry/supersede entry point for the browser-form auth path. The
+/// body has already been consumed; `replacement` (only used by
+/// `supersede`) is not surfaced as a browser control, so we never need to
+/// recover it here. If a future browser form needs additional fields the
+/// caller can pass the cached body in via this function's signature.
+fn handleTransitionFormPath(
+    self: *Daemon,
+    req: *std.http.Server.Request,
+    stack: []const u8,
+    id: []const u8,
+    t: mutations_mod.ApiTransition,
+) !void {
+    // Supersede needs `replacement` which the form layer never carries; if
+    // the route is ever surfaced as a form, callers must extend this path.
+    if (t == .supersede) {
+        try respondError(req, .validation_failed, "supersede not available via form path", &.{});
+        return;
+    }
+    const api_path = switch (t) {
+        .cancel => "POST /stacks/{name}/items/{id}/cancel",
+        .retry => "POST /stacks/{name}/items/{id}/retry",
+        .supersede => unreachable,
+    };
+    var request = mutation_queue.Request{
+        .kind = .{ .transition = .{
+            .stack = stack,
+            .id = id,
+            .transition = t,
+        } },
+        .ident = .{ .api_path = api_path },
+    };
+    self.queue.submitAndWait(&request);
+    if (request.err) |k| {
+        try respondMutationError(req, k, stack, id);
         return;
     }
     defer if (request.output) |*o| o.deinit();
