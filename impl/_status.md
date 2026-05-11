@@ -13,7 +13,7 @@ Tracks progress through the implement → review → fix loop for milestones 1�
 | 3 | 03_daemon_skeleton.md | 46ac594 | 0 | — | 0 | 0 | 11 non-blocking; 103/103 tests; std.http.Server + hand router |
 | 4 | 04_cli_read.md | 8137551 | 0 | — | 0 | 0 | initial impl had test hang (use-after-return in extractJsonStringArray); fixed in finalize pass; 135/135 tests, 13 non-blocking nits |
 | 5 | 05_mutations_and_vcs.md | 886f9ff | 0 | — | 0 | 0 | 16 non-blocking; 172/172 tests; 5/6 acceptance fully MET, rollback-on-commit-failure partial |
-| 6 | 06_runtime_core.md | | | | | | |
+| 6 | 06_runtime_core.md | e12ac69 | 1 | c2c76ae | 0 | 0 | blocker: daemon never started Supervisor; fix wired it into startWorker; 206/206 tests; 6 non-blocking remain |
 | 7 | 07_claude_codex_adapters.md | | | | | | |
 | 8 | 08_provider_status_and_gemini.md | | | | | | |
 | 9 | 09_html_rendering.md | | | | | | |
