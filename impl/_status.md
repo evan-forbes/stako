@@ -15,6 +15,6 @@ Tracks progress through the implement → review → fix loop for milestones 1�
 | 5 | 05_mutations_and_vcs.md | 886f9ff | 0 | — | 0 | 0 | 16 non-blocking; 172/172 tests; 5/6 acceptance fully MET, rollback-on-commit-failure partial |
 | 6 | 06_runtime_core.md | e12ac69 | 1 | c2c76ae | 0 | 0 | blocker: daemon never started Supervisor; fix wired it into startWorker; 206/206 tests; 6 non-blocking remain |
 | 7 | 07_claude_codex_adapters.md | 6f9af37 | 2 | b054686 | 0 | 0 | session_ended → [result] block was missing; fix wires it + 2 adapter [result] tests; 242/242 tests; 7 non-blocking remain |
-| 8 | 08_provider_status_and_gemini.md | | | | | | |
+| 8 | 08_provider_status_and_gemini.md | f39f3f8 | 0 | — | 0 | 0 | 7 non-blocking; 273/273 tests; Gemini scaffolded only (factory→null, documented in design_execution_harness.md) |
 | 9 | 09_html_rendering.md | | | | | | |
 | 10 | 10_authorization.md | | | | | | |
