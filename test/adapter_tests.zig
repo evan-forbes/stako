@@ -384,6 +384,154 @@ test "m7 runtime: codex adapter end-to-end against scripted fixture" {
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"terminal_status\":\"completed\"") != null);
 }
 
+test "m7 result block: claude scripted run records session_id + harness in meta.toml [result]" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "claude-result");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false, "[\"claude\"]");
+
+    const item_body =
+        \\id = "0001"
+        \\slug = "hello"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\provider = "anthropic"
+        \\match = "exact"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "hello", item_body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    const fixture_claude = try absFixturePath(a, "harness/claude_stream.jsonl");
+    const fixture_codex = try absFixturePath(a, "harness/codex_stream.jsonl");
+    const script = try absFixturePath(a, "harness/cat_jsonl.sh");
+    const sh = ScriptedHarness{
+        .fixture_claude_abs = fixture_claude,
+        .fixture_codex_abs = fixture_codex,
+        .script_abs = script,
+    };
+    GLOBAL_SCRIPTED = &sh;
+    defer {
+        GLOBAL_SCRIPTED = null;
+        a.free(fixture_claude);
+        a.free(fixture_codex);
+        a.free(script);
+    }
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = scriptedDispatch(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-hello/meta.toml" });
+    defer a.free(meta_path);
+    var mf = try std.fs.cwd().openFile(meta_path, .{});
+    defer mf.close();
+    const stat = try mf.stat();
+    const mbuf = try a.alloc(u8, stat.size);
+    defer a.free(mbuf);
+    _ = try mf.readAll(mbuf);
+
+    // Item must be terminal.
+    try std.testing.expect(std.mem.indexOf(u8, mbuf, "status = \"completed\"") != null);
+    // [result] block must exist and carry the adapter-captured fields.
+    const result_idx = std.mem.indexOf(u8, mbuf, "[result]") orelse return error.NoResultBlock;
+    const tail = mbuf[result_idx..];
+    try std.testing.expect(std.mem.indexOf(u8, tail, "harness = \"claude\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "session_id = \"sess-claude-real\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "model = \"claude-opus-4-7\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "exit_code = 0") != null);
+}
+
+test "m7 result block: codex scripted run records session_id + harness in meta.toml [result]" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "codex-result");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false, "[\"codex\"]");
+
+    const item_body =
+        \\id = "0001"
+        \\slug = "hello"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\provider = "openai"
+        \\match = "exact"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "hello", item_body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    const fixture_claude = try absFixturePath(a, "harness/claude_stream.jsonl");
+    const fixture_codex = try absFixturePath(a, "harness/codex_stream.jsonl");
+    const script = try absFixturePath(a, "harness/cat_jsonl.sh");
+    const sh = ScriptedHarness{
+        .fixture_claude_abs = fixture_claude,
+        .fixture_codex_abs = fixture_codex,
+        .script_abs = script,
+    };
+    GLOBAL_SCRIPTED = &sh;
+    defer {
+        GLOBAL_SCRIPTED = null;
+        a.free(fixture_claude);
+        a.free(fixture_codex);
+        a.free(script);
+    }
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = scriptedDispatch(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-hello/meta.toml" });
+    defer a.free(meta_path);
+    var mf = try std.fs.cwd().openFile(meta_path, .{});
+    defer mf.close();
+    const stat = try mf.stat();
+    const mbuf = try a.alloc(u8, stat.size);
+    defer a.free(mbuf);
+    _ = try mf.readAll(mbuf);
+
+    try std.testing.expect(std.mem.indexOf(u8, mbuf, "status = \"completed\"") != null);
+    const result_idx = std.mem.indexOf(u8, mbuf, "[result]") orelse return error.NoResultBlock;
+    const tail = mbuf[result_idx..];
+    try std.testing.expect(std.mem.indexOf(u8, tail, "harness = \"codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "session_id = \"th-codex-real\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "model = \"gpt-5\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tail, "exit_code = 0") != null);
+}
+
 test "m7 routing: item.target.provider=anthropic picks claude when allowed" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "route-anthropic");

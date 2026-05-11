@@ -504,6 +504,28 @@ fn onExitMain(s: *Session) void {
     const ran_to_completion = !canceled and term == .Exited;
 
     const ev = s.adapter.onExit(s.allocator, exit_code, ran_to_completion) catch return;
+    // Snapshot adapter-captured `[result]` fields from the session_ended
+    // payload BEFORE freeing the event. Each adapter emits a JSON object on
+    // `data_json` whose keys are stable (`session_id`, `session_file`,
+    // `model`, `exit_code`) — see claude_adapter.onExit and
+    // codex_adapter.onExit. The borrowed slices below become invalid once
+    // the event storage is freed, so we dupe them into local buffers that
+    // outlive the apply call.
+    var result_sid_owned: ?[]u8 = null;
+    var result_sf_owned: ?[]u8 = null;
+    var result_model_owned: ?[]u8 = null;
+    defer if (result_sid_owned) |x| s.allocator.free(x);
+    defer if (result_sf_owned) |x| s.allocator.free(x);
+    defer if (result_model_owned) |x| s.allocator.free(x);
+    if (extractJsonString(ev.ev.data_json, "\"session_id\":")) |x| {
+        result_sid_owned = s.allocator.dupe(u8, x) catch null;
+    }
+    if (extractJsonString(ev.ev.data_json, "\"session_file\":")) |x| {
+        result_sf_owned = s.allocator.dupe(u8, x) catch null;
+    }
+    if (extractJsonString(ev.ev.data_json, "\"model\":")) |x| {
+        result_model_owned = s.allocator.dupe(u8, x) catch null;
+    }
     {
         defer adapter_mod.freeOwned(s.allocator, ev);
         var event = ev.ev;
@@ -523,16 +545,75 @@ fn onExitMain(s: *Session) void {
         if (exit_code == 0) break :blk .completed;
         break :blk .failed;
     };
+
+    // Compose terminal `[result]` block from the adapter's captured state.
+    // Fall back to the session_id snooped from `session_started` if the
+    // session_ended payload omitted it.
+    var sid_fallback_owned: ?[]u8 = null;
+    defer if (sid_fallback_owned) |x| s.allocator.free(x);
+    s.session_id_mutex.lock();
+    if (result_sid_owned == null and s.session_id.len > 0) {
+        sid_fallback_owned = s.allocator.dupe(u8, s.session_id) catch null;
+    }
+    s.session_id_mutex.unlock();
+    const sid_for_result: ?[]const u8 = blk: {
+        if (result_sid_owned) |x| break :blk x;
+        if (sid_fallback_owned) |x| break :blk x;
+        break :blk null;
+    };
+
+    var ts_buf: [40]u8 = undefined;
+    const completed_at = audit.nowRfc3339Millis(&ts_buf);
+
     var input: mutation_queue.RuntimeTransitionInput = .{
         .stack = s.stack,
         .id = s.item_id,
         .to = tag,
+        .result_harness = s.harness_name,
+        .result_model = if (result_model_owned) |x| x else null,
+        .result_session_id = sid_for_result,
+        .result_session_file = if (result_sf_owned) |x| x else null,
+        .result_transcript_path = s.transcript.path,
+        .result_exit_code = @as(i64, exit_code),
+        .result_completed_at = completed_at,
     };
     if (tag == .failed) input.failed_reason = "subprocess_nonzero_exit";
     if (tag == .canceled) input.canceled_by = "system";
     applyTransition(s.manager.queue, input);
 
     s.manager.markFinished(s);
+}
+
+/// Extract a JSON string value for `key_with_colon` (e.g. `"\"foo\":"`)
+/// from a flat-ish JSON object. Skips escaped quotes inside the value.
+/// Returns the inner string slice borrowed from `src`, or null if absent.
+fn extractJsonString(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
+    var search_from: usize = 0;
+    while (search_from < src.len) {
+        const idx = std.mem.indexOf(u8, src[search_from..], key_with_colon) orelse return null;
+        const abs = search_from + idx;
+        if (abs > 0) {
+            const c = src[abs - 1];
+            if (c != ',' and c != '{' and c != ' ' and c != '\t' and c != '\n' and c != '[') {
+                search_from = abs + 1;
+                continue;
+            }
+        }
+        var i = abs + key_with_colon.len;
+        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
+        if (i >= src.len or src[i] != '"') return null;
+        i += 1;
+        const start = i;
+        while (i < src.len) : (i += 1) {
+            if (src[i] == '\\') {
+                i += 1;
+                continue;
+            }
+            if (src[i] == '"') return src[start..i];
+        }
+        return null;
+    }
+    return null;
 }
 
 fn extractSessionId(data_json: []const u8) ?[]const u8 {
