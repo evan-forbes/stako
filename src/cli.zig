@@ -150,11 +150,28 @@ pub const StackAction = enum {
     list,
     show,
     config,
+    // Mutations (milestone 5).
+    new,
+    add,
+    insert,
+    retry,
+    cancel,
+    supersede,
+    pause,
+    @"resume",
 
     pub fn fromString(s: []const u8) ?StackAction {
         if (std.mem.eql(u8, s, "list") or std.mem.eql(u8, s, "ls")) return .list;
         if (std.mem.eql(u8, s, "show") or std.mem.eql(u8, s, "sh")) return .show;
         if (std.mem.eql(u8, s, "config") or std.mem.eql(u8, s, "cfg")) return .config;
+        if (std.mem.eql(u8, s, "new")) return .new;
+        if (std.mem.eql(u8, s, "add")) return .add;
+        if (std.mem.eql(u8, s, "insert") or std.mem.eql(u8, s, "ins")) return .insert;
+        if (std.mem.eql(u8, s, "retry") or std.mem.eql(u8, s, "rt")) return .retry;
+        if (std.mem.eql(u8, s, "cancel") or std.mem.eql(u8, s, "cx")) return .cancel;
+        if (std.mem.eql(u8, s, "supersede") or std.mem.eql(u8, s, "sup")) return .supersede;
+        if (std.mem.eql(u8, s, "pause") or std.mem.eql(u8, s, "p")) return .pause;
+        if (std.mem.eql(u8, s, "resume") or std.mem.eql(u8, s, "r")) return .@"resume";
         return null;
     }
 };
@@ -173,6 +190,26 @@ pub const StackArgs = struct {
     /// Required for `show`/`config`. Empty for `list`.
     name: []const u8 = "",
     flags: ApiFlags = .{},
+
+    // Action-specific positional / flag inputs (milestone 5 mutations).
+    /// `add`: kind ("prompt", "compact", …). `insert`: same.
+    kind: []const u8 = "",
+    /// `add` / `insert`: target shorthand `provider[/model]` or `match=any`.
+    target: []const u8 = "",
+    /// `add` / `insert`: prompt body filename. `-` means stdin (not v1).
+    prompt_file: []const u8 = "",
+    /// `add` / `insert`: explicit slug (else derived from prompt file or
+    /// auto-generated).
+    slug: []const u8 = "",
+    /// `insert`: reference item id (positional before the kind).
+    ref: []const u8 = "",
+    /// `retry`/`cancel`/`supersede`: target item id.
+    item_id: []const u8 = "",
+    /// `supersede`: replacement item id.
+    replacement: []const u8 = "",
+    /// `config`: one --set entries (key=value). Up to 8 in v1.
+    set_pairs: [8][]const u8 = std.mem.zeroes([8][]const u8),
+    set_count: u8 = 0,
 };
 
 /// Parse `stack <action> [<name>] [flags...]`. Flags can appear before or
@@ -185,37 +222,144 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
+        // Global flags shared by every action.
         if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-j")) {
             out.flags.json = true;
-        } else if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
             out.flags.verbose = true;
-        } else if (std.mem.eql(u8, a, "--root") or std.mem.eql(u8, a, "-r")) {
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--root") or std.mem.eql(u8, a, "-r")) {
             if (i + 1 >= args.len) return error.BadFlagValue;
             i += 1;
             out.flags.root = args[i];
-        } else if (std.mem.startsWith(u8, a, "--root=")) {
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--root=")) {
             out.flags.root = a["--root=".len..];
             if (out.flags.root.len == 0) return error.BadFlagValue;
-        } else if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
             if (i + 1 >= args.len) return error.BadFlagValue;
             i += 1;
             out.flags.port_override = std.fmt.parseInt(u16, args[i], 10) catch return error.BadFlagValue;
-        } else if (std.mem.startsWith(u8, a, "--port=")) {
+            continue;
+        }
+        if (std.mem.startsWith(u8, a, "--port=")) {
             const v = a["--port=".len..];
             out.flags.port_override = std.fmt.parseInt(u16, v, 10) catch return error.BadFlagValue;
-        } else if (std.mem.startsWith(u8, a, "-")) {
-            return error.BadFlagValue;
-        } else {
-            // Positional.
-            if (positional_seen == 0 and out.action != .list) {
-                out.name = a;
-            } else {
-                return error.BadFlagValue;
-            }
-            positional_seen += 1;
+            continue;
         }
+
+        // Action-specific flags.
+        if (out.action == .add or out.action == .insert) {
+            if (std.mem.eql(u8, a, "--target") or std.mem.eql(u8, a, "-t")) {
+                if (i + 1 >= args.len) return error.BadFlagValue;
+                i += 1;
+                out.target = args[i];
+                continue;
+            }
+            if (std.mem.startsWith(u8, a, "--target=")) {
+                out.target = a["--target=".len..];
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--prompt-file") or std.mem.eql(u8, a, "-f")) {
+                if (i + 1 >= args.len) return error.BadFlagValue;
+                i += 1;
+                out.prompt_file = args[i];
+                continue;
+            }
+            if (std.mem.startsWith(u8, a, "--prompt-file=")) {
+                out.prompt_file = a["--prompt-file=".len..];
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--slug")) {
+                if (i + 1 >= args.len) return error.BadFlagValue;
+                i += 1;
+                out.slug = args[i];
+                continue;
+            }
+            if (std.mem.startsWith(u8, a, "--slug=")) {
+                out.slug = a["--slug=".len..];
+                continue;
+            }
+        }
+        if (out.action == .config) {
+            if (std.mem.eql(u8, a, "--set") or std.mem.eql(u8, a, "-s")) {
+                if (i + 1 >= args.len) return error.BadFlagValue;
+                i += 1;
+                if (out.set_count >= out.set_pairs.len) return error.BadFlagValue;
+                out.set_pairs[out.set_count] = args[i];
+                out.set_count += 1;
+                continue;
+            }
+            if (std.mem.startsWith(u8, a, "--set=")) {
+                if (out.set_count >= out.set_pairs.len) return error.BadFlagValue;
+                out.set_pairs[out.set_count] = a["--set=".len..];
+                out.set_count += 1;
+                continue;
+            }
+        }
+
+        if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
+
+        // Positionals (per-action layout).
+        switch (out.action) {
+            .list => return error.BadFlagValue,
+            .show, .config, .new, .pause, .@"resume" => {
+                if (positional_seen != 0) return error.BadFlagValue;
+                out.name = a;
+            },
+            .add => {
+                // positionals: <name> <kind>
+                switch (positional_seen) {
+                    0 => out.name = a,
+                    1 => out.kind = a,
+                    else => return error.BadFlagValue,
+                }
+            },
+            .insert => {
+                // positionals: <name> <ref> <kind>
+                switch (positional_seen) {
+                    0 => out.name = a,
+                    1 => out.ref = a,
+                    2 => out.kind = a,
+                    else => return error.BadFlagValue,
+                }
+            },
+            .retry, .cancel => {
+                // positionals: <name> <id>
+                switch (positional_seen) {
+                    0 => out.name = a,
+                    1 => out.item_id = a,
+                    else => return error.BadFlagValue,
+                }
+            },
+            .supersede => {
+                // positionals: <name> <id> <replacement>
+                switch (positional_seen) {
+                    0 => out.name = a,
+                    1 => out.item_id = a,
+                    2 => out.replacement = a,
+                    else => return error.BadFlagValue,
+                }
+            },
+        }
+        positional_seen += 1;
     }
-    if (out.action != .list and out.name.len == 0) return error.NoSubcommand;
+
+    // Validate per-action that we got the required positionals.
+    switch (out.action) {
+        .list => {},
+        .show, .config, .new, .pause, .@"resume" => if (out.name.len == 0) return error.NoSubcommand,
+        .add => if (out.name.len == 0 or out.kind.len == 0) return error.NoSubcommand,
+        .insert => if (out.name.len == 0 or out.ref.len == 0 or out.kind.len == 0) return error.NoSubcommand,
+        .retry, .cancel => if (out.name.len == 0 or out.item_id.len == 0) return error.NoSubcommand,
+        .supersede => if (out.name.len == 0 or out.item_id.len == 0 or out.replacement.len == 0) return error.NoSubcommand,
+    }
     return out;
 }
 
@@ -268,6 +412,12 @@ fn runDaemon(
                 return 1;
             };
             defer d.deinit();
+            // Mutations come up here: spawn the queue worker now that `d`
+            // has a stable address.
+            d.startWorker() catch |e| {
+                try stderr.print("organo daemon start: failed to start mutation worker: {s}\n", .{@errorName(e)});
+                return 1;
+            };
             try stdout.print("organo daemon: listening on 127.0.0.1:{d}\n", .{d.bound_port});
             try stdout.flush();
             try stderr.flush();
@@ -583,4 +733,67 @@ test "parseStackArgs: rejects extra positional" {
 
 test "parseStackArgs: rejects unknown action" {
     try std.testing.expectError(error.UnknownSubcommand, parseStackArgs(&.{"bogus"}));
+}
+
+// ---------- mutation subcommand parser tests (milestone 5) ----------
+
+test "parseStackArgs: new <name>" {
+    const a = try parseStackArgs(&.{ "new", "demo" });
+    try std.testing.expectEqual(StackAction.new, a.action);
+    try std.testing.expectEqualStrings("demo", a.name);
+}
+
+test "parseStackArgs: add with kind, target shorthand, prompt file" {
+    const a = try parseStackArgs(&.{ "add", "demo", "prompt", "-t", "anthropic/claude-opus-4-7", "-f", "p.md" });
+    try std.testing.expectEqual(StackAction.add, a.action);
+    try std.testing.expectEqualStrings("demo", a.name);
+    try std.testing.expectEqualStrings("prompt", a.kind);
+    try std.testing.expectEqualStrings("anthropic/claude-opus-4-7", a.target);
+    try std.testing.expectEqualStrings("p.md", a.prompt_file);
+}
+
+test "parseStackArgs: insert <name> <ref> <kind>" {
+    const a = try parseStackArgs(&.{ "ins", "demo", "0002", "prompt" });
+    try std.testing.expectEqual(StackAction.insert, a.action);
+    try std.testing.expectEqualStrings("demo", a.name);
+    try std.testing.expectEqualStrings("0002", a.ref);
+    try std.testing.expectEqualStrings("prompt", a.kind);
+}
+
+test "parseStackArgs: retry/cancel short aliases" {
+    const r = try parseStackArgs(&.{ "rt", "demo", "0001" });
+    try std.testing.expectEqual(StackAction.retry, r.action);
+    try std.testing.expectEqualStrings("0001", r.item_id);
+    const c = try parseStackArgs(&.{ "cx", "demo", "0001" });
+    try std.testing.expectEqual(StackAction.cancel, c.action);
+}
+
+test "parseStackArgs: supersede has replacement positional" {
+    const a = try parseStackArgs(&.{ "sup", "demo", "0001", "0007" });
+    try std.testing.expectEqual(StackAction.supersede, a.action);
+    try std.testing.expectEqualStrings("0001", a.item_id);
+    try std.testing.expectEqualStrings("0007", a.replacement);
+}
+
+test "parseStackArgs: pause / resume short aliases" {
+    const p = try parseStackArgs(&.{ "p", "demo" });
+    try std.testing.expectEqual(StackAction.pause, p.action);
+    const r = try parseStackArgs(&.{ "r", "demo" });
+    try std.testing.expectEqual(StackAction.@"resume", r.action);
+}
+
+test "parseStackArgs: config --set key=value collects entries" {
+    const a = try parseStackArgs(&.{ "cfg", "demo", "-s", "paused=true", "--set=continuity=chain" });
+    try std.testing.expectEqual(StackAction.config, a.action);
+    try std.testing.expectEqual(@as(u8, 2), a.set_count);
+    try std.testing.expectEqualStrings("paused=true", a.set_pairs[0]);
+    try std.testing.expectEqualStrings("continuity=chain", a.set_pairs[1]);
+}
+
+test "parseStackArgs: add missing kind rejected" {
+    try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{ "add", "demo" }));
+}
+
+test "parseStackArgs: supersede missing replacement rejected" {
+    try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{ "sup", "demo", "0001" }));
 }

@@ -18,6 +18,10 @@ pub const errors = @import("errors.zig");
 pub const storage = @import("storage.zig");
 pub const daemon = @import("daemon.zig");
 pub const http_client = @import("http_client.zig");
+pub const audit = @import("audit.zig");
+pub const vcs = @import("vcs.zig");
+pub const mutations = @import("mutations.zig");
+pub const mutation_queue = @import("mutation_queue.zig");
 
 pub const Status = state.Status;
 pub const Kind = item.Kind;

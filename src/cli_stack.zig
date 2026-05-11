@@ -33,7 +33,20 @@ pub fn run(
     switch (args.action) {
         .list => return try runList(allocator, &client, args.flags, stdout, stderr),
         .show => return try runShow(allocator, &client, args.flags, args.name, stdout, stderr),
-        .config => return try runConfig(allocator, &client, args.flags, args.name, stdout, stderr),
+        .config => {
+            if (args.set_count == 0) {
+                return try runConfig(allocator, &client, args.flags, args.name, stdout, stderr);
+            }
+            return try runConfigSet(allocator, &client, args, stdout, stderr);
+        },
+        .new => return try runNew(allocator, &client, args, stdout, stderr),
+        .add => return try runAdd(allocator, &client, args, stdout, stderr),
+        .insert => return try runInsert(allocator, &client, args, stdout, stderr),
+        .retry => return try runTransition(allocator, &client, args, "retry", stdout, stderr),
+        .cancel => return try runTransition(allocator, &client, args, "cancel", stdout, stderr),
+        .supersede => return try runSupersede(allocator, &client, args, stdout, stderr),
+        .pause => return try runPauseResume(allocator, &client, args, true, stdout, stderr),
+        .@"resume" => return try runPauseResume(allocator, &client, args, false, stdout, stderr),
     }
 }
 
@@ -375,6 +388,256 @@ fn extractJsonStringArray(
         if (i < body.len) i += 1; // step past closing quote
     }
     return out[0..n];
+}
+
+// ---------- mutation runners (milestone 5) ----------
+
+fn runNew(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    // POST /stacks with body {"name": "<name>"}.
+    var body = std.ArrayList(u8){};
+    defer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{\"name\":\"");
+    try writeJsonStr(w, args.name);
+    try w.writeAll("\"}");
+    return try postAndReport(allocator, client, "/stacks", body.items, args.flags, stdout, stderr);
+}
+
+fn runAdd(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    // POST /stacks/{name}/items with body {kind, slug, target?, prompt?}.
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items", .{args.name});
+    defer allocator.free(path);
+
+    var prompt_buf: ?[]u8 = null;
+    defer if (prompt_buf) |p| allocator.free(p);
+    if (args.prompt_file.len > 0) {
+        prompt_buf = readPromptFile(allocator, args.prompt_file) catch |e| {
+            try stderr.print("organo: failed to read --prompt-file: {s}\n", .{@errorName(e)});
+            return 1;
+        };
+    }
+
+    var body = std.ArrayList(u8){};
+    defer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{");
+    try w.print("\"kind\":\"{s}\"", .{args.kind});
+    const slug = if (args.slug.len > 0) args.slug else deriveDefaultSlug(args.kind, args.prompt_file);
+    try w.writeAll(",\"slug\":\"");
+    try writeJsonStr(w, slug);
+    try w.writeAll("\"");
+    try writeTargetFieldFromShorthand(w, args.target);
+    if (prompt_buf) |p| {
+        try w.writeAll(",\"prompt\":\"");
+        try writeJsonStr(w, p);
+        try w.writeAll("\"");
+    }
+    try w.writeAll("}");
+    return try postAndReport(allocator, client, path, body.items, args.flags, stdout, stderr);
+}
+
+fn runInsert(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/insert", .{ args.name, args.ref });
+    defer allocator.free(path);
+    var body = std.ArrayList(u8){};
+    defer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{");
+    try w.print("\"kind\":\"{s}\"", .{args.kind});
+    const slug = if (args.slug.len > 0) args.slug else deriveDefaultSlug(args.kind, args.prompt_file);
+    try w.writeAll(",\"slug\":\"");
+    try writeJsonStr(w, slug);
+    try w.writeAll("\"");
+    try writeTargetFieldFromShorthand(w, args.target);
+    try w.writeAll("}");
+    return try postAndReport(allocator, client, path, body.items, args.flags, stdout, stderr);
+}
+
+fn runTransition(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    verb: []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/{s}", .{ args.name, args.item_id, verb });
+    defer allocator.free(path);
+    return try postAndReport(allocator, client, path, "{}", args.flags, stdout, stderr);
+}
+
+fn runSupersede(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/supersede", .{ args.name, args.item_id });
+    defer allocator.free(path);
+    var body = std.ArrayList(u8){};
+    defer body.deinit(allocator);
+    try body.writer(allocator).print("{{\"replacement\":\"{s}\"}}", .{args.replacement});
+    return try postAndReport(allocator, client, path, body.items, args.flags, stdout, stderr);
+}
+
+fn runPauseResume(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    paused: bool,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const verb: []const u8 = if (paused) "pause" else "resume";
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/{s}", .{ args.name, verb });
+    defer allocator.free(path);
+    return try postAndReport(allocator, client, path, "{}", args.flags, stdout, stderr);
+}
+
+fn runConfigSet(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/config", .{args.name});
+    defer allocator.free(path);
+    var body = std.ArrayList(u8){};
+    defer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{");
+    var first = true;
+    var i: usize = 0;
+    while (i < args.set_count) : (i += 1) {
+        const pair = args.set_pairs[i];
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+            try stderr.writeAll("organo: --set must be key=value\n");
+            return 2;
+        };
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.writeAll("\"");
+        try writeJsonStr(w, pair[0..eq]);
+        try w.writeAll("\":\"");
+        try writeJsonStr(w, pair[eq + 1 ..]);
+        try w.writeAll("\"");
+    }
+    try w.writeAll("}");
+    return try postAndReport(allocator, client, path, body.items, args.flags, stdout, stderr);
+}
+
+fn postAndReport(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    path: []const u8,
+    body: []const u8,
+    flags: cli.ApiFlags,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    _ = allocator;
+    var resp = http_client.request(client, "POST", path, body) catch |e| {
+        return reportClientError(e, client, path, stderr);
+    };
+    defer resp.deinit();
+    if (resp.status < 200 or resp.status >= 300) {
+        return reportApiError(resp.status, resp.body, path, flags.verbose, stderr);
+    }
+    if (flags.json) {
+        try stdout.writeAll(resp.body);
+        try stdout.writeAll("\n");
+        return 0;
+    }
+    // Human view: print "ok" plus the commit SHA if present.
+    if (findJsonStringField(resp.body, "\"commit\":\"")) |sha| {
+        try stdout.print("organo: ok (commit {s})\n", .{sha});
+    } else {
+        try stdout.writeAll("organo: ok\n");
+    }
+    return 0;
+}
+
+fn writeJsonStr(w: anytype, s: []const u8) !void {
+    for (s) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            else => try w.writeByte(c),
+        }
+    }
+}
+
+/// `target` shorthand: `provider[/model]` or "any"/"compatible"/"exact"
+/// (the latter sets `match` only). Empty target string emits nothing.
+fn writeTargetFieldFromShorthand(w: anytype, target: []const u8) !void {
+    if (target.len == 0) return;
+    try w.writeAll(",\"target\":{");
+    if (std.mem.eql(u8, target, "any") or std.mem.eql(u8, target, "compatible") or std.mem.eql(u8, target, "exact")) {
+        try w.print("\"match\":\"{s}\"", .{target});
+        try w.writeAll("}");
+        return;
+    }
+    const slash = std.mem.indexOfScalar(u8, target, '/');
+    const provider = if (slash) |i| target[0..i] else target;
+    try w.writeAll("\"provider\":\"");
+    try writeJsonStr(w, provider);
+    try w.writeAll("\"");
+    if (slash) |i| {
+        const model = target[i + 1 ..];
+        try w.writeAll(",\"model\":\"");
+        try writeJsonStr(w, model);
+        try w.writeAll("\"");
+    }
+    try w.writeAll(",\"match\":\"compatible\"}");
+}
+
+fn deriveDefaultSlug(kind: []const u8, prompt_file: []const u8) []const u8 {
+    if (prompt_file.len > 0) {
+        const base = std.fs.path.basename(prompt_file);
+        const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len;
+        if (dot > 0 and dot <= 30 and isAllKebabCase(base[0..dot])) return base[0..dot];
+    }
+    return kind;
+}
+
+fn isAllKebabCase(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn readPromptFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    if (stat.size > 1024 * 1024) return error.PromptFileTooLarge;
+    const buf = try allocator.alloc(u8, stat.size);
+    _ = try f.readAll(buf);
+    return buf;
 }
 
 // ---------- unit tests ----------

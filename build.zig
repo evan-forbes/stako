@@ -208,6 +208,22 @@ pub fn build(b: *std.Build) void {
     // is installed before the test runs.
     run_cli_tests.step.dependOn(b.getInstallStep());
 
+    // Milestone 5: mutation HTTP integration tests. Boots an ephemeral
+    // daemon backed by a real git repo (via vcs.ensureRealRepo), drives
+    // POST endpoints through the queue + audit log + vcs commit pipeline.
+    const mutation_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/mutation_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "organo", .module = mod },
+            },
+        }),
+    });
+    const run_mutation_tests = b.addRunArtifact(mutation_tests);
+    run_mutation_tests.setCwd(b.path("."));
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -218,6 +234,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_init_tests.step);
     test_step.dependOn(&run_daemon_tests.step);
     test_step.dependOn(&run_cli_tests.step);
+    test_step.dependOn(&run_mutation_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
