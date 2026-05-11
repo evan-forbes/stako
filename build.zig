@@ -260,6 +260,23 @@ pub fn build(b: *std.Build) void {
     const run_adapter_tests = b.addRunArtifact(adapter_tests);
     run_adapter_tests.setCwd(b.path("."));
 
+    // Milestone 9: HTML rendering snapshot tests + Accept-header negotiation.
+    // Renders the canonical smoke-stack fixture and asserts byte-equality
+    // against committed `.expected` files under test/fixtures/html/. Runs
+    // from the build root so fixture paths resolve.
+    const html_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/html_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "organo", .module = mod },
+            },
+        }),
+    });
+    const run_html_tests = b.addRunArtifact(html_tests);
+    run_html_tests.setCwd(b.path("."));
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -273,6 +290,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mutation_tests.step);
     test_step.dependOn(&run_runtime_tests.step);
     test_step.dependOn(&run_adapter_tests.step);
+    test_step.dependOn(&run_html_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

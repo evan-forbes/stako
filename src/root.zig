@@ -35,6 +35,7 @@ pub const session_manager = @import("session_manager.zig");
 pub const runtime = @import("runtime.zig");
 pub const provider_status = @import("provider_status.zig");
 pub const cli_auth = @import("cli_auth.zig");
+pub const html = @import("html.zig");
 
 pub const Status = state.Status;
 pub const Kind = item.Kind;

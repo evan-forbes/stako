@@ -30,6 +30,7 @@ const mutation_queue = @import("mutation_queue.zig");
 const sse_mod = @import("sse.zig");
 const runtime_mod = @import("runtime.zig");
 const provider_status = @import("provider_status.zig");
+const html = @import("html.zig");
 
 pub const StartOptions = struct {
     /// Notes-root directory (path; resolved internally).
@@ -462,6 +463,9 @@ const Route = enum {
     // Provider status (milestone 8).
     providers_list, // GET /providers
     provider_get, // GET /providers/{name}
+    // HTML (milestone 9).
+    index_html, // GET / (HTML-only landing page)
+    static_css, // GET /static/style.css
     unknown,
 };
 
@@ -480,6 +484,8 @@ pub fn matchRoute(target: []const u8) RouteMatch {
     const path = target[0..q];
 
     if (std.mem.eql(u8, path, "/healthz")) return .{ .route = .healthz };
+    if (std.mem.eql(u8, path, "/") or path.len == 0) return .{ .route = .index_html };
+    if (std.mem.eql(u8, path, "/static/style.css")) return .{ .route = .static_css };
     if (std.mem.eql(u8, path, "/stacks") or std.mem.eql(u8, path, "/stacks/"))
         return .{ .route = .stacks_list };
 
@@ -594,13 +600,16 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         }
     }
 
+    // Content negotiation for the read endpoints that have an HTML view.
+    const wants_html = is_get and acceptHeaderWantsHtml(req);
+
     switch (m.route) {
         .healthz => try respondOkText(req, "ok\n"),
-        .stacks_list => try respondStacksList(self, req),
-        .stack_get => try respondStackGet(self, req, m.stack),
+        .stacks_list => if (wants_html) try respondIndexHtml(self, req) else try respondStacksList(self, req),
+        .stack_get => if (wants_html) try respondStackHtml(self, req, m.stack) else try respondStackGet(self, req, m.stack),
         .stack_config_get => try respondStackConfigGet(self, req, m.stack),
         .stack_items_list => try respondStackItemsList(self, req, m.stack),
-        .stack_item_get => try respondStackItemGet(self, req, m.stack, m.item),
+        .stack_item_get => if (wants_html) try respondItemHtml(self, req, m.stack, m.item) else try respondStackItemGet(self, req, m.stack, m.item),
         // Mutations.
         .stacks_create => try handleCreateStack(self, req),
         .stack_config_post => try handleConfigPost(self, req, m.stack),
@@ -615,8 +624,23 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         // Provider status (M8).
         .providers_list => try respondProvidersList(self, req),
         .provider_get => try respondProviderGet(self, req, m.provider),
+        // HTML (M9).
+        .index_html => try respondIndexHtml(self, req),
+        .static_css => try respondStyleCss(req),
         .unknown => try respondError(req, .not_found, "endpoint not found", &.{}),
     }
+}
+
+/// Read the `Accept` header from the request and decide whether the caller
+/// wants HTML. Defaults to JSON when the header is absent.
+fn acceptHeaderWantsHtml(req: *std.http.Server.Request) bool {
+    var it = req.iterateHeaders();
+    while (it.next()) |h| {
+        if (asciiEqlIgnoreCase(h.name, "accept")) {
+            return html.acceptHeaderWantsHtml(h.value);
+        }
+    }
+    return false;
 }
 
 fn promoteToMutation(r: Route) Route {
@@ -883,6 +907,191 @@ fn respondProviderGet(self: *Daemon, req: *std.http.Server.Request, name: []cons
     defer buf.deinit(self.allocator);
     try provider_status.writeJsonOne(buf.writer(self.allocator), status);
     try respondJson(req, buf.items);
+}
+
+// ---------- HTML (milestone 9) ----------
+
+fn respondHtml(req: *std.http.Server.Request, body: []const u8) !void {
+    try req.respond(body, .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+        },
+    });
+}
+
+fn respondStyleCss(req: *std.http.Server.Request) !void {
+    try req.respond(html.STYLE_CSS, .{
+        .status = .ok,
+        .extra_headers = &.{
+            .{ .name = "content-type", .value = "text/css; charset=utf-8" },
+            .{ .name = "cache-control", .value = "public, max-age=300" },
+        },
+    });
+}
+
+fn respondIndexHtml(self: *Daemon, req: *std.http.Server.Request) !void {
+    const names = self.reader.listStacks() catch {
+        try respondError(req, .internal, "failed to list stacks", &.{});
+        return;
+    };
+    defer self.reader.freeStackList(names);
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    html.renderIndex(self.allocator, &buf, names) catch {
+        try respondError(req, .internal, "failed to render index", &.{});
+        return;
+    };
+    try respondHtml(req, buf.items);
+}
+
+fn respondStackHtml(self: *Daemon, req: *std.http.Server.Request, name: []const u8) !void {
+    if (!storage.isValidStackName(name)) {
+        try respondError(req, .validation_failed, "invalid stack name", &.{
+            .{ .key = "name", .value = name },
+        });
+        return;
+    }
+    var cfg = self.reader.readStackConfig(name) catch |e| switch (e) {
+        error.NotFound => {
+            try respondError(req, .not_found, "stack not found", &.{
+                .{ .key = "stack", .value = name },
+            });
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer cfg.deinit();
+    const items = self.reader.listItems(name) catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
+    defer self.reader.freeItemList(items);
+
+    // Count items currently in `running` status as a cheap snapshot.
+    var running_count: usize = 0;
+    for (items) |it| {
+        if (std.mem.eql(u8, it.status, "running")) running_count += 1;
+    }
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    html.renderStack(self.allocator, &buf, .{
+        .name = name,
+        .config = &cfg,
+        .items = items,
+        .running_count = running_count,
+    }) catch {
+        try respondError(req, .internal, "failed to render stack", &.{});
+        return;
+    };
+    try respondHtml(req, buf.items);
+}
+
+fn respondItemHtml(
+    self: *Daemon,
+    req: *std.http.Server.Request,
+    name: []const u8,
+    id: []const u8,
+) !void {
+    if (!storage.isValidStackName(name)) {
+        try respondError(req, .validation_failed, "invalid stack name", &.{
+            .{ .key = "name", .value = name },
+        });
+        return;
+    }
+    if (!item_mod.isValidId(id)) {
+        try respondError(req, .validation_failed, "invalid item id", &.{
+            .{ .key = "id", .value = id },
+        });
+        return;
+    }
+    var it = self.reader.readItem(name, id) catch |e| switch (e) {
+        error.NotFound => {
+            try respondError(req, .not_found, "item not found", &.{
+                .{ .key = "stack", .value = name },
+                .{ .key = "id", .value = id },
+            });
+            return;
+        },
+        error.BadItemId => {
+            try respondError(req, .validation_failed, "invalid item id", &.{
+                .{ .key = "id", .value = id },
+            });
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer it.deinit();
+
+    // Load prompt.md and transcript.jsonl if present, both owned by the
+    // local allocator and freed after rendering. Errors are swallowed —
+    // missing files are normal for non-prompt items.
+    const item_dir = blk: {
+        const dir_name = try std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ it.id, it.slug });
+        defer self.allocator.free(dir_name);
+        break :blk try std.fs.path.join(self.allocator, &.{ self.notes_root_abs, "stacks", name, dir_name });
+    };
+    defer self.allocator.free(item_dir);
+
+    const prompt_body = readSmallFile(self.allocator, item_dir, "prompt.md") catch null;
+    defer if (prompt_body) |b| self.allocator.free(b);
+
+    const transcript_jsonl = readSmallFile(self.allocator, item_dir, "transcript.jsonl") catch null;
+    defer if (transcript_jsonl) |b| self.allocator.free(b);
+
+    // SSE is wired only when the runtime hub is live; otherwise the page is
+    // static (snapshots / tests). Item status `running` is the trigger for
+    // making the inline JS subscribe — terminal items don't need updates.
+    const enable_sse = self.sse_hub != null and it.status == .running;
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    html.renderItem(self.allocator, &buf, .{
+        .stack = name,
+        .item = &it,
+        .prompt_body = prompt_body,
+        .transcript_jsonl = transcript_jsonl,
+        .enable_sse = enable_sse,
+    }) catch {
+        try respondError(req, .internal, "failed to render item", &.{});
+        return;
+    };
+    try respondHtml(req, buf.items);
+}
+
+/// Read a single small file under `dir`. Returns null on missing/error so
+/// the caller can render a "no transcript yet" placeholder without bailing.
+/// Caller frees the returned buffer.
+fn readSmallFile(
+    allocator: std.mem.Allocator,
+    dir_abs: []const u8,
+    name: []const u8,
+) !?[]u8 {
+    const path = try std.fs.path.join(allocator, &.{ dir_abs, name });
+    defer allocator.free(path);
+    var f = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    defer f.close();
+    const stat = try f.stat();
+    if (stat.size == 0) return null;
+    // Cap to a sensible size; transcripts can grow large but for browser
+    // display we paginate at the HTML layer. v1 just clips at 1 MiB.
+    const cap: usize = 1024 * 1024;
+    const sz = if (stat.size > cap) cap else @as(usize, @intCast(stat.size));
+    const buf = try allocator.alloc(u8, sz);
+    errdefer allocator.free(buf);
+    _ = try f.readAll(buf);
+    return buf;
 }
 
 // ---------- JSON writers (typed views) ----------
@@ -1695,11 +1904,18 @@ test "matchRoute: known paths" {
 }
 
 test "matchRoute: unknown" {
-    try std.testing.expectEqual(Route.unknown, matchRoute("/").route);
+    // `/` is the HTML index landing page from M9 onward; what used to be
+    // `unknown` is now `index_html`.
+    try std.testing.expectEqual(Route.index_html, matchRoute("/").route);
     try std.testing.expectEqual(Route.unknown, matchRoute("/whatever").route);
     try std.testing.expectEqual(Route.unknown, matchRoute("/stacks/foo/items/0001/extra").route);
     // Trailing slash on the collection still matches the list route.
     try std.testing.expectEqual(Route.stacks_list, matchRoute("/stacks/").route);
+}
+
+test "matchRoute: HTML routes (M9)" {
+    try std.testing.expectEqual(Route.index_html, matchRoute("/").route);
+    try std.testing.expectEqual(Route.static_css, matchRoute("/static/style.css").route);
 }
 
 test "matchRoute: providers (M8)" {
