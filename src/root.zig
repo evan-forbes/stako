@@ -8,10 +8,14 @@ const std = @import("std");
 pub const toml = @import("toml.zig");
 pub const state = @import("state.zig");
 pub const item = @import("item.zig");
+pub const stack_config = @import("stack_config.zig");
+pub const init = @import("init.zig");
+pub const cli = @import("cli.zig");
 
 pub const Status = state.Status;
 pub const Kind = item.Kind;
 pub const Item = item.Item;
+pub const StackConfig = stack_config.StackConfig;
 
 pub fn bufferedPrint() !void {
     var stdout_buffer: [1024]u8 = undefined;

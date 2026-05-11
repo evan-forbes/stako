@@ -152,6 +152,21 @@ pub fn build(b: *std.Build) void {
     // Tests open files relative to the build root.
     run_item_format_tests.setCwd(b.path("."));
 
+    // Milestone 2: init + layout tests. Same conventions as item_format_tests:
+    // run from build root so fixture paths resolve.
+    const init_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/init_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "organo", .module = mod },
+            },
+        }),
+    });
+    const run_init_tests = b.addRunArtifact(init_tests);
+    run_init_tests.setCwd(b.path("."));
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -159,6 +174,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_item_format_tests.step);
+    test_step.dependOn(&run_init_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

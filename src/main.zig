@@ -1,27 +1,51 @@
+//! `organo` binary entry point.
+//!
+//! Milestone 2 wires `organo init`. Subcommand routing lives in `cli.zig`;
+//! this file is a thin wrapper around it.
+
 const std = @import("std");
 const organo = @import("organo");
 
-pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try organo.bufferedPrint();
-}
+pub fn main() !u8 {
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    // Collect argv (excluding argv[0]).
+    var arg_it = try std.process.argsWithAllocator(allocator);
+    defer arg_it.deinit();
+    _ = arg_it.next(); // skip program name
 
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
+    var args = std.ArrayList([]const u8){};
+    defer {
+        for (args.items) |s| allocator.free(s);
+        args.deinit(allocator);
+    }
+    while (arg_it.next()) |a| {
+        try args.append(allocator, try allocator.dupe(u8, a));
+    }
+
+    // Stdout/stderr writers (std.fs.File adapter).
+    var stdout_buf: [4096]u8 = undefined;
+    var stderr_buf: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    const stdout = &stdout_writer.interface;
+    const stderr = &stderr_writer.interface;
+
+    const code = organo.cli.dispatch(allocator, args.items, stdout, stderr) catch |e| {
+        stderr.print("organo: internal error: {s}\n", .{@errorName(e)}) catch {};
+        stderr.flush() catch {};
+        return 1;
     };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+
+    stdout.flush() catch {};
+    stderr.flush() catch {};
+    return code;
+}
+
+test "main module compiles" {
+    // Smoke test: ensure the module compiles. Behavioural tests live in
+    // test/init_tests.zig.
+    try std.testing.expect(true);
 }
