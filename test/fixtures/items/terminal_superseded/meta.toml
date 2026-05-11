@@ -1,0 +1,11 @@
+id = "0010"
+slug = "terminal-superseded"
+kind = "prompt"
+status = "superseded"
+created_at = 2026-05-10T15:15:00Z
+updated_at = 2026-05-10T15:15:30Z
+superseded_by = "0011"
+
+[target]
+provider = "anthropic"
+match = "exact"

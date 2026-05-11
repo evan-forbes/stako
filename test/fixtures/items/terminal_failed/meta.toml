@@ -1,0 +1,17 @@
+id = "0008"
+slug = "terminal-failed"
+kind = "prompt"
+status = "failed"
+created_at = 2026-05-10T15:05:00Z
+updated_at = 2026-05-10T15:05:12Z
+failed_reason = "subprocess_nonzero_exit"
+
+[target]
+provider = "anthropic"
+model = "claude-opus-4-7"
+match = "exact"
+
+[result]
+harness = "claude"
+exit_code = 1
+completed_at = 2026-05-10T15:05:12Z
