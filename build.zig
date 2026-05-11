@@ -184,6 +184,30 @@ pub fn build(b: *std.Build) void {
     const run_daemon_tests = b.addRunArtifact(daemon_tests);
     run_daemon_tests.setCwd(b.path("."));
 
+    // Milestone 4: CLI read-path tests. Spawns the daemon ephemerally and
+    // drives `cli.dispatch` in-process plus one subprocess invocation against
+    // the installed binary. The subprocess test depends on the install step
+    // so `zig-out/bin/organo` exists at runtime; we wire that explicitly.
+    const cli_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/cli_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            // Links libc for the ORGANO_PORT env-override test, which uses
+            // `setenv` to mutate the process environment in-place. No other
+            // module needs libc.
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "organo", .module = mod },
+            },
+        }),
+    });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+    run_cli_tests.setCwd(b.path("."));
+    // The subprocess test reads `zig-out/bin/organo`; make sure the binary
+    // is installed before the test runs.
+    run_cli_tests.step.dependOn(b.getInstallStep());
+
     // A top level step for running all tests. dependOn can be called multiple
     // times and since the two run steps do not depend on one another, this will
     // make the two of them run in parallel.
@@ -193,6 +217,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_item_format_tests.step);
     test_step.dependOn(&run_init_tests.step);
     test_step.dependOn(&run_daemon_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
