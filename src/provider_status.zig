@@ -76,8 +76,11 @@ pub const AuthState = enum {
     }
 };
 
-/// One provider's resolved status. Strings are borrowed from constants (or
-/// owned by the caller's arena when produced via `probeAll`).
+/// One provider's resolved status. All string fields are borrowed from
+/// program-lifetime constants — `probe`/`probeAll` never allocate per-field
+/// strings, so `Status` values can be passed around without ownership
+/// concerns. `probeAll` only owns the outer `[]Status` slice; see
+/// `StatusList.deinit`.
 pub const Status = struct {
     provider: Provider,
     /// The harness label we route through ("claude"/"codex"/"gemini").
@@ -125,6 +128,10 @@ pub fn probeAll(allocator: std.mem.Allocator) !StatusList {
 /// call on every routing tick, but the supervisor caches it once per
 /// supervisor lifetime — see `runtime.zig`'s `binary_present_cache`.
 pub fn probe(allocator: std.mem.Allocator, p: Provider) Status {
+    // Allocator currently unused: every `Status` field is a program-lifetime
+    // constant. The parameter is preserved so future probe paths (e.g.
+    // reading the head of a credential file or shelling out for `--version`)
+    // can take an allocator without breaking callers.
     _ = allocator;
     const binary = p.binaryName();
     const present = binaryOnPath(binary);
@@ -297,6 +304,19 @@ test "Provider.fromString aliases" {
     try std.testing.expectEqual(Provider.google, Provider.fromString("google").?);
     try std.testing.expectEqual(Provider.google, Provider.fromString("gemini").?);
     try std.testing.expect(Provider.fromString("nope") == null);
+}
+
+test "Provider.fromString empty string returns null" {
+    // Audit C9: empty string falls through cleanly; daemon route uses this
+    // as the "unknown provider" 404 path.
+    try std.testing.expect(Provider.fromString("") == null);
+}
+
+test "probeAll surfaces OOM cleanly" {
+    // Audit C6: the allocator-failure path must propagate `OutOfMemory`
+    // rather than leak the partially-built slice. `respondProvidersList`
+    // catches this and maps to HTTP 500.
+    try std.testing.expectError(error.OutOfMemory, probeAll(std.testing.failing_allocator));
 }
 
 test "binaryOnPath: /bin/sh always present" {

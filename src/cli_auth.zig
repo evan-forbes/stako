@@ -90,7 +90,17 @@ fn runSignout(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    _ = stdout;
+    // `--json` callers (scripted invocations) get a stable JSON envelope on
+    // stdout so they don't have to parse the human prose. Exit code stays 1
+    // either way. See audit I3.
+    if (args.flags.json) {
+        try stdout.print(
+            "{{\"error\":\"not_supported\",\"action\":\"signout\",\"provider\":\"{s}\"," ++
+                "\"message\":\"organo does not own provider subscription tokens; sign out via the provider's own CLI or unset the API-key env var\"}}\n",
+            .{args.provider_name},
+        );
+        return 1;
+    }
     try stderr.print(
         "organo auth: signout not supported for `{s}` in v1.\n" ++
             "  organo doesn't own provider subscription tokens; sign out via the\n" ++
@@ -152,6 +162,11 @@ fn reportApiError(
 fn renderList(allocator: std.mem.Allocator, body: []const u8, stdout: anytype) !void {
     _ = allocator;
     // Body: {"providers":[{...},{...},...]}
+    //
+    // The header is printed only after we've located the `providers` array
+    // marker; otherwise an unexpected body (e.g. a daemon-side regression
+    // that drops the envelope) would print a column header followed by raw
+    // JSON, which is confusing. See audit I1.
     const marker = "\"providers\":[";
     const start = std.mem.indexOf(u8, body, marker) orelse {
         try stdout.writeAll(body);
@@ -261,6 +276,69 @@ test "renderRow grep: provider + auth in output" {
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "claude") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "signed_in") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "present") != null);
+}
+
+test "renderList suppresses header when providers marker is absent" {
+    // Audit I1: the column header must not appear before raw-body fallback
+    // — otherwise a daemon regression that drops the envelope would print
+    // a header followed by random JSON, which is confusing.
+    const a = std.testing.allocator;
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(a);
+    const body = "{\"unexpected\":\"shape\"}";
+    try renderList(a, body, buf.writer(a));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "PROVIDER") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "HARNESS") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "unexpected") != null);
+}
+
+test "renderList prints header when providers marker is present" {
+    const a = std.testing.allocator;
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(a);
+    const body = "{\"providers\":[]}";
+    try renderList(a, body, buf.writer(a));
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "PROVIDER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "(no providers reported)") != null);
+}
+
+test "runSignout --json emits a not_supported envelope on stdout" {
+    // Audit I3: scripted callers that pass `--json` get a stable JSON
+    // envelope on stdout while exit code remains 1.
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    var err = std.ArrayList(u8){};
+    defer err.deinit(a);
+    const args = cli.AuthArgs{
+        .action = .signout,
+        .provider_name = "anthropic",
+        .flags = .{ .json = true },
+    };
+    const code = try runSignout(args, out.writer(a), err.writer(a));
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"error\":\"not_supported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"provider\":\"anthropic\"") != null);
+    // Human prose should NOT appear in JSON mode.
+    try std.testing.expect(std.mem.indexOf(u8, err.items, "signout not supported") == null);
+}
+
+test "runSignout (no --json) prints human prose to stderr" {
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    var err = std.ArrayList(u8){};
+    defer err.deinit(a);
+    const args = cli.AuthArgs{
+        .action = .signout,
+        .provider_name = "openai",
+        .flags = .{},
+    };
+    const code = try runSignout(args, out.writer(a), err.writer(a));
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err.items, "signout not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.items, "openai") != null);
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 test "renderOne grep: every field appears on its own line" {

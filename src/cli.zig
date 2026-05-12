@@ -695,10 +695,15 @@ fn printAuthUsage(w: anytype) !void {
         \\  <provider>                 Show one provider (anthropic|openai|google
         \\                             or harness aliases claude|codex|gemini).
         \\  signout, out <provider>    Always fails in v1 — organo doesn't own
-        \\                             provider subscription tokens.
+        \\                             provider subscription tokens. Local-only;
+        \\                             never contacts the daemon. The --root,
+        \\                             --port, and --verbose flags are accepted
+        \\                             but ignored. --json emits a JSON envelope.
         \\
         \\Flags (common to every API subcommand):
-        \\  --json,    -j         Pass the daemon JSON through unchanged.
+        \\  --json,    -j         Pass the daemon JSON through unchanged
+        \\                        (signout emits a `{"error":"not_supported"}`
+        \\                        envelope on stdout instead).
         \\  --root,    -r <path>  Notes root for local config/token discovery.
         \\  --port,    -p <n>     Override the daemon port (also: ORGANO_PORT).
         \\  --verbose, -v         Show request URL on errors.

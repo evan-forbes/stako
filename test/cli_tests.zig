@@ -669,6 +669,103 @@ test "cli: auth signout always exits non-zero with helpful note" {
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "anthropic") != null);
 }
 
+// ---------- milestone 8 audit additions ----------
+
+test "cli: auth bogus-provider surfaces daemon 404 + not_found code" {
+    // Audit C1: the daemon test pins `/providers/bogus → 404`, but the CLI's
+    // own reportApiError formatting on the auth subcommand wasn't covered.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-404");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r = try runCli(a, &.{ "auth", "bogus-provider", "--root", s.abs_path });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 1), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "HTTP 404") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "not_found") != null);
+}
+
+test "cli: auth status with daemon down prints helpful hint" {
+    // Audit C2: stack tests cover DaemonNotRunning/ConnectionRefused but
+    // the auth path is a copy of the same code; lock it down.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-no-daemon");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    // No daemon started; --port 1 is closed.
+    var r = try runCli(a, &.{ "auth", "status", "--root", s.abs_path, "--port", "1" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 1), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "daemon not started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "organo daemon start") != null);
+}
+
+test "cli: auth status --verbose includes request URL on connection failure" {
+    // Audit C3: --verbose is parsed for auth but only consulted by
+    // reportClientError / reportApiError, which the auth tests don't reach
+    // without an explicit "daemon down" scenario.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-verbose");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var r = try runCli(a, &.{ "auth", "status", "--root", s.abs_path, "--port", "1", "-v" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 1), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "attempted: http://127.0.0.1:1/providers") != null);
+}
+
+test "cli: auth status never echoes ANTHROPIC_API_KEY value" {
+    // Audit C7: a regression that printed the env var's *value* (instead of
+    // just its name) would be a silent credential leak. Lock down the
+    // security contract with a recognizable fake token.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-no-leak");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    const c = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const fake_token = "sk-test-LEAK-CANARY-do-not-echo-12345";
+    _ = c.setenv("ANTHROPIC_API_KEY", fake_token, 1);
+    defer _ = c.unsetenv("ANTHROPIC_API_KEY");
+
+    var r = try runCli(a, &.{ "auth", "status", "--root", s.abs_path });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    // The env var *name* must appear (or at least not the value); the
+    // *value* must never appear in stdout or stderr.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, fake_token) == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, fake_token) == null);
+}
+
+test "cli: auth signout --json emits a not_supported JSON envelope on stdout" {
+    // Audit I3 fix: scripted callers passing --json receive a parseable
+    // envelope instead of plain prose. Exit code stays 1.
+    const a = std.testing.allocator;
+    var r = try runCli(a, &.{ "auth", "signout", "openai", "--json" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 1), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "\"error\":\"not_supported\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "\"provider\":\"openai\"") != null);
+    // Human prose must not bleed into stderr in --json mode.
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "signout not supported") == null);
+}
+
 // ---------- milestone 4 audit additions ----------
 //
 // The following tests stand up a hand-rolled TCP server (not the real daemon)
