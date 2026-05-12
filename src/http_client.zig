@@ -40,6 +40,10 @@ pub const Opts = struct {
     host: []const u8 = "127.0.0.1",
     /// When true, errors include the resolved URL and port.
     verbose: bool = false,
+    /// Per-read receive timeout. 0 disables (waits forever). The default keeps
+    /// a stalled daemon from hanging the CLI indefinitely; ctrl-C is the
+    /// fallback the user shouldn't need to reach for.
+    read_timeout_ms: u32 = 10_000,
 };
 
 /// A resolved client, ready to issue requests. Owns no sockets — each
@@ -54,6 +58,7 @@ pub const Client = struct {
     /// without further plumbing.
     token: ?[]u8 = null,
     verbose: bool = false,
+    read_timeout_ms: u32 = 10_000,
 
     pub fn deinit(self: *Client) void {
         if (self.token) |t| self.allocator.free(t);
@@ -76,10 +81,17 @@ pub const Response = struct {
 pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
     // Port resolution.
     var port: u16 = 7421;
-    // Config files are optional; missing `.organo/` is tolerated so users can
-    // override everything via flags/env.
+    // Missing `.organo/` is the common case (user invokes from outside an
+    // initialized notes root and overrides everything via flags/env). Other
+    // load errors — malformed TOML, wrong types, `PortOutOfRange` — must
+    // surface; otherwise we silently downgrade to the default port and the
+    // user sees a confusing "daemon not started" against a daemon that's
+    // actually listening on the configured port.
     blk: {
-        var cfg = config_mod.loadFromRoot(allocator, opts.root) catch break :blk;
+        var cfg = config_mod.loadFromRoot(allocator, opts.root) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => break :blk,
+            else => return e,
+        };
         defer cfg.deinit();
         port = cfg.daemon.port;
     }
@@ -110,6 +122,7 @@ pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
         .port = port,
         .token = token_owned,
         .verbose = opts.verbose,
+        .read_timeout_ms = opts.read_timeout_ms,
     };
 }
 
@@ -155,12 +168,29 @@ pub fn request(
     body: ?[]const u8,
 ) ClientError!Response {
     const addr = std.net.Address.parseIp(self.host, self.port) catch
-        return error.BadResponse;
+        return error.BadHost;
     var stream = std.net.tcpConnectToAddress(addr) catch |e| switch (e) {
         error.ConnectionRefused => return error.DaemonNotRunning,
         else => return e,
     };
     defer stream.close();
+
+    if (self.read_timeout_ms > 0) {
+        // SO_RCVTIMEO bounds each `stream.read` call so a hung daemon can't
+        // pin the CLI indefinitely. Failure to set the option (older kernel,
+        // unusual platform) is non-fatal: the read loop's error handling
+        // still catches EOF; a slow-but-progressing daemon stays usable.
+        const tv = std.posix.timeval{
+            .sec = @intCast(self.read_timeout_ms / 1000),
+            .usec = @intCast((self.read_timeout_ms % 1000) * 1000),
+        };
+        std.posix.setsockopt(
+            stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&tv),
+        ) catch {};
+    }
 
     // Compose the request.
     var req_buf = std.ArrayList(u8){};
@@ -188,7 +218,20 @@ pub fn request(
     errdefer resp_buf.deinit(self.allocator);
     var tmp: [4096]u8 = undefined;
     while (true) {
-        const n = stream.read(&tmp) catch break;
+        const n = stream.read(&tmp) catch |e| switch (e) {
+            // A receive-timeout firing means the daemon stopped sending mid
+            // response. Surface it rather than passing a truncated body to
+            // `parseResponse`, which would silently accept any framing that
+            // happens to align (no Content-Length, chunk boundary, …).
+            error.WouldBlock => return error.TransportTimeout,
+            // EOF — Zig 0.15 reports clean stream end as ConnectionResetByPeer
+            // on some Linux flavors; we cannot distinguish "clean RST" from
+            // "abrupt mid-body RST" cheaply, so we accept it as EOF and let
+            // parseResponse's framing checks (Content-Length, chunked) catch
+            // mid-body truncation when those headers are present.
+            error.ConnectionResetByPeer => break,
+            else => return error.TransportError,
+        };
         if (n == 0) break;
         try resp_buf.appendSlice(self.allocator, tmp[0..n]);
         // Cap at 8 MiB to prevent runaway response accumulation.
@@ -318,6 +361,12 @@ test "parseResponse: chunked decoding" {
 test "parseResponse: rejects garbage" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.BadResponse, parseResponse(a, "not http"));
+}
+
+test "parseResponse: rejects content-length larger than the body we received" {
+    const a = std.testing.allocator;
+    const raw = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort";
+    try std.testing.expectError(error.BadResponse, parseResponse(a, raw));
 }
 
 test "asciiEqlIgnoreCase" {

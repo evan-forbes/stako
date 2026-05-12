@@ -114,11 +114,8 @@ fn runShow(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    // `show` is documented as a composite view: stack config + item listing.
-    // We do two GETs rather than one because the daemon's `/stacks/{name}`
-    // endpoint already returns both, AND we surface the items separately for
-    // the routing-target column. Reuse `/stacks/{name}/items` for accurate
-    // queue order without re-fetching the config we already have.
+    // The daemon's `/stacks/{name}` returns a composite payload (config +
+    // inlined items in queue order), so a single GET suffices.
     const stack_path = try std.fmt.allocPrint(allocator, "/stacks/{s}", .{name});
     defer allocator.free(stack_path);
 
@@ -130,18 +127,12 @@ fn runShow(
         return reportApiError(stack_resp.status, stack_resp.body, stack_path, flags.verbose, stderr);
     }
 
-    // `--json`: pass through the composite /stacks/{name} response. We
-    // deliberately do NOT bundle a second request here — that would mean
-    // synthesizing JSON locally, which the design forbids.
     if (flags.json) {
         try stdout.writeAll(stack_resp.body);
         try stdout.writeAll("\n");
         return 0;
     }
 
-    // Human render: pull items separately so we can preserve queue order and
-    // include the target details (`/stacks/{name}` already inlines items, but
-    // we'll parse from the `items` array within the composite payload).
     try renderStackShow(allocator, name, stack_resp.body, stdout, stderr);
     return 0;
 }
@@ -157,6 +148,13 @@ fn reportClientError(
     switch (e) {
         error.DaemonNotRunning, error.ConnectionRefused => {
             try stderr.writeAll("organo: daemon not started; try `organo daemon start`\n");
+            if (client.verbose) {
+                try stderr.print("  attempted: http://{s}:{d}{s}\n", .{ client.host, client.port, path });
+            }
+            return 1;
+        },
+        error.TransportTimeout => {
+            try stderr.writeAll("organo: daemon did not respond in time\n");
             if (client.verbose) {
                 try stderr.print("  attempted: http://{s}:{d}{s}\n", .{ client.host, client.port, path });
             }
@@ -224,27 +222,36 @@ fn renderStackList(
     stdout: anytype,
     stderr: anytype,
 ) !void {
-    // Body shape: {"stacks":[{"name":"foo"},{"name":"bar"}]}
-    var names = std.ArrayList([]const u8){};
-    defer names.deinit(allocator);
+    // Body shape: {"stacks":[{"name":"foo"},{"name":"bar"}, ...]}.
+    // A previous version substring-grepped for `"name":"`, which would match
+    // any future sibling object whose key is also `name`. Walk the actual
+    // JSON instead.
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        try stderr.writeAll("organo: malformed daemon response\n");
+        return;
+    };
+    defer parsed.deinit();
 
-    var i: usize = 0;
-    while (i < body.len) {
-        const key = "\"name\":\"";
-        const pos = std.mem.indexOfPos(u8, body, i, key) orelse break;
-        const start = pos + key.len;
-        const end = std.mem.indexOfScalarPos(u8, body, start, '"') orelse break;
-        try names.append(allocator, body[start..end]);
-        i = end + 1;
+    const root = parsed.value;
+    if (root != .object) {
+        try stderr.writeAll("organo: malformed daemon response\n");
+        return;
     }
-
-    if (names.items.len == 0) {
+    const stacks = root.object.get("stacks") orelse {
+        try stdout.writeAll("(no stacks)\n");
+        return;
+    };
+    if (stacks != .array or stacks.array.items.len == 0) {
         try stdout.writeAll("(no stacks)\n");
         return;
     }
-    try stdout.print("{s}\n", .{"NAME"});
-    for (names.items) |n| try stdout.print("{s}\n", .{n});
-    _ = stderr;
+    try stdout.writeAll("NAME\n");
+    for (stacks.array.items) |entry| {
+        if (entry != .object) continue;
+        const name_v = entry.object.get("name") orelse continue;
+        if (name_v != .string) continue;
+        try stdout.print("{s}\n", .{name_v.string});
+    }
 }
 
 fn renderStackConfig(
@@ -263,7 +270,7 @@ fn renderStackConfig(
     // booleans / numbers: search for the unquoted value.
     if (findJsonRawField(body, "\"paused\":")) |s| try stdout.print("  paused:         {s}\n", .{s});
     if (findJsonRawField(body, "\"max_concurrent_per_stack\":")) |s| try stdout.print("  max_concurrent: {s}\n", .{s});
-    if (findJsonStringField(body, "\"default_workdir\":\"")) |s| try stdout.print("  default_workdir:{s}\n", .{s});
+    if (findJsonStringField(body, "\"default_workdir\":\"")) |s| try stdout.print("  default_workdir: {s}\n", .{s});
     var arr_buf: [16][]const u8 = undefined;
     if (extractJsonStringArray(body, "\"allowed_harnesses\":[", &arr_buf) catch null) |arr| {
         try stdout.writeAll("  allowed_harnesses: ");
@@ -406,7 +413,7 @@ fn runNew(
     try w.writeAll("{\"name\":\"");
     try writeJsonStr(w, args.name);
     try w.writeAll("\"}");
-    return try postAndReport(allocator, client, "/stacks", body.items, args.flags, stdout, stderr);
+    return try postAndReport(client, "/stacks", body.items, args.flags, stdout, stderr);
 }
 
 fn runAdd(
@@ -424,7 +431,7 @@ fn runAdd(
         else => return e,
     };
     defer allocator.free(body);
-    return try postAndReport(allocator, client, path, body, args.flags, stdout, stderr);
+    return try postAndReport(client, path, body, args.flags, stdout, stderr);
 }
 
 fn runInsert(
@@ -441,7 +448,7 @@ fn runInsert(
         else => return e,
     };
     defer allocator.free(body);
-    return try postAndReport(allocator, client, path, body, args.flags, stdout, stderr);
+    return try postAndReport(client, path, body, args.flags, stdout, stderr);
 }
 
 const BuildItemBodyError = error{PromptFileReadFailed} || anyerror;
@@ -487,7 +494,7 @@ fn runTransition(
 ) !u8 {
     const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/{s}", .{ args.name, args.item_id, verb });
     defer allocator.free(path);
-    return try postAndReport(allocator, client, path, "{}", args.flags, stdout, stderr);
+    return try postAndReport(client, path, "{}", args.flags, stdout, stderr);
 }
 
 fn runSupersede(
@@ -501,7 +508,7 @@ fn runSupersede(
     defer allocator.free(path);
     const body = try buildSupersedeBody(allocator, args.replacement);
     defer allocator.free(body);
-    return try postAndReport(allocator, client, path, body, args.flags, stdout, stderr);
+    return try postAndReport(client, path, body, args.flags, stdout, stderr);
 }
 
 fn buildSupersedeBody(allocator: std.mem.Allocator, replacement: []const u8) ![]u8 {
@@ -525,7 +532,7 @@ fn runPauseResume(
     const verb: []const u8 = if (paused) "pause" else "resume";
     const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/{s}", .{ args.name, verb });
     defer allocator.free(path);
-    return try postAndReport(allocator, client, path, "{}", args.flags, stdout, stderr);
+    return try postAndReport(client, path, "{}", args.flags, stdout, stderr);
 }
 
 fn runConfigSet(
@@ -558,11 +565,10 @@ fn runConfigSet(
         try w.writeAll("\"");
     }
     try w.writeAll("}");
-    return try postAndReport(allocator, client, path, body.items, args.flags, stdout, stderr);
+    return try postAndReport(client, path, body.items, args.flags, stdout, stderr);
 }
 
 fn postAndReport(
-    allocator: std.mem.Allocator,
     client: *http_client.Client,
     path: []const u8,
     body: []const u8,
@@ -570,7 +576,6 @@ fn postAndReport(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
-    _ = allocator;
     var resp = http_client.request(client, "POST", path, body) catch |e| {
         return reportClientError(e, client, path, stderr);
     };
@@ -651,7 +656,11 @@ fn readPromptFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const stat = try f.stat();
     if (stat.size > 1024 * 1024) return error.PromptFileTooLarge;
     const buf = try allocator.alloc(u8, stat.size);
-    _ = try f.readAll(buf);
+    errdefer allocator.free(buf);
+    const n = try f.readAll(buf);
+    // The file may have shrunk between stat and read (concurrent editor save).
+    // Without truncating to `n` the tail is uninitialized memory.
+    if (n < buf.len) return try allocator.realloc(buf, n);
     return buf;
 }
 
