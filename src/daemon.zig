@@ -285,6 +285,13 @@ pub const Daemon = struct {
                 self.allocator.destroy(sup_p);
             }
             self.supervisor = sup_p;
+            // Install the post-mutation wake hook so accepted mutations
+            // immediately nudge the supervisor's per-stack workers instead
+            // of waiting up to one poll interval (100 ms by default). Must
+            // run before the worker threads start so the first dispatched
+            // tick can rely on the wake-after-append semantics.
+            self.queue.post_commit_ctx = @ptrCast(sup_p);
+            self.queue.post_commit_fn = queuePostCommitWake;
             // Restart-sweep before any worker thread starts so we never
             // race with the supervisor's own ticking over a stale runtime
             // file (per design step 10).
@@ -895,6 +902,17 @@ fn hexNibble(c: u8) ?u8 {
         'A'...'F' => c - 'A' + 10,
         else => null,
     };
+}
+
+/// Mutation-queue post-commit hook: wake every supervisor worker so a
+/// freshly-queued item (or a transition that may unblock waiting items)
+/// is dispatched without waiting for the 100 ms poll interval. Called
+/// once per successful mutation, outside the queue mutex.
+fn queuePostCommitWake(ctx: ?*anyopaque, req: *const mutation_queue.Request) void {
+    _ = req;
+    const ctx_p = ctx orelse return;
+    const sup: *runtime_mod.Supervisor = @ptrCast(@alignCast(ctx_p));
+    sup.wakeAllWorkers();
 }
 
 /// Policy callback handed to the runtime supervisor: gates harness
@@ -2111,8 +2129,17 @@ fn handleStackEventsDetached(
     };
     self.sse_threads_mu.unlock();
 
-    // Send SSE headers via the std HTTP server. We write the response head
-    // directly because this connection is handed to a streaming worker.
+    // Send SSE headers, then hand the connection to a streaming worker.
+    //
+    // Subtle: the request handler owns a stack-allocated `net_writer` whose
+    // buffer is referenced by `req.server.out`. Writing the response head
+    // through that buffered writer and flushing it BEFORE returning is the
+    // only way to guarantee any bytes the std HTTP machinery may have
+    // queued (none in the receive-only happy path today, but the contract
+    // is opaque) land on the wire before the writer's stack frame unwinds.
+    // After this flush the writer's buffer is empty, so the SSE worker's
+    // subsequent direct `conn.stream` writes cannot race with stale
+    // buffered bytes from `handleConnection`'s frame.
     const sse_head =
         "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/event-stream\r\n" ++
@@ -2120,9 +2147,12 @@ fn handleStackEventsDetached(
         "Connection: keep-alive\r\n" ++
         "X-Accel-Buffering: no\r\n" ++
         "\r\n";
-    try conn.stream.writeAll(sse_head);
+    try req.server.out.writeAll(sse_head);
+    try req.server.out.flush();
 
-    // Track the worker thread so deinit can join.
+    // Track the worker thread so deinit can join. Spawn AFTER the head is
+    // on the wire so the worker can rely on the connection being in SSE
+    // mode for every subsequent write.
     const t = try std.Thread.spawn(.{}, sseWorkerThread, .{ctx});
     self.sse_threads_mu.lock();
     self.sse_threads.appendAssumeCapacity(t);

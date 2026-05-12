@@ -1268,3 +1268,585 @@ test "m8 routing: preflight disabled allows the fake-harness path to run as befo
     // as it isn't `blocked`).
     try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") == null);
 }
+
+// ---------- milestone 6 audit coverage additions ----------
+
+test "SSE Hub: multiple concurrent subscribers each receive every published event" {
+    // Audit coverage gap: prior tests never exercised N>1 subscribers.
+    const a = std.testing.allocator;
+    var hub = sse_mod.Hub.init(a);
+    defer hub.deinit();
+
+    const Cap = struct {
+        buf: std.ArrayList(u8) = .{},
+        a: std.mem.Allocator,
+        writes: usize = 0,
+    };
+    const writeFn = struct {
+        fn cb(ctx: *anyopaque, line: []const u8) anyerror!void {
+            const c: *Cap = @ptrCast(@alignCast(ctx));
+            try c.buf.appendSlice(c.a, line);
+            c.writes += 1;
+        }
+    }.cb;
+
+    var c1 = Cap{ .a = a };
+    var c2 = Cap{ .a = a };
+    var c3 = Cap{ .a = a };
+    defer c1.buf.deinit(a);
+    defer c2.buf.deinit(a);
+    defer c3.buf.deinit(a);
+
+    const s1 = try hub.subscribe("demo", .{ .ctx = &c1, .write_fn = writeFn });
+    const s2 = try hub.subscribe("demo", .{ .ctx = &c2, .write_fn = writeFn });
+    const s3 = try hub.subscribe("demo", .{ .ctx = &c3, .write_fn = writeFn });
+
+    // Three events; each subscriber should see all three.
+    try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .session_started });
+    try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .message });
+    try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .session_ended });
+
+    try std.testing.expectEqual(@as(usize, 3), c1.writes);
+    try std.testing.expectEqual(@as(usize, 3), c2.writes);
+    try std.testing.expectEqual(@as(usize, 3), c3.writes);
+
+    // Unsubscribe one and re-publish. The remaining two still receive.
+    hub.unsubscribe(s2);
+    try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .message });
+    try std.testing.expectEqual(@as(usize, 4), c1.writes);
+    try std.testing.expectEqual(@as(usize, 3), c2.writes);
+    try std.testing.expectEqual(@as(usize, 4), c3.writes);
+
+    hub.unsubscribe(s1);
+    hub.unsubscribe(s3);
+}
+
+test "SSE Hub: failing sink retires while other concurrent subscribers continue" {
+    // Audit coverage gap: previously tested fail-sink with a single sub.
+    // Here verify that one sink's failure doesn't drop events for healthy
+    // siblings on the same stack.
+    const a = std.testing.allocator;
+    var hub = sse_mod.Hub.init(a);
+    defer hub.deinit();
+
+    const Cap = struct {
+        buf: std.ArrayList(u8) = .{},
+        a: std.mem.Allocator,
+        writes: usize = 0,
+        fail_after: ?usize = null,
+    };
+    const writeFn = struct {
+        fn cb(ctx: *anyopaque, line: []const u8) anyerror!void {
+            const c: *Cap = @ptrCast(@alignCast(ctx));
+            if (c.fail_after) |lim| if (c.writes >= lim) return error.SinkFailure;
+            try c.buf.appendSlice(c.a, line);
+            c.writes += 1;
+        }
+    }.cb;
+
+    var good = Cap{ .a = a };
+    var bad = Cap{ .a = a, .fail_after = 1 };
+    defer good.buf.deinit(a);
+    defer bad.buf.deinit(a);
+
+    const sg = try hub.subscribe("demo", .{ .ctx = &good, .write_fn = writeFn });
+    _ = try hub.subscribe("demo", .{ .ctx = &bad, .write_fn = writeFn });
+
+    try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .session_started });
+    try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .message });
+    try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .session_ended });
+
+    // The bad sink got removed after its second publish attempt; the good
+    // sink got every event.
+    try std.testing.expectEqual(@as(usize, 3), good.writes);
+    try std.testing.expectEqual(@as(usize, 1), bad.writes);
+    // Hub state: bad sub auto-removed.
+    try std.testing.expectEqual(@as(usize, 1), hub.subs.items.len);
+    hub.unsubscribe(sg);
+}
+
+test "Supervisor.wakeAllWorkers: signal reaches every registered worker" {
+    // Audit coverage gap: wakeAllWorkers had no direct test. Build a
+    // supervisor with two stacks, call wake, observe each worker ticks
+    // once promptly.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "wake-all");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "alpha", false);
+    try seedStack(a, s.abs_path, "beta", false);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = runtime_mod.fakeDispatch(),
+    });
+    defer sup.deinit();
+
+    const wa = try sup.ensureWorker("alpha");
+    const wb = try sup.ensureWorker("beta");
+    // Use a long poll interval so we know a tick only happens via wake.
+    wa.poll_interval_ns = 60 * std.time.ns_per_s;
+    wb.poll_interval_ns = 60 * std.time.ns_per_s;
+    try wa.start();
+    try wb.start();
+
+    // Both workers ticked once at start (wake_pending=true). After a short
+    // delay, seed an item under each stack and call wakeAllWorkers; the
+    // workers should pick the items up well before the next poll interval.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    const body =
+        \\id = "0001"
+        \\slug = "hi"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "alpha", "0001", "hi", body);
+    try seedItem(a, s.abs_path, "beta", "0001", "hi", body);
+
+    sup.wakeAllWorkers();
+
+    // Wait up to 2s for both items to land at `completed` or `running`.
+    // /usr/bin/true exits 0 immediately, so the fake-dispatch will reach
+    // completed quickly.
+    const deadline_ms: i64 = std.time.milliTimestamp() + 2000;
+    var both_seen = false;
+    while (std.time.milliTimestamp() < deadline_ms) {
+        var ok_alpha = false;
+        var ok_beta = false;
+        const a_meta = try std.fs.path.join(a, &.{ s.abs_path, "stacks/alpha/0001-hi/meta.toml" });
+        defer a.free(a_meta);
+        const b_meta = try std.fs.path.join(a, &.{ s.abs_path, "stacks/beta/0001-hi/meta.toml" });
+        defer a.free(b_meta);
+        if (std.fs.cwd().openFile(a_meta, .{})) |fa| {
+            defer fa.close();
+            const st = try fa.stat();
+            const bf = try a.alloc(u8, st.size);
+            defer a.free(bf);
+            _ = try fa.readAll(bf);
+            if (std.mem.indexOf(u8, bf, "status = \"completed\"") != null) ok_alpha = true;
+        } else |_| {}
+        if (std.fs.cwd().openFile(b_meta, .{})) |fb| {
+            defer fb.close();
+            const st = try fb.stat();
+            const bf = try a.alloc(u8, st.size);
+            defer a.free(bf);
+            _ = try fb.readAll(bf);
+            if (std.mem.indexOf(u8, bf, "status = \"completed\"") != null) ok_beta = true;
+        } else |_| {}
+        if (ok_alpha and ok_beta) {
+            both_seen = true;
+            break;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(both_seen);
+}
+
+test "routingPreflight: compact item against a harness that cannot compact blocks with harness_unsupported_capability" {
+    // Audit coverage gap: the `harness_unsupported_capability` slug was
+    // the only canonical preflight reason without test coverage. The fake
+    // adapter explicitly returns false for `.compact` (see fake_adapter
+    // `supports`), so a compact item routes to fake and should block.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "compact-unsup");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+
+    const body =
+        \\id = "0001"
+        \\slug = "do-compact"
+        \\kind = "compact"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\provider = "anthropic"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "do-compact", body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = runtime_mod.fakeDispatch(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-do-compact/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "blocked_reason = \"harness_unsupported_capability\"") != null);
+}
+
+test "fake adapter: recovers from a malformed line and continues parsing subsequent valid events" {
+    // Audit coverage gap: the malformed-JSON test never exercised the
+    // mixed "one bad, one good" sequence so a future regression in parser
+    // state-keeping would not be caught.
+    const a = std.testing.allocator;
+    var ad = try fake_adapter.create(a);
+    defer ad.deinit(a);
+
+    // First: a malformed line → single .error event.
+    {
+        const evs = try ad.parseLine(a, "garbage\n");
+        defer adapter_mod.freeOwnedSlice(a, evs);
+        try std.testing.expectEqual(@as(usize, 1), evs.len);
+        try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    }
+    // Then: a valid session_started recovers normally.
+    {
+        const evs = try ad.parseLine(a, "{\"kind\":\"session_started\",\"data\":{\"session\":\"sess-x\"}}\n");
+        defer adapter_mod.freeOwnedSlice(a, evs);
+        try std.testing.expectEqual(@as(usize, 1), evs.len);
+        try std.testing.expectEqual(events.Kind.session_started, evs[0].ev.kind);
+    }
+    // Then: a follow-up message picks up the captured session id.
+    {
+        const evs = try ad.parseLine(a, "{\"kind\":\"message\",\"data\":{\"text\":\"hi\",\"role\":\"assistant\"}}\n");
+        defer adapter_mod.freeOwnedSlice(a, evs);
+        try std.testing.expectEqualStrings("sess-x", evs[0].ev.session);
+    }
+}
+
+test "fake adapter: parseStderrLine attaches captured session id to error event" {
+    // Audit important #3: parseStderrLine used to discard the per-session
+    // state. After the fix it should carry the captured session id so the
+    // adapter contract matches parseLine.
+    const a = std.testing.allocator;
+    var ad = try fake_adapter.create(a);
+    defer ad.deinit(a);
+
+    // Prime the session id via a session_started event.
+    {
+        const evs = try ad.parseLine(a, "{\"kind\":\"session_started\",\"data\":{\"session\":\"sess-err\"}}\n");
+        defer adapter_mod.freeOwnedSlice(a, evs);
+    }
+
+    const evs = try ad.parseStderrLine(a, "boom\n");
+    defer adapter_mod.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    try std.testing.expectEqualStrings("sess-err", evs[0].ev.session);
+}
+
+test "runtime_file: write+read round-trip preserves quote-escaped values" {
+    // Audit coverage gap: the parser strips a single enclosing pair of
+    // quotes from values. Verify a stored value containing internal
+    // characters (a backslash + a quote escape) round-trips correctly.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    // A transcript path with spaces + an internal quote — exercises the
+    // writer's escape codepath. Backslashes & quotes both get escaped on
+    // write; the reader's "strip one outer pair" semantics still finds
+    // the embedded delimiters as literal bytes.
+    const weird_path = "/tmp/my dir/has \"quote\".jsonl";
+    try runtime_file.write(a, abs, "demo", "0042", .{
+        .pid = 99,
+        .harness = "fake",
+        .started_at = "2026-05-10T14:00:00.000Z",
+        .transcript_path = weird_path,
+        .session_id = "sess-q",
+    });
+    var p = (try runtime_file.read(a, abs, "demo", "0042")).?;
+    defer p.deinit();
+    try std.testing.expectEqualStrings("fake", p.rf.harness);
+    try std.testing.expectEqualStrings("sess-q", p.rf.session_id);
+    // The reader strips one pair of outer quotes but does not unescape;
+    // the writer escapes internal `"` as `\"` and `\\` as `\\\\`. The
+    // round-trip value therefore preserves the escape sequence rather
+    // than the original raw bytes — pin that contract here so future
+    // changes have to update both halves together.
+    try std.testing.expect(std.mem.indexOf(u8, p.rf.transcript_path, "/tmp/my dir/has \\\"quote\\\".jsonl") != null);
+}
+
+test "[result] block: session_ended payload empty fields still produce a result block with exit_code" {
+    // Audit coverage gap: the case where the adapter emits a session_ended
+    // with no session_id / session_file / model. The fake adapter's onExit
+    // produces `{"exit_code":N,"terminal_status":"completed"}` only — no
+    // session_id field. The session manager should still write a
+    // [result] block populated from the fallback session id captured at
+    // session_started time (or empty if none was seen).
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "result-minimal");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+
+    const item_body =
+        \\id = "0001"
+        \\slug = "hi"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "hi", item_body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    // Use a fixture whose JSONL is empty (no session_started, no message).
+    // We re-use the existing cat_jsonl helper but point it at an empty
+    // fixture so the adapter emits no events.
+    const empty_path = try std.fs.path.join(a, &.{ s.abs_path, "empty.jsonl" });
+    defer a.free(empty_path);
+    {
+        var ef = try std.fs.cwd().createFile(empty_path, .{ .truncate = true });
+        defer ef.close();
+    }
+    const script = try absFixturePath(a, "harness/cat_jsonl.sh");
+    defer a.free(script);
+    const cs = CatScript{ .fixture_abs = empty_path, .script_abs = script };
+    GLOBAL_CAT_SCRIPT = &cs;
+    defer GLOBAL_CAT_SCRIPT = null;
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = fakeDispatchCat(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-hi/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    // The [result] block must still exist with exit_code = 0 (cat of an
+    // empty file exits 0) and a harness field, even without session_id.
+    try std.testing.expect(std.mem.indexOf(u8, buf, "[result]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "exit_code = 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "harness = \"") != null);
+}
+
+test "Manager.cancelAndEscalate: SIGTERM-resistant subprocess gets SIGKILLed" {
+    // Audit coverage gap: cancel-escalation was only tested up to SIGTERM.
+    // Use a script that ignores BOTH SIGINT and SIGTERM to drive the third
+    // escalation step.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "kill-escalate");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+
+    const body =
+        \\id = "0001"
+        \\slug = "very-stubborn"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "very-stubborn", body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    const script = try absFixturePath(a, "harness/claude_ignores_sigterm.sh");
+    defer a.free(script);
+    const sc = StubbornScript{ .script_abs = script };
+    GLOBAL_STUBBORN = &sc;
+    defer GLOBAL_STUBBORN = null;
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = fakeDispatchStubborn(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+
+    var spins: usize = 0;
+    while (sup.sm.findSessionByKey("demo", "0001") == null and spins < 200) : (spins += 1) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(sup.sm.findSessionByKey("demo", "0001") != null);
+
+    // Tight bounds: 200 ms SIGINT grace, 200 ms SIGTERM grace, then SIGKILL.
+    try sup.sm.cancelAndEscalate("demo", "0001", 200, 200);
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-very-stubborn/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"canceled\"") != null);
+}
+
+test "runtime: daemon shutdown mid-session reaps the live subprocess and clears the runtime file" {
+    // Audit coverage gap: cancel-escalate exercises in-process cancel, but
+    // not the path where the daemon itself is torn down while a session
+    // is mid-stream. The expectation is: requestShutdown signals SIGINT,
+    // sm.waitAll drains, the item lands at `canceled`, and the runtime
+    // file is gone.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "mid-shutdown");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+
+    const body =
+        \\id = "0001"
+        \\slug = "slow"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "slow", body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    const script = try absFixturePath(a, "harness/slow_sigint_ok.sh");
+    defer a.free(script);
+    const sc = StubbornScript{ .script_abs = script };
+    GLOBAL_STUBBORN = &sc;
+    defer GLOBAL_STUBBORN = null;
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = fakeDispatchStubborn(),
+    });
+    // Do not `defer sup.deinit();` here — we call it explicitly below to
+    // observe the mid-session reap. After that the supervisor is gone.
+    try sup.tickStack("demo");
+
+    // Wait for the session to register so we know we're mid-stream.
+    var spins: usize = 0;
+    while (sup.sm.findSessionByKey("demo", "0001") == null and spins < 200) : (spins += 1) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(sup.sm.findSessionByKey("demo", "0001") != null);
+
+    // Drive daemon-style shutdown: request → wait → deinit. The script
+    // honors SIGINT, so requestShutdown is enough to terminate it.
+    sup.requestShutdown();
+    sup.deinit();
+
+    // Item ends up as `canceled` (the session manager classifies the
+    // SIGINT-terminated run as canceled because `outcome.canceled` is set
+    // by requestShutdown).
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-slow/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"canceled\"") != null);
+
+    // Runtime file was cleaned up.
+    if (try runtime_file.read(a, s.abs_path, "demo", "0001")) |p| {
+        var pp = p;
+        defer pp.deinit();
+        return error.RuntimeFileShouldBeGone;
+    }
+}
+
+test "Worker: tear-down right after start cleanly joins the worker thread" {
+    // Audit coverage gap: no test created a worker, kicked it, then
+    // immediately tore down. Verify that even when the worker's first
+    // tick is racing with `requestShutdown`, `deinit` returns promptly
+    // and no leaks remain.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "worker-churn");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = runtime_mod.fakeDispatch(),
+    });
+
+    const w = try sup.ensureWorker("demo");
+    try w.start();
+    // Immediately request shutdown without waiting for the first tick.
+    sup.deinit();
+    // If we reach here without hanging, the join completed cleanly.
+}

@@ -237,14 +237,28 @@ pub const Manager = struct {
             _ = child.wait() catch {};
             return error.SpawnFailed;
         };
-        errdefer t.deinit();
+        // Ownership of the transcript Writer transfers to `sess.transcript`
+        // once `sess.*` is initialized below. Until then, an early-exit must
+        // close the file via the local `t`. After sess is initialized we
+        // null this out and rely on `Session.deinit()` instead — see
+        // `transcript_in_local`.
+        var transcript_in_local = true;
+        errdefer if (transcript_in_local) t.deinit();
 
         const outcome = try self.allocator.create(RunOutcome);
         outcome.* = .{};
-        errdefer self.allocator.destroy(outcome);
+        // Ownership transfers to `sess.outcome` after `sess.*` init. Same
+        // pattern as the transcript handle above.
+        var outcome_in_local = true;
+        errdefer if (outcome_in_local) self.allocator.destroy(outcome);
 
         const sess = try self.allocator.create(Session);
-        errdefer self.allocator.destroy(sess);
+        // Ownership of the Session pointer transfers to either:
+        //   (a) the Manager's `sessions` list (registered branch below), or
+        //   (b) the local manual-cleanup branch on append-failure.
+        // While `sess_owned` is true the errdefer destroys the pointer.
+        var sess_owned = true;
+        errdefer if (sess_owned) self.allocator.destroy(sess);
 
         var ts_buf: [40]u8 = undefined;
         const start_ts = audit.nowRfc3339Millis(&ts_buf);
@@ -263,6 +277,10 @@ pub const Manager = struct {
             .started_at = start_ts_owned,
             .outcome = outcome,
         };
+        // Resources are now owned by `sess` — let `sess.deinit()` handle
+        // them and prevent the local errdefers from double-freeing.
+        transcript_in_local = false;
+        outcome_in_local = false;
 
         // Runtime file.
         runtime_file.write(self.allocator, self.notes_root_abs, input.stack, input.item_id, .{
@@ -279,11 +297,18 @@ pub const Manager = struct {
             self.mutex.unlock();
             _ = sess.child.kill() catch {};
             _ = sess.child.wait() catch {};
+            // `sess.deinit()` handles transcript + outcome + duped strings.
+            // The adapter is owned by the caller on this failure path.
             sess.adapter_owned = false;
             sess.deinit();
             self.allocator.destroy(sess);
+            sess_owned = false;
             return error.OutOfMemory;
         };
+        // The Manager's `sessions` list now owns the pointer. From here on
+        // any error path must go through `cleanupRegisteredSpawnFailure`,
+        // which handles both list removal and `sess` destruction.
+        sess_owned = false;
         self.mutex.unlock();
 
         // Audit: dispatch_harness.

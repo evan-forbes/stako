@@ -90,12 +90,14 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
 }
 
 fn parseStderrLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) anyerror![]adapter.OwnedEvent {
-    _ = impl;
+    const st: *State = @ptrCast(@alignCast(impl));
     var line = raw;
     if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
     if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
     if (line.len == 0) return allocator.alloc(adapter.OwnedEvent, 0);
-    // Wrap as a non-terminal error event.
+    // Wrap as a non-terminal error event. Attach the captured session id so
+    // the event is self-describing even before session_manager rewrites the
+    // envelope — keeps the adapter contract consistent with parseLine.
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -108,6 +110,7 @@ fn parseStderrLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const 
         .ev = .{
             .stack = "",
             .item = "",
+            .session = st.session_id,
             .kind = .@"error",
             .data_json = storage,
         },

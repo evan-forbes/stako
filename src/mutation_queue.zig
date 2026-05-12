@@ -129,6 +129,14 @@ pub const Queue = struct {
 
     worker_thread: ?std.Thread = null,
 
+    /// Optional post-mutation callback invoked once `processOne` finishes
+    /// for any non-failed request. The daemon installs a closure here that
+    /// calls `supervisor.wakeAllWorkers()` so a newly-queued item gets
+    /// picked up without waiting for the worker's poll interval. The hook
+    /// is best-effort; it is called outside the queue mutex.
+    post_commit_ctx: ?*anyopaque = null,
+    post_commit_fn: ?*const fn (ctx: ?*anyopaque, req: *const Request) void = null,
+
     pub fn init(
         allocator: std.mem.Allocator,
         notes_root_abs: []const u8,
@@ -209,6 +217,13 @@ pub const Queue = struct {
         while (true) {
             const req = self.dequeueOne() orelse return;
             self.processOne(req);
+            // Wake subscribed runtime worker(s) when the mutation succeeded.
+            // We do this BEFORE signaling completion so the wake races with
+            // the caller's resumed thread instead of after it; either order
+            // is correct, but doing it here keeps the latency window small.
+            if (req.err == null) {
+                if (self.post_commit_fn) |hook| hook(self.post_commit_ctx, req);
+            }
             // Signal completion.
             req.done_mutex.lock();
             req.done = true;

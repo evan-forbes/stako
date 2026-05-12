@@ -93,6 +93,17 @@ pub const Hub = struct {
 
     /// Publish a single event to all subscribers of `event.stack`. Errors
     /// from sinks remove that subscriber from the list silently.
+    ///
+    /// Sink contract — IMPORTANT for future sink authors:
+    /// The sink callback (`Sink.write_fn`) is invoked WITHOUT the hub
+    /// mutex held, but the subscription's `ref_count` is bumped before the
+    /// callback runs. The subscription pointer and its sink context stay
+    /// valid for the duration of the callback. However, the sink MUST NOT
+    /// call `Hub.unsubscribe` on its own subscription from inside the
+    /// callback: `unsubscribe` waits on `ref_count` to reach zero, and the
+    /// publish-side ref is still held — that would deadlock the publishing
+    /// thread forever. To "self-cancel" from a sink, return an error from
+    /// `write_fn`; the hub will retire the subscription itself.
     pub fn publish(self: *Hub, event: events.Event) !void {
         var sse_line = std.ArrayList(u8){};
         defer sse_line.deinit(self.allocator);
