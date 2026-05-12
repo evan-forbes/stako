@@ -23,6 +23,8 @@ pub const Code = enum {
     // Authorization.
     identity_required,
     capability_denied,
+    // HTTP method.
+    method_not_allowed,
     // State / concurrency.
     not_found,
     conflict,
@@ -50,6 +52,7 @@ pub const Code = enum {
             .unknown_field => "unknown_field",
             .identity_required => "identity_required",
             .capability_denied => "capability_denied",
+            .method_not_allowed => "method_not_allowed",
             .not_found => "not_found",
             .conflict => "conflict",
             .state_conflict => "state_conflict",
@@ -76,6 +79,7 @@ pub const Code = enum {
             .identity_required => 401,
             .capability_denied => 403,
             .not_found => 404,
+            .method_not_allowed => 405,
             .conflict, .state_conflict, .vcs_conflict => 409,
             .harness_unavailable, .harness_denied, .auth_missing, .workdir_denied, .model_unsupported, .harness_unsupported_capability, .no_session_to_compact, .spawn_failed => 422,
             .internal => 500,

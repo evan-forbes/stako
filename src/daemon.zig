@@ -181,12 +181,29 @@ pub const Daemon = struct {
             // sse_hub is a borrow; clear it so stale reads can't happen.
             self.sse_hub = null;
         }
+        // Record the lifecycle event before the audit writer is torn down.
+        // Best-effort: failures here never propagate (matches the
+        // daemon_started emit at the bottom of `startWorker`).
+        self.audit_writer.append(.{
+            .identity = "system",
+            .action = .daemon_stopped,
+            .target = "daemon",
+            .outcome = .allowed,
+        }) catch {};
         self.audit_writer.deinit();
         self.server.deinit();
         self.allocator.free(self.token.bytes);
         self.reader.deinit();
         self.config.deinit();
         if (self.log_file) |*f| f.close();
+        // Remove daemon.pid if this instance wrote it. The supervised stop
+        // path (`stop()`) also removes the file after SIGTERM; doing it
+        // here covers in-process shutdowns (ctrl-C handler, Daemon.deinit
+        // on the start side).
+        if (self.pid_written) {
+            removePidFile(self.allocator, self.notes_root_abs) catch {};
+            self.pid_written = false;
+        }
         self.allocator.free(self.notes_root_abs);
     }
 
@@ -289,6 +306,11 @@ pub const Daemon = struct {
 /// once you have the handle. Splitting open and serve lets tests inspect the
 /// bound port before driving traffic.
 pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon {
+    // Refuse non-loopback before any disk write. The token-generation
+    // and pidfile paths both touch the filesystem, so doing this check
+    // first keeps a fail-fast `start()` free of side effects.
+    if (!isLoopbackHost(opts.host)) return error.NotLoopbackHost;
+
     // Resolve notes root to abs.
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try std.fs.cwd().realpath(opts.notes_root, &root_buf);
@@ -303,8 +325,6 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
     const token = try local_token.ensureAndLoad(allocator, abs_owned);
     errdefer allocator.free(token.bytes);
 
-    // Decide host + port. v1: refuse non-loopback.
-    if (!isLoopbackHost(opts.host)) return error.NotLoopbackHost;
     const port = opts.port_override orelse cfg.daemon.port;
 
     // Bind.
@@ -318,10 +338,17 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
     var log_file: ?std.fs.File = null;
     if (!opts.ephemeral) {
         pid_written = try writePidFile(allocator, abs_owned, bound_port);
+    }
+    // Any failure between here and the successful Daemon return must
+    // remove the PID file we just wrote; otherwise a stale pidfile would
+    // cause the next start() to refuse with AlreadyRunning.
+    errdefer if (pid_written) removePidFile(allocator, abs_owned) catch {};
+    if (!opts.ephemeral) {
         // daemon.log is best-effort: if we can't open it, drop logging
         // rather than failing to start.
         log_file = openLogFile(allocator, abs_owned) catch null;
     }
+    errdefer if (log_file) |*f| f.close();
 
     // Storage reader.
     var reader = try storage.Reader.init(allocator, abs_owned);
@@ -611,9 +638,17 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
     // Apply method-based promotion: a POST to a path that matched as a
     // GET-default route gets remapped to the matching mutation route.
     if (is_post) {
-        m.route = promoteToMutation(m.route);
+        const promoted = promoteToMutation(m.route);
+        // POST onto a route that has no mutation form (e.g. /healthz,
+        // /providers, /stacks/{name}, /stacks/{name}/items/{id}) is a
+        // method mismatch, not a 404. `unknown` paths still 404 below.
+        if (promoted == m.route and !isMutationRoute(m.route) and m.route != .unknown) {
+            try respondError(req, .method_not_allowed, "method not allowed", &.{});
+            return;
+        }
+        m.route = promoted;
     } else if (!is_get) {
-        try respondError(req, .validation_failed, "method not allowed", &.{});
+        try respondError(req, .method_not_allowed, "method not allowed", &.{});
         return;
     }
     // GETs on mutation-only paths (e.g. /stacks/foo/items/0001/cancel) are 404.
@@ -816,7 +851,10 @@ fn verifyAuthFormBody(self: *Daemon, req: *std.http.Server.Request) !?[]u8 {
         // required for the canonical shape. We still tolerate `+` (URL-
         // encoded space) and `%XX` to keep the parser forgiving against
         // any wrapping helpers a browser/tester might apply.
-        const decoded = formUrlDecode(self.allocator, val) catch return null;
+        const decoded = formUrlDecode(self.allocator, val) catch {
+            self.allocator.free(body);
+            return null;
+        };
         defer self.allocator.free(decoded);
         if (self.token.verify(decoded)) ok = true;
         break;

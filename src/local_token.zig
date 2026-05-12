@@ -41,6 +41,10 @@ pub fn ensureAndLoad(
     // Try open-for-read first.
     if (root.openFile(".organo/local_token", .{})) |f| {
         defer f.close();
+        // Re-tighten perms in case the file was created or chmod'd with
+        // looser permissions by something outside organo. The token must
+        // stay 0600; verified on every load to keep the contract.
+        std.posix.fchmod(f.handle, 0o600) catch {};
         return try readToken(allocator, f);
     } else |open_err| switch (open_err) {
         error.FileNotFound => {
@@ -164,4 +168,53 @@ test "ensureAndLoad: rejects short uppercase and overlong token files" {
         const abs = try tmp.dir.realpath(".", &buf);
         try std.testing.expectError(error.BadShape, ensureAndLoad(a, abs));
     }
+}
+
+test "ensureAndLoad: rejects empty token file" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".organo");
+    var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true });
+    f.close();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    try std.testing.expectError(error.BadShape, ensureAndLoad(a, abs));
+}
+
+test "ensureAndLoad: generated token file has 0600 perms" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    const tok = try ensureAndLoad(a, abs);
+    defer a.free(tok.bytes);
+
+    var f = try tmp.dir.openFile(".organo/local_token", .{});
+    defer f.close();
+    const stat = try f.stat();
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
+}
+
+test "ensureAndLoad: re-tightens perms on a previously widened token file" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".organo");
+    {
+        var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true, .mode = 0o644 });
+        try f.writeAll("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n");
+        f.close();
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    const tok = try ensureAndLoad(a, abs);
+    defer a.free(tok.bytes);
+
+    var f = try tmp.dir.openFile(".organo/local_token", .{});
+    defer f.close();
+    const stat = try f.stat();
+    try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
 }

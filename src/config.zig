@@ -362,3 +362,44 @@ test "loadFromRoot: config read errors are not treated as missing config" {
     const abs = try tmp.dir.realpath(".", &buf);
     try std.testing.expectError(error.IsDir, loadFromRoot(a, abs));
 }
+
+test "loadFromRoot: malformed TOML in config.local.toml surfaces error.Toml" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".organo");
+    var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+    defer f.close();
+    // Unterminated string ⇒ TOML parse failure.
+    try f.writeAll("[daemon]\nport = \"oops\n");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    try std.testing.expectError(error.Toml, loadFromRoot(a, abs));
+}
+
+test "loadFromRoot: wrong scalar type rejected with error.BadType" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".organo");
+    var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+    defer f.close();
+    // port is declared as a string instead of integer.
+    try f.writeAll("[daemon]\nport = \"7421\"\n");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    try std.testing.expectError(error.BadType, loadFromRoot(a, abs));
+}
+
+test "loadFromRoot: loopback_only wrong type rejected" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".organo");
+    var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+    defer f.close();
+    try f.writeAll("[daemon]\nloopback_only = \"yes\"\n");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    try std.testing.expectError(error.BadType, loadFromRoot(a, abs));
+}

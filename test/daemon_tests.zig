@@ -617,3 +617,230 @@ test "daemon: GET /providers is a read endpoint (no auth required)" {
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
 }
+
+// ---------- milestone 3 audit additions ----------
+
+test "daemon: start fails fast on already-bound port" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "addr-in-use");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    // Hold an ephemeral port open so a second listen() against the same
+    // address surfaces AddressInUse.
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var holder = try addr.listen(.{ .reuse_address = false });
+    defer holder.deinit();
+    const taken = holder.listen_address.in.getPort();
+
+    if (daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = taken,
+        .ephemeral = true,
+    })) |d| {
+        // If the kernel allowed the rebind (some configs ignore reuse_address
+        // contention on loopback) we don't fail the test — that's a platform
+        // quirk, not a daemon bug. Drain and skip.
+        var dd = d;
+        dd.deinit();
+        return error.SkipZigTest;
+    } else |e| {
+        try std.testing.expectEqual(error.AddressInUse, e);
+    }
+}
+
+test "daemon: serves multiple sequential requests on the same listener" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "concurrent-seq");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedDemoStack(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    // Drive three back-to-back requests through one accept-loop thread.
+    try drv.serve(3);
+
+    const r1 = try httpRequestRaw(a, drv.daemon.bound_port, "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(r1);
+    const r2 = try httpRequestRaw(a, drv.daemon.bound_port, "GET /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(r2);
+    const r3 = try httpRequestRaw(a, drv.daemon.bound_port, "GET /stacks/demo HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    defer a.free(r3);
+
+    try std.testing.expectEqual(@as(u16, 200), splitResponse(r1).status);
+    try std.testing.expectEqual(@as(u16, 200), splitResponse(r2).status);
+    try std.testing.expectEqual(@as(u16, 200), splitResponse(r3).status);
+    // Per-response bodies are isolated.
+    try std.testing.expectEqualStrings("ok\n", splitResponse(r1).body);
+    try std.testing.expect(std.mem.indexOf(u8, splitResponse(r2).body, "\"demo\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, splitResponse(r3).body, "\"name\":\"demo\"") != null);
+}
+
+test "daemon: POST on a GET-only endpoint returns 405 method_not_allowed" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "method-405");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    // /healthz has no mutation form. The POST is a method mismatch, not a 404.
+    const req = "POST /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 405), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"code\":\"method_not_allowed\"") != null);
+}
+
+test "daemon: PUT returns 405 method_not_allowed" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "put-405");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    const req = "PUT /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 405), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"code\":\"method_not_allowed\"") != null);
+}
+
+test "daemon: bearer-auth negative paths surface 401 over HTTP" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "auth-negative");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(3);
+
+    // (1) Missing Authorization header on a mutation route.
+    const r1 = try httpRequestRaw(a, drv.daemon.bound_port,
+        "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    defer a.free(r1);
+    const p1 = splitResponse(r1);
+    try std.testing.expectEqual(@as(u16, 401), p1.status);
+    try std.testing.expect(std.mem.indexOf(u8, p1.body, "\"code\":\"identity_required\"") != null);
+
+    // (2) Wrong scheme (Basic).
+    const r2 = try httpRequestRaw(a, drv.daemon.bound_port,
+        "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Basic abcdef\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    defer a.free(r2);
+    try std.testing.expectEqual(@as(u16, 401), splitResponse(r2).status);
+
+    // (3) Wrong token (right shape, wrong bytes).
+    const r3 = try httpRequestRaw(a, drv.daemon.bound_port,
+        "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    defer a.free(r3);
+    try std.testing.expectEqual(@as(u16, 401), splitResponse(r3).status);
+}
+
+test "daemon: malformed _token form-body escape rejected without leaking" {
+    // Anchors the Blocking #1 fix: a `_token` value with an invalid %XX
+    // escape used to leak the 256 KiB body buffer because the
+    // `formUrlDecode` error path returned null without freeing. We exercise
+    // the path here to ensure the testing allocator catches any regression.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "form-bad-escape");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    // %ZZ is not valid hex — `formUrlDecode` raises `error.InvalidEscape`.
+    const body = "_token=%ZZ";
+    const req_buf = try std.fmt.allocPrint(a, "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+    defer a.free(req_buf);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, req_buf);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 401), parsed.status);
+}
+
+test "daemon: deinit removes daemon.pid on clean shutdown" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "pid-deinit");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var d = try daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = false,
+    });
+    {
+        const info = try daemon_mod.readPidFile(a, s.abs_path);
+        try std.testing.expect(info != null);
+    }
+    d.deinit();
+    // PID file is removed as part of deinit.
+    const info_after = try daemon_mod.readPidFile(a, s.abs_path);
+    try std.testing.expect(info_after == null);
+}
+
+test "daemon: daemon_started and daemon_stopped events recorded in audit.log" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "audit-lifecycle");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var d = try startEphemeralDaemon(a, s.abs_path);
+    try d.startWorker();
+    d.deinit();
+
+    const path = try std.fs.path.join(a, &.{ s.abs_path, ".organo", "audit.log" });
+    defer a.free(path);
+    var f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "\"action\":\"daemon_started\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "\"action\":\"daemon_stopped\"") != null);
+}
+
+test "daemon: stop returns not_running when no pidfile present" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "stop-empty");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    const r = try daemon_mod.stop(a, s.abs_path, 1);
+    try std.testing.expectEqual(daemon_mod.StopResult.not_running, r);
+}
+
+test "daemon: stop returns not_running and cleans pidfile when pid is dead" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "stop-stale");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    const organo_dir = try std.fs.path.join(a, &.{ s.abs_path, ".organo" });
+    defer a.free(organo_dir);
+    try std.fs.cwd().makePath(organo_dir);
+
+    // Write a pidfile pointing at a PID that's almost certainly absent.
+    const pid_path = try std.fs.path.join(a, &.{ s.abs_path, ".organo", "daemon.pid" });
+    defer a.free(pid_path);
+    {
+        var f = try std.fs.cwd().createFile(pid_path, .{ .truncate = true, .mode = 0o600 });
+        defer f.close();
+        // 2^31 - 2 is well above any reasonable live pid in CI.
+        try f.writeAll("2147483646\n0\n0\n");
+    }
+    const r = try daemon_mod.stop(a, s.abs_path, 1);
+    try std.testing.expectEqual(daemon_mod.StopResult.not_running, r);
+    // pidfile is gone.
+    const info = try daemon_mod.readPidFile(a, s.abs_path);
+    try std.testing.expect(info == null);
+}
