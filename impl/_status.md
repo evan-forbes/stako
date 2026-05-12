@@ -18,3 +18,22 @@ Tracks progress through the implement → review → fix loop for milestones 1�
 | 8 | 08_provider_status_and_gemini.md | f39f3f8 | 0 | — | 0 | 0 | 7 non-blocking; 273/273 tests; Gemini scaffolded only (factory→null, documented in design_execution_harness.md) |
 | 9 | 09_html_rendering.md | 558535f | 1 | c7992ef | 0 | 0 | blocker: step 6 browser mutation controls missing; fix wired pause/resume/cancel/retry + token in form; 301/301 tests |
 | 10 | 10_authorization.md | 6ab036f | 0 | — | 0 | 0 | 7 non-blocking; 319/319 tests, no flakes; identity model parses [identity.<name>] from config.toml; backwards-compat implicit-* for undeclared local |
+
+## Audit Pass (2026-05-11)
+
+Second pass: full-module audit (correctness, test coverage, readability, DRY/KISS, performance, memory, execution trace) → one fix subagent → retry-once on failure. Audit findings live in `impl/_audit_NN.md`.
+
+**Baseline:** `e67229d` (chore: review feedback), 350/350 tests passing.
+
+| # | Plan | Audit doc | Blocking | Important | Minor | Fix SHA | Retry SHA | Unresolved | Notes |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 01_item_format.md | _audit_01.md | — | — | — | — | — | — | pending |
+| 2 | 02_init_and_layout.md | _audit_02.md | — | — | — | — | — | — | pending |
+| 3 | 03_daemon_skeleton.md | _audit_03.md | — | — | — | — | — | — | pending |
+| 4 | 04_cli_read.md | _audit_04.md | — | — | — | — | — | — | pending |
+| 5 | 05_mutations_and_vcs.md | _audit_05.md | — | — | — | — | — | — | pending |
+| 6 | 06_runtime_core.md | _audit_06.md | — | — | — | — | — | — | pending |
+| 7 | 07_claude_codex_adapters.md | _audit_07.md | — | — | — | — | — | — | pending |
+| 8 | 08_provider_status_and_gemini.md | _audit_08.md | — | — | — | — | — | — | pending |
+| 9 | 09_html_rendering.md | _audit_09.md | — | — | — | — | — | — | pending |
+| 10 | 10_authorization.md | _audit_10.md | — | — | — | — | — | — | pending |
