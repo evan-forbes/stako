@@ -166,23 +166,52 @@ pub fn commit(
     return res;
 }
 
-/// Roll back: reset the index for `paths` and discard any working-tree
-/// changes to them. Used on commit failure to leave the tree clean.
+/// Roll back: reset the index for `paths` AND restore the working tree so
+/// the on-disk state matches HEAD for those paths. Used on commit failure
+/// to leave the tree clean per acceptance criteria.
+///
+/// For each path:
+///   * `git reset HEAD -- <path>` unstages anything we just `git add`ed.
+///   * If HEAD has the path, `git checkout HEAD -- <path>` restores the
+///     pre-mutation bytes. If HEAD doesn't (the mutator created a new
+///     file), we delete the on-disk file/tree so a retry can re-create.
 pub fn rollbackPaths(
     allocator: std.mem.Allocator,
     repo_root: []const u8,
     paths: []const []const u8,
 ) Error!void {
     if (paths.len == 0) return;
-    // Unstage.
     var reset_argv = std.ArrayList([]const u8){};
     defer reset_argv.deinit(allocator);
     try reset_argv.appendSlice(allocator, &.{ "reset", "HEAD", "--" });
     for (paths) |p| try reset_argv.append(allocator, p);
-    _ = runGit(allocator, repo_root, reset_argv.items, false) catch {};
+    if (runGit(allocator, repo_root, reset_argv.items, false)) |out| {
+        allocator.free(out);
+    } else |_| {}
 
-    // For untracked / dirty workspace files we don't auto-discard — too risky.
-    // The mutation worker is expected to remove temp files itself on error.
+    for (paths) |p| {
+        const checkout_argv = [_][]const u8{ "checkout", "HEAD", "--", p };
+        if (runGit(allocator, repo_root, &checkout_argv, true)) |out| {
+            allocator.free(out);
+        } else |_| {
+            const abs = std.fs.path.join(allocator, &.{ repo_root, p }) catch continue;
+            defer allocator.free(abs);
+            std.fs.cwd().deleteTree(abs) catch {};
+            removeEmptyParentsUpTo(allocator, repo_root, p);
+        }
+    }
+}
+
+/// Walk up `rel_path` from its dirname toward (but not including) `repo_root`,
+/// removing each directory if it is empty. Stops at the first non-empty dir.
+fn removeEmptyParentsUpTo(allocator: std.mem.Allocator, repo_root: []const u8, rel_path: []const u8) void {
+    var current = std.fs.path.dirname(rel_path) orelse return;
+    while (current.len > 0) {
+        const abs = std.fs.path.join(allocator, &.{ repo_root, current }) catch return;
+        defer allocator.free(abs);
+        std.fs.deleteDirAbsolute(abs) catch return;
+        current = std.fs.path.dirname(current) orelse return;
+    }
 }
 
 fn hasStagedChanges(allocator: std.mem.Allocator, repo_root: []const u8) Error!bool {
@@ -262,6 +291,7 @@ fn runGitFull(
     child.cwd = repo_root;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    child.env_map = null;
 
     child.spawn() catch |e| switch (e) {
         error.FileNotFound => return error.GitNotFound,
@@ -349,6 +379,56 @@ test "ensureRealRepo + commit: round-trip works" {
         .subject = "test: no-op",
     });
     try std.testing.expectEqual(false, res2.committed);
+}
+
+test "rollbackPaths: restores tracked file edits and removes new files" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    try ensureRealRepo(a, abs);
+    {
+        var f = try tmp.dir.createFile("tracked.txt", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("original\n");
+    }
+    _ = try commit(a, abs, .{ .paths = &.{"tracked.txt"}, .subject = "init" });
+
+    // Mutator-equivalent: edit a tracked file AND create a new file under a
+    // brand-new subdirectory. Stage both, then roll back.
+    {
+        var f = try tmp.dir.createFile("tracked.txt", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("mutated\n");
+    }
+    try tmp.dir.makePath("stacks/new");
+    {
+        var f = try tmp.dir.createFile("stacks/new/stack.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("description = \"x\"\n");
+    }
+    const stage_out = try runGit(a, abs, &.{ "add", "--", "tracked.txt", "stacks/new/stack.toml" }, true);
+    a.free(stage_out);
+
+    try rollbackPaths(a, abs, &.{ "tracked.txt", "stacks/new/stack.toml" });
+
+    // Tracked file restored to HEAD content.
+    {
+        var f = try tmp.dir.openFile("tracked.txt", .{});
+        defer f.close();
+        var rb: [64]u8 = undefined;
+        const n = try f.readAll(&rb);
+        try std.testing.expectEqualStrings("original\n", rb[0..n]);
+    }
+    // New file removed and its empty parent directory cleaned up.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("stacks/new/stack.toml", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("stacks/new", .{}));
+    // Index is clean.
+    const status_out = try runGit(a, abs, &.{ "status", "--porcelain" }, true);
+    defer a.free(status_out);
+    try std.testing.expectEqual(@as(usize, 0), status_out.len);
 }
 
 test "assertPathsClean: detects modified file" {

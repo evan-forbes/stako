@@ -580,6 +580,71 @@ test "mutation: daemon startup refuses repo with merge conflicts" {
     }
 }
 
+test "mutation: commit failure rolls back working tree (B1)" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "rollback");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try makeRealRepo(a, s.abs_path);
+
+    // Install a pre-commit hook that always fails, forcing `git commit` to
+    // return non-zero for any subsequent mutation.
+    const hooks_dir = try std.fs.path.join(a, &.{ s.abs_path, ".git", "hooks" });
+    defer a.free(hooks_dir);
+    try std.fs.cwd().makePath(hooks_dir);
+    const hook_path = try std.fs.path.join(a, &.{ hooks_dir, "pre-commit" });
+    defer a.free(hook_path);
+    {
+        var hf = try std.fs.cwd().createFile(hook_path, .{ .truncate = true, .mode = 0o755 });
+        defer hf.close();
+        try hf.writeAll("#!/bin/sh\nexit 1\n");
+    }
+
+    var drv = Driver{ .allocator = a, .daemon = try startDaemonWithGit(a, s.abs_path) };
+    defer drv.deinit();
+    try drv.startWorker();
+    try drv.serve(1);
+
+    const baseline_commits = try countCommits(a, s.abs_path);
+    const baseline_audit = try auditLineCount(a, s.abs_path);
+
+    const body = "{\"name\":\"rollback-demo\"}";
+    const req = try buildPostRequest(a, "/stacks", drv.daemon.token.bytes, body);
+    defer a.free(req);
+    const resp = try httpRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 500), parsed.status);
+
+    // No new commit.
+    try std.testing.expectEqual(baseline_commits, try countCommits(a, s.abs_path));
+    // No new audit line (commit failure path bypasses audit append).
+    try std.testing.expectEqual(baseline_audit, try auditLineCount(a, s.abs_path));
+
+    // Working tree is clean: the mutator wrote stacks/rollback-demo/stack.toml
+    // and the rollback must remove both the file and the dangling directory.
+    const file_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "rollback-demo", "stack.toml" });
+    defer a.free(file_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(file_path, .{}));
+    const dir_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "rollback-demo" });
+    defer a.free(dir_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(dir_path, .{}));
+
+    // Index is clean (no staged changes).
+    var status = std.process.Child.init(&.{ "git", "status", "--porcelain" }, a);
+    status.cwd = s.abs_path;
+    status.stdout_behavior = .Pipe;
+    status.stderr_behavior = .Pipe;
+    try status.spawn();
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    var err = std.ArrayList(u8){};
+    defer err.deinit(a);
+    try status.collectOutput(a, &out, &err, 65536);
+    _ = try status.wait();
+    try std.testing.expectEqual(@as(usize, 0), std.mem.trim(u8, out.items, " \t\r\n").len);
+}
+
 fn runGitCmd(allocator: std.mem.Allocator, root: []const u8, args: []const []const u8) !void {
     var argv = std.ArrayList([]const u8){};
     defer argv.deinit(allocator);

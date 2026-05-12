@@ -123,14 +123,16 @@ pub const Queue = struct {
     items: std.ArrayList(*Request) = .{},
     closed: bool = false,
 
-    audit_writer: *audit.Writer,
+    /// Nullable so the queue can be constructed before the daemon's audit
+    /// writer has its final address. `start()` asserts non-null.
+    audit_writer: ?*audit.Writer,
 
     worker_thread: ?std.Thread = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
         notes_root_abs: []const u8,
-        audit_writer: *audit.Writer,
+        audit_writer: ?*audit.Writer,
     ) Queue {
         return .{
             .allocator = allocator,
@@ -150,6 +152,7 @@ pub const Queue = struct {
 
     pub fn start(self: *Queue) !void {
         if (self.worker_thread != null) return;
+        std.debug.assert(self.audit_writer != null);
         self.worker_thread = try std.Thread.spawn(.{}, workerMain, .{self});
     }
 
@@ -320,13 +323,15 @@ pub const Queue = struct {
         //    runtime `running` transition because the session manager
         //    already emitted a `dispatch_harness` event at spawn time.
         if (!skip_commit or req.kind != .runtime_transition) {
-            self.audit_writer.append(.{
-                .identity = req.ident.identity,
-                .action = out.audit_action,
-                .target = out.audit_target,
-                .outcome = .allowed,
-                .details = out.audit_details,
-            }) catch {};
+            if (self.audit_writer) |aw| {
+                aw.append(.{
+                    .identity = req.ident.identity,
+                    .action = out.audit_action,
+                    .target = out.audit_target,
+                    .outcome = .allowed,
+                    .details = out.audit_details,
+                }) catch {};
+            }
         }
 
         req.output = out;
@@ -478,4 +483,96 @@ test "Queue: duplicate stack rejected with already_exists" {
     q.submitAndWait(&r1);
     try std.testing.expect(r1.err != null);
     try std.testing.expectEqual(MutationFailureKind.already_exists, r1.err.?);
+}
+
+test "Queue: runtime_transition to=running skips both commit and audit (G4)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("stacks/demo/0001-hi");
+    try tmp.dir.makePath(".organo");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-hi/meta.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\id = "0001"
+            \\slug = "hi"
+            \\kind = "prompt"
+            \\status = "queued"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\match = "any"
+            \\
+        );
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    var aw = try audit.Writer.init(a, abs);
+    defer aw.deinit();
+    var q = Queue.init(a, abs, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    var r = Request{
+        .kind = .{ .runtime_transition = .{ .stack = "demo", .id = "0001", .to = .running } },
+        .ident = .{ .api_path = "internal/runtime" },
+    };
+    q.submitAndWait(&r);
+    try std.testing.expect(r.err == null);
+    try std.testing.expectEqual(@as(u8, 0), r.commit_short_sha_len);
+    if (r.output) |*o| o.deinit();
+
+    // No audit line should have been written (the file might not even exist).
+    const audit_path = std.fs.path.join(a, &.{ abs, ".organo", "audit.log" }) catch unreachable;
+    defer a.free(audit_path);
+    if (std.fs.cwd().openFile(audit_path, .{})) |f| {
+        defer f.close();
+        const stat = try f.stat();
+        try std.testing.expectEqual(@as(u64, 0), stat.size);
+    } else |_| {}
+}
+
+test "Queue: applyTransition rejects mid-run cancel with state_conflict (G8)" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("stacks/demo/0001-hi");
+    try tmp.dir.makePath(".organo");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-hi/meta.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\id = "0001"
+            \\slug = "hi"
+            \\kind = "prompt"
+            \\status = "running"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\match = "any"
+            \\
+        );
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    var aw = try audit.Writer.init(a, abs);
+    defer aw.deinit();
+    var q = Queue.init(a, abs, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    var r = Request{
+        .kind = .{ .transition = .{ .stack = "demo", .id = "0001", .transition = .cancel } },
+        .ident = .{ .api_path = "POST /stacks/demo/items/0001/cancel" },
+    };
+    q.submitAndWait(&r);
+    try std.testing.expect(r.err != null);
+    try std.testing.expectEqual(MutationFailureKind.state_conflict, r.err.?);
 }

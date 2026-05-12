@@ -77,13 +77,16 @@ pub const Event = struct {
     details: []const DetailKV = &.{},
 };
 
-/// Owning writer. Bound to a notes root. Single-writer access expected
-/// (callers serialize through the mutation queue); no internal lock.
+/// Owning writer. Bound to a notes root. Real callers (queue worker, session
+/// manager spawn, HTTP accept thread for denial logging, daemon lifecycle
+/// events) reach `append` from multiple threads, so the writer guards the
+/// build+write+fsync sequence with an internal mutex.
 pub const Writer = struct {
     allocator: std.mem.Allocator,
     notes_root_abs: []u8,
     /// Open file handle, opened lazily on first append.
     file: ?std.fs.File = null,
+    mutex: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, notes_root_abs: []const u8) !Writer {
         const owned = try allocator.dupe(u8, notes_root_abs);
@@ -117,6 +120,8 @@ pub const Writer = struct {
 
     /// Append one event. Each event becomes one NDJSON line.
     pub fn append(self: *Writer, event: Event) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         try self.ensureOpen();
         var f = self.file orelse return error.NoFile;
 
@@ -269,6 +274,79 @@ test "Writer: append produces one NDJSON line, file mode 0600" {
         const mode_bits: u32 = @intCast(file_stat.mode & 0o777);
         try std.testing.expectEqual(@as(u32, 0o600), mode_bits);
     }
+}
+
+test "Writer: concurrent appends from many threads produce N*M parseable lines" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &path_buf);
+
+    var w = try Writer.init(a, abs);
+    defer w.deinit();
+
+    const n_threads: usize = 8;
+    const m_per_thread: usize = 32;
+
+    const ThreadCtx = struct {
+        writer: *Writer,
+        thread_id: u32,
+        count: usize,
+
+        fn run(self: *@This()) void {
+            var i: usize = 0;
+            while (i < self.count) : (i += 1) {
+                var tag_buf: [16]u8 = undefined;
+                const tag = std.fmt.bufPrint(&tag_buf, "t{d}-i{d}", .{ self.thread_id, i }) catch return;
+                self.writer.append(.{
+                    .ts = "2026-05-10T14:32:00.123Z",
+                    .identity = "stress",
+                    .action = .append_item,
+                    .target = tag,
+                    .outcome = .allowed,
+                }) catch return;
+            }
+        }
+    };
+
+    var ctxs: [n_threads]ThreadCtx = undefined;
+    var threads: [n_threads]std.Thread = undefined;
+    var t: usize = 0;
+    while (t < n_threads) : (t += 1) {
+        ctxs[t] = .{ .writer = &w, .thread_id = @intCast(t), .count = m_per_thread };
+        threads[t] = try std.Thread.spawn(.{}, ThreadCtx.run, .{&ctxs[t]});
+    }
+    for (threads) |th| th.join();
+
+    const log_path = try std.fs.path.join(a, &.{ abs, ".organo", "audit.log" });
+    defer a.free(log_path);
+    var f = try std.fs.cwd().openFile(log_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const contents = try a.alloc(u8, stat.size);
+    defer a.free(contents);
+    _ = try f.readAll(contents);
+
+    var newlines: usize = 0;
+    var line_start: usize = 0;
+    var idx: usize = 0;
+    var parsed: usize = 0;
+    while (idx < contents.len) : (idx += 1) {
+        if (contents[idx] != '\n') continue;
+        newlines += 1;
+        const line = contents[line_start..idx];
+        line_start = idx + 1;
+        // Each parsed line must start with `{"ts":"` and contain a target
+        // that follows our `t<thread>-i<i>` shape. No interleaved bytes.
+        if (!std.mem.startsWith(u8, line, "{\"ts\":\"")) continue;
+        if (std.mem.indexOf(u8, line, "\"identity\":\"stress\"") == null) continue;
+        if (std.mem.indexOf(u8, line, "\"target\":\"t") == null) continue;
+        if (!std.mem.endsWith(u8, line, "}")) continue;
+        parsed += 1;
+    }
+    try std.testing.expectEqual(n_threads * m_per_thread, newlines);
+    try std.testing.expectEqual(n_threads * m_per_thread, parsed);
 }
 
 test "Writer: two appends produce two lines" {

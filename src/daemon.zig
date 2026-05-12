@@ -370,7 +370,7 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
     errdefer audit_writer.deinit();
 
     // Mutation queue.
-    var queue = mutation_queue.Queue.init(allocator, abs_owned, undefined);
+    var queue = mutation_queue.Queue.init(allocator, abs_owned, null);
     queue.enable_git = opts.enable_git;
 
     var d: Daemon = .{
