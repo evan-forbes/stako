@@ -491,36 +491,12 @@ fn stripEol(raw: []const u8) []const u8 {
     return line;
 }
 
+/// Find the value of a top-level (depth==1) string key in a JSON object.
+/// Walks the source tracking string/escape state and brace/bracket depth, so
+/// nested objects are skipped — `findStringValue(`{"a":{"k":"buried"},"k":"top"}`, "\"k\":")`
+/// returns `"top"`, not `"buried"`. This matters whenever a key shadows a
+/// vendor-nested key (e.g. `"message"` inside an error details object).
 fn findStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (search_from < src.len) {
-        const idx = std.mem.indexOf(u8, src[search_from..], key_with_colon) orelse return null;
-        const abs = search_from + idx;
-        if (abs > 0) {
-            const c = src[abs - 1];
-            if (c != ',' and c != '{' and c != ' ' and c != '\t' and c != '\n' and c != '[') {
-                search_from = abs + 1;
-                continue;
-            }
-        }
-        var i = abs + key_with_colon.len;
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-        if (i >= src.len or src[i] != '"') return null;
-        i += 1;
-        const start = i;
-        while (i < src.len) : (i += 1) {
-            if (src[i] == '\\') {
-                i += 1;
-                continue;
-            }
-            if (src[i] == '"') return src[start..i];
-        }
-        return null;
-    }
-    return null;
-}
-
-fn findTopLevelStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
     var i: usize = 0;
     var depth: usize = 0;
     var in_str = false;
@@ -567,92 +543,156 @@ fn findTopLevelStringValue(src: []const u8, key_with_colon: []const u8) ?[]const
     return null;
 }
 
+/// Alias retained for readability at call sites that historically distinguish
+/// "top-level only" from the older buggy first-match scanner. The two helpers
+/// now share identical depth-1 semantics.
+const findTopLevelStringValue = findStringValue;
+
+/// Top-level (depth==1) integer-value lookup.
 fn findIntValue(src: []const u8, key_with_colon: []const u8) ?i64 {
-    var search_from: usize = 0;
-    while (search_from < src.len) {
-        const idx = std.mem.indexOf(u8, src[search_from..], key_with_colon) orelse return null;
-        const abs = search_from + idx;
-        if (abs > 0) {
-            const c = src[abs - 1];
-            if (c != ',' and c != '{' and c != ' ' and c != '\t' and c != '\n' and c != '[') {
-                search_from = abs + 1;
-                continue;
-            }
+    var i: usize = 0;
+    var depth: usize = 0;
+    var in_str = false;
+    var escape = false;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (escape) {
+            escape = false;
+            continue;
         }
-        var i = abs + key_with_colon.len;
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-        const start = i;
-        while (i < src.len and (std.ascii.isDigit(src[i]) or src[i] == '-')) i += 1;
-        return std.fmt.parseInt(i64, src[start..i], 10) catch null;
+        if (in_str) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
+                var j = i + key_with_colon.len;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+                const start = j;
+                while (j < src.len and (std.ascii.isDigit(src[j]) or src[j] == '-')) j += 1;
+                return std.fmt.parseInt(i64, src[start..j], 10) catch null;
+            }
+            in_str = true;
+            continue;
+        }
+        if (c == '{' or c == '[') depth += 1;
+        if (c == '}' or c == ']') {
+            if (depth == 0) return null;
+            depth -= 1;
+        }
     }
     return null;
 }
 
+/// Top-level (depth==1) object-value lookup. Returns the object's bytes
+/// including its outer braces. Skips nested objects.
 fn findObjectValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (search_from < src.len) {
-        const idx = std.mem.indexOf(u8, src[search_from..], key_with_colon) orelse return null;
-        const abs = search_from + idx;
-        if (abs > 0) {
-            const c = src[abs - 1];
-            if (c != ',' and c != '{' and c != ' ' and c != '\t' and c != '\n' and c != '[') {
-                search_from = abs + 1;
-                continue;
-            }
+    var i: usize = 0;
+    var depth: usize = 0;
+    var in_str = false;
+    var escape = false;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (escape) {
+            escape = false;
+            continue;
         }
-        var i = abs + key_with_colon.len;
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-        if (i >= src.len or src[i] != '{') return null;
-        const end = findMatchingBraceEnd(src, i) orelse return null;
-        return src[i..end];
+        if (in_str) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
+                var j = i + key_with_colon.len;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+                if (j >= src.len or src[j] != '{') return null;
+                const end = findMatchingBraceEnd(src, j) orelse return null;
+                return src[j..end];
+            }
+            in_str = true;
+            continue;
+        }
+        if (c == '{' or c == '[') depth += 1;
+        if (c == '}' or c == ']') {
+            if (depth == 0) return null;
+            depth -= 1;
+        }
     }
     return null;
 }
 
+/// Top-level (depth==1) array-value lookup. Returns the array's bytes
+/// including its outer brackets, skipping nested objects/arrays.
 fn findArrayValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (search_from < src.len) {
-        const idx = std.mem.indexOf(u8, src[search_from..], key_with_colon) orelse return null;
-        const abs = search_from + idx;
-        if (abs > 0) {
-            const c = src[abs - 1];
-            if (c != ',' and c != '{' and c != ' ' and c != '\t' and c != '\n' and c != '[') {
-                search_from = abs + 1;
-                continue;
-            }
+    var i: usize = 0;
+    var depth: usize = 0;
+    var in_str = false;
+    var escape = false;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (escape) {
+            escape = false;
+            continue;
         }
-        var i = abs + key_with_colon.len;
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-        if (i >= src.len or src[i] != '[') return null;
-        const start = i;
-        var depth: usize = 0;
-        var in_str = false;
-        var escape = false;
-        while (i < src.len) : (i += 1) {
-            const c = src[i];
-            if (escape) {
-                escape = false;
-                continue;
+        if (in_str) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_str = false;
             }
-            if (in_str) {
-                if (c == '\\') {
-                    escape = true;
-                } else if (c == '"') {
-                    in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
+                var j = i + key_with_colon.len;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+                if (j >= src.len or src[j] != '[') return null;
+                const start = j;
+                var adepth: usize = 0;
+                var ain_str = false;
+                var aescape = false;
+                while (j < src.len) : (j += 1) {
+                    const ac = src[j];
+                    if (aescape) {
+                        aescape = false;
+                        continue;
+                    }
+                    if (ain_str) {
+                        if (ac == '\\') {
+                            aescape = true;
+                        } else if (ac == '"') {
+                            ain_str = false;
+                        }
+                        continue;
+                    }
+                    if (ac == '"') {
+                        ain_str = true;
+                        continue;
+                    }
+                    if (ac == '[') adepth += 1;
+                    if (ac == ']') {
+                        adepth -= 1;
+                        if (adepth == 0) return src[start .. j + 1];
+                    }
                 }
-                continue;
+                return null;
             }
-            if (c == '"') {
-                in_str = true;
-                continue;
-            }
-            if (c == '[') depth += 1;
-            if (c == ']') {
-                depth -= 1;
-                if (depth == 0) return src[start .. i + 1];
-            }
+            in_str = true;
+            continue;
         }
-        return null;
+        if (c == '{' or c == '[') depth += 1;
+        if (c == '}' or c == ']') {
+            if (depth == 0) return null;
+            depth -= 1;
+        }
     }
     return null;
 }
@@ -842,4 +882,99 @@ test "codex: unknown top-level event emits recoverable error" {
     try std.testing.expectEqual(@as(usize, 1), evs.len);
     try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
     try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"recoverable\":true") != null);
+}
+
+test "codex: error event with top-level message emits recoverable error" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"error\",\"message\":\"transient\"}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"recoverable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "transient") != null);
+}
+
+test "codex: thread.error event emits recoverable error" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"thread.error\",\"message\":\"backoff\"}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"recoverable\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "backoff") != null);
+}
+
+test "codex: error event prefers top-level message over nested buried one" {
+    // Regression for the audit-flagged first-positional bug.
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"error\",\"details\":{\"message\":\"buried\"},\"message\":\"actual\"}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "actual") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "buried") == null);
+}
+
+test "codex: findStringValue ignores nested same-name keys (depth-1 only)" {
+    const line = "{\"type\":\"error\",\"details\":{\"message\":\"buried\"},\"message\":\"actual\"}";
+    const got = findStringValue(line, "\"message\":") orelse return error.NotFound;
+    try std.testing.expectEqualStrings("actual", got);
+}
+
+test "codex: item.updated emits the same projection as item.completed" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"item.updated\",\"item\":{\"item_type\":\"agent_message\",\"text\":\"streamed.\"}}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.message, evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"text\":\"streamed.\"") != null);
+}
+
+test "codex: reasoning item maps to message with role=reasoning" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"item.completed\",\"item\":{\"item_type\":\"reasoning\",\"text\":\"thinking\"}}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.message, evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"role\":\"reasoning\"") != null);
+}
+
+test "codex: parseStderrLine emits one recoverable error per non-empty line" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseStderrLine(a, "boom\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "boom") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"recoverable\":true") != null);
+}
+
+test "codex: parseStderrLine empty line yields zero events" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseStderrLine(a, "\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 0), evs.len);
+}
+
+test "codex: on_exit clean exit + ran_to_completion=false → canceled" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const exit_ev = try ad.onExit(a, 0, false);
+    defer adapter.freeOwned(a, exit_ev);
+    try std.testing.expect(std.mem.indexOf(u8, exit_ev.ev.data_json, "\"terminal_status\":\"canceled\"") != null);
 }

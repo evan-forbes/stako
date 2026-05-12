@@ -48,11 +48,23 @@ pub const State = struct {
     session_file: []u8 = "",
     turn_index: u32 = 0,
     seen_init: bool = false,
+    /// `Bash` tool_use ids that have not yet seen a matching `tool_result`.
+    /// We use this to defer the `command_executed` emission until the real
+    /// exit signal (`is_error`) arrives, since the `tool_use` line itself
+    /// carries no exit code. Keyed by tool_use id; value is the duplicated
+    /// command string.
+    pending_bash: std.StringHashMapUnmanaged([]u8) = .{},
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         if (self.session_id.len > 0) allocator.free(self.session_id);
         if (self.model.len > 0) allocator.free(self.model);
         if (self.session_file.len > 0) allocator.free(self.session_file);
+        var it = self.pending_bash.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.pending_bash.deinit(allocator);
     }
 };
 
@@ -117,6 +129,19 @@ fn parseStderrLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const 
 
 fn onExit(impl: *anyopaque, allocator: std.mem.Allocator, exit_code: i32, ran_to_completion: bool) anyerror!adapter.OwnedEvent {
     const st: *State = @ptrCast(@alignCast(impl));
+    // Drop any deferred Bash command entries that never saw a matching
+    // `tool_result`. The session is ending so we can't recover the real exit
+    // code; rather than emit fabricated `command_executed` events with a
+    // synthetic exit, we silently discard them — the corresponding `tool_call`
+    // event was already emitted at parse time and remains in the transcript.
+    {
+        var it = st.pending_bash.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        st.pending_bash.clearAndFree(allocator);
+    }
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -211,7 +236,7 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
             return out.toOwnedSlice(allocator);
         };
         if (findArrayValue(msg, "\"content\":")) |arr| {
-            try emitToolResults(allocator, &out, arr);
+            try emitToolResults(allocator, &out, st, arr);
         }
     } else if (std.mem.eql(u8, type_str, "stream_event")) {
         // Partial-message stream-event passthrough. We only project the
@@ -397,7 +422,6 @@ fn emitAssistantContent(
     st: *State,
     arr_with_brackets: []const u8,
 ) !void {
-    _ = st;
     // Iterate top-level objects in the array.
     var i: usize = 0;
     if (arr_with_brackets.len == 0 or arr_with_brackets[0] != '[') return;
@@ -413,7 +437,7 @@ fn emitAssistantContent(
         const obj_start = i;
         const obj_end = findMatchingBraceEnd(arr_with_brackets, obj_start) orelse break;
         const obj = arr_with_brackets[obj_start..obj_end];
-        try projectAssistantBlock(allocator, out, obj);
+        try projectAssistantBlock(allocator, out, st, obj);
         i = obj_end;
     }
 }
@@ -421,6 +445,7 @@ fn emitAssistantContent(
 fn projectAssistantBlock(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(adapter.OwnedEvent),
+    st: *State,
     block: []const u8,
 ) !void {
     const btype = findStringValue(block, "\"type\":") orelse return;
@@ -439,8 +464,30 @@ fn projectAssistantBlock(
             const op: []const u8 = if (std.mem.eql(u8, tool, "Write")) "create" else "modify";
             try emitFileChanged(allocator, out, path, op);
         } else if (std.mem.eql(u8, tool, "Bash")) {
+            // Defer `command_executed` until the matching `tool_result`
+            // arrives — only then do we know the real exit_code (via
+            // `is_error`). Stash the command keyed by tool_use id.
             const cmd = findStringValue(inp_obj, "\"command\":") orelse "";
-            try emitCommandExecuted(allocator, out, cmd, 0);
+            if (call_id.len > 0) {
+                const key = try allocator.dupe(u8, call_id);
+                errdefer allocator.free(key);
+                const val = try allocator.dupe(u8, cmd);
+                errdefer allocator.free(val);
+                const gop = try st.pending_bash.getOrPut(allocator, key);
+                if (gop.found_existing) {
+                    // Replace stale entry under the same id.
+                    allocator.free(key);
+                    allocator.free(gop.value_ptr.*);
+                    gop.value_ptr.* = val;
+                } else {
+                    gop.key_ptr.* = key;
+                    gop.value_ptr.* = val;
+                }
+            } else {
+                // No id to correlate the result with — emit immediately with
+                // exit:0 so the transcript still records the command.
+                try emitCommandExecuted(allocator, out, cmd, 0);
+            }
         }
     }
     // tool_result handled in `user` message path.
@@ -530,6 +577,7 @@ fn emitCommandExecuted(
 fn emitToolResults(
     allocator: std.mem.Allocator,
     out: *std.ArrayList(adapter.OwnedEvent),
+    st: *State,
     arr_with_brackets: []const u8,
 ) !void {
     if (arr_with_brackets.len == 0 or arr_with_brackets[0] != '[') return;
@@ -548,10 +596,61 @@ fn emitToolResults(
         if (std.mem.eql(u8, btype, "tool_result")) {
             const id = findStringValue(obj, "\"tool_use_id\":") orelse "";
             const content = findStringValue(obj, "\"content\":") orelse "";
-            try emitToolResultEvent(allocator, out, id, content);
+            const is_error = isErrorBool(obj);
+            const ok = !is_error;
+            try emitToolResultEvent(allocator, out, id, content, ok);
+            // If we deferred a `command_executed` for this tool_use id (Bash),
+            // emit it now with the real exit code derived from `is_error`.
+            if (id.len > 0) {
+                if (st.pending_bash.fetchRemove(id)) |kv| {
+                    defer allocator.free(kv.key);
+                    defer allocator.free(kv.value);
+                    const exit_code: i32 = if (is_error) 1 else 0;
+                    try emitCommandExecuted(allocator, out, kv.value, exit_code);
+                }
+            }
         }
         i = obj_end;
     }
+}
+
+/// Look for a top-level `"is_error":true` flag inside a tool_result object.
+fn isErrorBool(obj: []const u8) bool {
+    var i: usize = 0;
+    var depth: usize = 0;
+    var in_str = false;
+    var escape = false;
+    const key = "\"is_error\":";
+    while (i < obj.len) : (i += 1) {
+        const c = obj[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_str) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 and std.mem.startsWith(u8, obj[i..], key)) {
+                var j = i + key.len;
+                while (j < obj.len and (obj[j] == ' ' or obj[j] == '\t')) j += 1;
+                return j < obj.len and obj[j] == 't';
+            }
+            in_str = true;
+            continue;
+        }
+        if (c == '{' or c == '[') depth += 1;
+        if (c == '}' or c == ']') {
+            if (depth == 0) return false;
+            depth -= 1;
+        }
+    }
+    return false;
 }
 
 fn emitToolResultEvent(
@@ -559,13 +658,16 @@ fn emitToolResultEvent(
     out: *std.ArrayList(adapter.OwnedEvent),
     call_id: []const u8,
     output: []const u8,
+    ok: bool,
 ) !void {
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try w.writeAll("{\"call_id\":\"");
     try writeParsedJsonStringContent(w, call_id);
-    try w.writeAll("\",\"ok\":true,\"output\":\"");
+    try w.writeAll("\",\"ok\":");
+    try w.writeAll(if (ok) "true" else "false");
+    try w.writeAll(",\"output\":\"");
     try writeParsedJsonStringContent(w, output);
     try w.writeAll("\"}");
     const storage = try buf.toOwnedSlice(allocator);
@@ -630,38 +732,13 @@ fn stripEol(raw: []const u8) []const u8 {
     return line;
 }
 
+/// Find the value of a top-level (depth==1) string key in a JSON object.
+///
+/// Walks the source tracking string/escape state and brace/bracket depth, so
+/// nested objects are skipped — `findStringValue(`{"a":{"k":"buried"},"k":"top"}`, "\"k\":")`
+/// returns `"top"`, not `"buried"`. This matters whenever a key shadows a
+/// vendor-nested key (e.g. `"message"` inside an error details object).
 fn findStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (search_from < src.len) {
-        const idx = std.mem.indexOf(u8, src[search_from..], key_with_colon) orelse return null;
-        const abs = search_from + idx;
-        // Ensure the byte before the key is `,` or `{` or whitespace (so we
-        // don't match `"foo_session_id":` when scanning for `"session_id":`).
-        if (abs > 0) {
-            const c = src[abs - 1];
-            if (c != ',' and c != '{' and c != ' ' and c != '\t' and c != '\n' and c != '[') {
-                search_from = abs + 1;
-                continue;
-            }
-        }
-        var i = abs + key_with_colon.len;
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-        if (i >= src.len or src[i] != '"') return null;
-        i += 1;
-        const start = i;
-        while (i < src.len) : (i += 1) {
-            if (src[i] == '\\') {
-                i += 1;
-                continue;
-            }
-            if (src[i] == '"') return src[start..i];
-        }
-        return null;
-    }
-    return null;
-}
-
-fn findTopLevelStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
     var i: usize = 0;
     var depth: usize = 0;
     var in_str = false;
@@ -708,71 +785,118 @@ fn findTopLevelStringValue(src: []const u8, key_with_colon: []const u8) ?[]const
     return null;
 }
 
+/// Alias retained for readability at call sites that historically distinguish
+/// "top-level only" from the older buggy first-match scanner. The two helpers
+/// now share identical depth-1 semantics.
+const findTopLevelStringValue = findStringValue;
+
+/// Top-level (depth==1) object-value lookup. Like `findStringValue` but
+/// returns the object's bytes including its outer braces. Skips nested
+/// objects so e.g. `{"a":{"k":{...}},"k":{"top":1}}` returns the top-level
+/// `"k"` object.
 fn findObjectValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (search_from < src.len) {
-        const idx = std.mem.indexOf(u8, src[search_from..], key_with_colon) orelse return null;
-        const abs = search_from + idx;
-        if (abs > 0) {
-            const c = src[abs - 1];
-            if (c != ',' and c != '{' and c != ' ' and c != '\t' and c != '\n' and c != '[') {
-                search_from = abs + 1;
-                continue;
-            }
+    var i: usize = 0;
+    var depth: usize = 0;
+    var in_str = false;
+    var escape = false;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (escape) {
+            escape = false;
+            continue;
         }
-        var i = abs + key_with_colon.len;
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-        if (i >= src.len or src[i] != '{') return null;
-        const end = findMatchingBraceEnd(src, i) orelse return null;
-        return src[i..end];
+        if (in_str) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
+                var j = i + key_with_colon.len;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+                if (j >= src.len or src[j] != '{') return null;
+                const end = findMatchingBraceEnd(src, j) orelse return null;
+                return src[j..end];
+            }
+            in_str = true;
+            continue;
+        }
+        if (c == '{' or c == '[') depth += 1;
+        if (c == '}' or c == ']') {
+            if (depth == 0) return null;
+            depth -= 1;
+        }
     }
     return null;
 }
 
+/// Top-level (depth==1) array-value lookup. Returns the array's bytes
+/// including its outer brackets, skipping nested objects/arrays.
 fn findArrayValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (search_from < src.len) {
-        const idx = std.mem.indexOf(u8, src[search_from..], key_with_colon) orelse return null;
-        const abs = search_from + idx;
-        if (abs > 0) {
-            const c = src[abs - 1];
-            if (c != ',' and c != '{' and c != ' ' and c != '\t' and c != '\n' and c != '[') {
-                search_from = abs + 1;
-                continue;
-            }
+    var i: usize = 0;
+    var depth: usize = 0;
+    var in_str = false;
+    var escape = false;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (escape) {
+            escape = false;
+            continue;
         }
-        var i = abs + key_with_colon.len;
-        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-        if (i >= src.len or src[i] != '[') return null;
-        const start = i;
-        var depth: usize = 0;
-        var in_str = false;
-        var escape = false;
-        while (i < src.len) : (i += 1) {
-            const c = src[i];
-            if (escape) {
-                escape = false;
-                continue;
+        if (in_str) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_str = false;
             }
-            if (in_str) {
-                if (c == '\\') {
-                    escape = true;
-                } else if (c == '"') {
-                    in_str = false;
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
+                var j = i + key_with_colon.len;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+                if (j >= src.len or src[j] != '[') return null;
+                const start = j;
+                var adepth: usize = 0;
+                var ain_str = false;
+                var aescape = false;
+                while (j < src.len) : (j += 1) {
+                    const ac = src[j];
+                    if (aescape) {
+                        aescape = false;
+                        continue;
+                    }
+                    if (ain_str) {
+                        if (ac == '\\') {
+                            aescape = true;
+                        } else if (ac == '"') {
+                            ain_str = false;
+                        }
+                        continue;
+                    }
+                    if (ac == '"') {
+                        ain_str = true;
+                        continue;
+                    }
+                    if (ac == '[') adepth += 1;
+                    if (ac == ']') {
+                        adepth -= 1;
+                        if (adepth == 0) return src[start .. j + 1];
+                    }
                 }
-                continue;
+                return null;
             }
-            if (c == '"') {
-                in_str = true;
-                continue;
-            }
-            if (c == '[') depth += 1;
-            if (c == ']') {
-                depth -= 1;
-                if (depth == 0) return src[start .. i + 1];
-            }
+            in_str = true;
+            continue;
         }
-        return null;
+        if (c == '{' or c == '[') depth += 1;
+        if (c == '}' or c == ']') {
+            if (depth == 0) return null;
+            depth -= 1;
+        }
     }
     return null;
 }
@@ -891,17 +1015,53 @@ test "claude: tool_use Edit -> tool_call + file_changed" {
     try std.testing.expect(std.mem.indexOf(u8, evs[1].ev.data_json, "\"op\":\"modify\"") != null);
 }
 
-test "claude: tool_use Bash -> tool_call + command_executed" {
+test "claude: tool_use Bash defers command_executed until tool_result" {
     const a = std.testing.allocator;
     var ad = try create(a);
     defer ad.deinit(a);
-    const line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"Bash\",\"input\":{\"command\":\"echo hi\"}}]}}\n";
-    const evs = try ad.parseLine(a, line);
-    defer adapter.freeOwnedSlice(a, evs);
-    try std.testing.expectEqual(@as(usize, 2), evs.len);
-    try std.testing.expectEqual(events.Kind.tool_call, evs[0].ev.kind);
-    try std.testing.expectEqual(events.Kind.command_executed, evs[1].ev.kind);
-    try std.testing.expect(std.mem.indexOf(u8, evs[1].ev.data_json, "\"cmd\":\"echo hi\"") != null);
+    // 1) tool_use only emits a tool_call — no command_executed yet.
+    const tu_line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_2\",\"name\":\"Bash\",\"input\":{\"command\":\"echo hi\"}}]}}\n";
+    {
+        const evs = try ad.parseLine(a, tu_line);
+        defer adapter.freeOwnedSlice(a, evs);
+        try std.testing.expectEqual(@as(usize, 1), evs.len);
+        try std.testing.expectEqual(events.Kind.tool_call, evs[0].ev.kind);
+    }
+    // 2) tool_result with is_error=false → tool_result + command_executed{exit:0}.
+    const tr_line = "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_2\",\"content\":\"hi\\n\",\"is_error\":false}]}}\n";
+    {
+        const evs = try ad.parseLine(a, tr_line);
+        defer adapter.freeOwnedSlice(a, evs);
+        try std.testing.expectEqual(@as(usize, 2), evs.len);
+        try std.testing.expectEqual(events.Kind.tool_result, evs[0].ev.kind);
+        try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"ok\":true") != null);
+        try std.testing.expectEqual(events.Kind.command_executed, evs[1].ev.kind);
+        try std.testing.expect(std.mem.indexOf(u8, evs[1].ev.data_json, "\"cmd\":\"echo hi\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, evs[1].ev.data_json, "\"exit\":0") != null);
+    }
+}
+
+test "claude: tool_use Bash failure surfaces exit from is_error=true" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const tu_line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_fail\",\"name\":\"Bash\",\"input\":{\"command\":\"false\"}}]}}\n";
+    {
+        const evs = try ad.parseLine(a, tu_line);
+        defer adapter.freeOwnedSlice(a, evs);
+        try std.testing.expectEqual(@as(usize, 1), evs.len);
+        try std.testing.expectEqual(events.Kind.tool_call, evs[0].ev.kind);
+    }
+    const tr_line = "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_fail\",\"content\":\"err\",\"is_error\":true}]}}\n";
+    {
+        const evs = try ad.parseLine(a, tr_line);
+        defer adapter.freeOwnedSlice(a, evs);
+        try std.testing.expectEqual(@as(usize, 2), evs.len);
+        try std.testing.expectEqual(events.Kind.tool_result, evs[0].ev.kind);
+        try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"ok\":false") != null);
+        try std.testing.expectEqual(events.Kind.command_executed, evs[1].ev.kind);
+        try std.testing.expect(std.mem.indexOf(u8, evs[1].ev.data_json, "\"exit\":1") != null);
+    }
 }
 
 test "claude: malformed line yields recoverable error" {
@@ -994,4 +1154,84 @@ test "claude: unknown top-level event emits recoverable error" {
     try std.testing.expectEqual(@as(usize, 1), evs.len);
     try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
     try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"recoverable\":true") != null);
+}
+
+test "claude: findStringValue ignores nested same-name keys (depth-1 only)" {
+    // Regression for the audit-flagged first-positional bug: a buried
+    // `"session_id":` inside a nested object must NOT be returned in place of
+    // the top-level `"session_id":`.
+    const line = "{\"type\":\"system\",\"subtype\":\"init\",\"details\":{\"session_id\":\"buried\"},\"session_id\":\"top\",\"model\":\"claude-opus-4-7\"}\n";
+    const got = findStringValue(line, "\"session_id\":") orelse return error.NotFound;
+    try std.testing.expectEqualStrings("top", got);
+}
+
+test "claude: parseLine prefers top-level session_id over nested buried one" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const line = "{\"type\":\"system\",\"subtype\":\"init\",\"details\":{\"session_id\":\"buried\"},\"session_id\":\"top\",\"model\":\"claude-opus-4-7\"}\n";
+    const evs = try ad.parseLine(a, line);
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.session_started, evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"session\":\"top\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "buried") == null);
+}
+
+test "claude: user.tool_result maps to tool_result event with output" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const line = "{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_1\",\"content\":\"ok\"}]}}\n";
+    const evs = try ad.parseLine(a, line);
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.tool_result, evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"call_id\":\"tu_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"ok\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"output\":\"ok\"") != null);
+}
+
+test "claude: assistant message with mixed text + tool_use emits both in order" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const line = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Editing now.\"},{\"type\":\"tool_use\",\"id\":\"tu_mix\",\"name\":\"Edit\",\"input\":{\"file_path\":\"/tmp/m.zig\"}}]}}\n";
+    const evs = try ad.parseLine(a, line);
+    defer adapter.freeOwnedSlice(a, evs);
+    // Expected: message (from text) + tool_call (from tool_use) + file_changed.
+    try std.testing.expectEqual(@as(usize, 3), evs.len);
+    try std.testing.expectEqual(events.Kind.message, evs[0].ev.kind);
+    try std.testing.expectEqual(events.Kind.tool_call, evs[1].ev.kind);
+    try std.testing.expectEqual(events.Kind.file_changed, evs[2].ev.kind);
+}
+
+test "claude: parseStderrLine emits one recoverable error per non-empty line" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseStderrLine(a, "panic: borked\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "panic: borked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"recoverable\":true") != null);
+}
+
+test "claude: parseStderrLine empty line yields zero events" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseStderrLine(a, "\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 0), evs.len);
+}
+
+test "claude: on_exit clean exit + ran_to_completion=false → canceled" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const exit_ev = try ad.onExit(a, 0, false);
+    defer adapter.freeOwned(a, exit_ev);
+    try std.testing.expect(std.mem.indexOf(u8, exit_ev.ev.data_json, "\"terminal_status\":\"canceled\"") != null);
 }

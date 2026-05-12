@@ -289,3 +289,53 @@ test "buildArgv: unknown harness fails instead of running a no-op" {
     defer it.deinit();
     try std.testing.expectError(error.UnsupportedHarness, buildArgv(a, "unknown", &it, "/nonexistent-dir-9003"));
 }
+
+test "buildArgv: pathological prompt.md contents pass through as one argv slot" {
+    // Regression: argv composition must NOT interpret shell metacharacters,
+    // newlines, or `$(…)` substitutions — the prompt is a single argv slot
+    // and the spawn path does not invoke a shell. We exercise both adapters.
+    const a = std.testing.allocator;
+    // Build a real on-disk prompt.md inside a tmp dir.
+    const tmp = std.posix.getenv("TMPDIR") orelse "/tmp";
+    var ts_buf: [40]u8 = undefined;
+    const ts = try std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.nanoTimestamp()});
+    const dir = try std.fs.path.join(a, &.{ tmp, "organo-test-m7-argv", ts });
+    defer a.free(dir);
+    try std.fs.cwd().makePath(dir);
+    defer std.fs.cwd().deleteTree(dir) catch {};
+    const prompt_path = try std.fs.path.join(a, &.{ dir, "prompt.md" });
+    defer a.free(prompt_path);
+    // Content: contains $(rm -rf /), embedded newline, and quotes.
+    const pathological = "say: \"$(rm -rf /)\"\nsecond line; && echo nope";
+    {
+        var f = try std.fs.cwd().createFile(prompt_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(pathological);
+    }
+    var it = item_mod.Item{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0001",
+        .slug = "say-hi",
+        .kind = .prompt,
+        .status = .queued,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer it.deinit();
+    {
+        const argv = try buildArgv(a, "claude", &it, dir);
+        defer {
+            for (argv) |s| a.free(s);
+            a.free(argv);
+        }
+        try std.testing.expectEqualStrings(pathological, argv[2]);
+    }
+    {
+        const argv = try buildArgv(a, "codex", &it, dir);
+        defer {
+            for (argv) |s| a.free(s);
+            a.free(argv);
+        }
+        try std.testing.expectEqualStrings(pathological, argv[3]);
+    }
+}
