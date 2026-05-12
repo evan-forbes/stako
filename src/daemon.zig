@@ -920,7 +920,12 @@ fn queuePostCommitWake(ctx: ?*anyopaque, req: *const mutation_queue.Request) voi
 /// In v1 the only mutator is `local`; once items carry a `created_by`
 /// identity field this callback grows that lookup.
 fn runtimePolicyCheck(ctx: ?*anyopaque, provider_slug: []const u8) bool {
-    const self_any = ctx orelse return true;
+    // Fail-closed default: an authorization callback with no context can
+    // never positively assert that dispatch is allowed. In v1 the daemon
+    // always installs `@ptrCast(self)` (never null) at install time, so
+    // this branch is unreachable in practice — but a future refactor or
+    // partially-initialized supervisor must not silently bypass policy.
+    const self_any = ctx orelse return false;
     const self: *Daemon = @ptrCast(@alignCast(self_any));
     const id = policy.resolveLocal(&self.config);
     const decision = policy.evaluate(id, .dispatch_harness, .{ .provider = provider_slug });

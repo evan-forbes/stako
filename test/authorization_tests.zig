@@ -17,6 +17,7 @@ const init_mod = organo.init;
 const daemon_mod = organo.daemon;
 const policy_mod = organo.policy;
 const config_mod = organo.config;
+const vcs = organo.vcs;
 
 // ---------- harness ----------
 
@@ -451,4 +452,210 @@ test "authorization: routing denied for provider lacking capability" {
 
     try std.testing.expect(policy_mod.evaluate(id, .dispatch_harness, .{ .provider = "anthropic" }) == .allow);
     try std.testing.expect(policy_mod.evaluate(id, .dispatch_harness, .{ .provider = "openai" }) == .capability_denied);
+}
+
+// ---------- coverage gap #4 (audit_10): form-body auth path produces the same canonical denial body ----------
+
+fn buildPostForm(allocator: std.mem.Allocator, path: []const u8, body: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ path, body.len, body });
+}
+
+test "authorization: form-body auth path emits canonical capability_denied" {
+    // The form-body auth path (browser `<form>` POST) carries the token
+    // in `_token=...` rather than the Authorization header. Capability
+    // denials taken via this path must produce the same JSON shape and
+    // 403 status as the bearer-header path so HTML clients see a
+    // consistent error vocabulary. See audit_10 coverage gap #4.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "form-deny");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedIdentityCapabilities(a, s.abs_path, "[]"); // pause on any stack denied
+
+    // Seed a stack so pause/resume can run end-to-end through the form path.
+    const stack_dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "demo" });
+    defer a.free(stack_dir);
+    try std.fs.cwd().makePath(stack_dir);
+    {
+        const path = try std.fs.path.join(a, &.{ stack_dir, "stack.toml" });
+        defer a.free(path);
+        var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("description = \"d\"\npaused = false\n");
+    }
+
+    var drv = Driver{ .allocator = a, .daemon = try startDaemonNoGit(a, s.abs_path) };
+    defer drv.deinit();
+    try drv.startWorker();
+    try drv.serve(1);
+
+    const body = try std.fmt.allocPrint(a, "_token={s}", .{drv.daemon.token.bytes});
+    defer a.free(body);
+    const req = try buildPostForm(a, "/stacks/demo/pause", body);
+    defer a.free(req);
+    const resp = try httpRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 403), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"code\":\"capability_denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"identity\":\"local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"capability\":\"stack.demo.pause\"") != null);
+
+    // The mutation never landed: stack remains unpaused on disk.
+    const stack_toml_path = try std.fs.path.join(a, &.{ stack_dir, "stack.toml" });
+    defer a.free(stack_toml_path);
+    var f = try std.fs.cwd().openFile(stack_toml_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "paused = false") != null);
+
+    // Audit denial entry written for the form-path denial.
+    const log = try readAuditLog(a, s.abs_path);
+    defer a.free(log);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"reason\":\"capability_denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"action\":\"pause_stack\"") != null);
+}
+
+// ---------- coverage gap #6 (audit_10): denied mutation produces zero git activity ----------
+
+fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
+    const git_path = try std.fs.path.join(allocator, &.{ root, ".git" });
+    defer allocator.free(git_path);
+    std.fs.cwd().deleteTree(git_path) catch {};
+    try vcs.ensureRealRepo(allocator, root);
+    const paths = [_][]const u8{ ".gitignore", "stacks", ".organo/config.toml" };
+    _ = vcs.commit(allocator, root, .{ .paths = &paths, .subject = "init: baseline" }) catch {};
+}
+
+fn startDaemonWithGit(allocator: std.mem.Allocator, root: []const u8) !daemon_mod.Daemon {
+    return daemon_mod.start(allocator, .{
+        .notes_root = root,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = true,
+        .check_repo_conflicts = false,
+    });
+}
+
+fn runGitCapture(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) ![]u8 {
+    var full_argv = std.ArrayList([]const u8){};
+    defer full_argv.deinit(allocator);
+    try full_argv.append(allocator, "git");
+    for (argv) |a| try full_argv.append(allocator, a);
+    var child = std.process.Child.init(full_argv.items, allocator);
+    child.cwd = cwd;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+    var out_buf = std.ArrayList(u8){};
+    errdefer out_buf.deinit(allocator);
+    var err_buf = std.ArrayList(u8){};
+    defer err_buf.deinit(allocator);
+    try child.collectOutput(allocator, &out_buf, &err_buf, 1 * 1024 * 1024);
+    _ = try child.wait();
+    return out_buf.toOwnedSlice(allocator);
+}
+
+test "authorization: denied mutation leaves zero git activity" {
+    // A future regression could accidentally route a denied mutation
+    // through the queue before consulting policy; that would land a git
+    // commit on disk. This test enables a real git repo, denies a
+    // mutation, and asserts `git log --oneline` shows only the baseline
+    // commit — i.e. the denied path never reached the queue. See
+    // audit_10 coverage gap #6.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "no-git-on-deny");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try makeRealRepo(a, s.abs_path);
+    try seedIdentityCapabilities(a, s.abs_path, "[]");
+
+    // Re-commit the rewritten config so the baseline log is exactly one entry.
+    _ = vcs.commit(a, s.abs_path, .{
+        .paths = &.{".organo/config.toml"},
+        .subject = "test: seed identity",
+    }) catch {};
+
+    const log_before = try runGitCapture(a, s.abs_path, &.{ "log", "--oneline" });
+    defer a.free(log_before);
+    var before_lines: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, log_before, '\n');
+        while (it.next()) |line| if (line.len > 0) {
+            before_lines += 1;
+        };
+    }
+
+    var drv = Driver{ .allocator = a, .daemon = try startDaemonWithGit(a, s.abs_path) };
+    defer drv.deinit();
+    try drv.startWorker();
+    try drv.serve(1);
+
+    const body = "{\"name\":\"demo\"}";
+    const req = try buildPost(a, "/stacks", drv.daemon.token.bytes, body);
+    defer a.free(req);
+    const resp = try httpRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 403), parsed.status);
+
+    // Drive the daemon worker to quiescence before sampling git so any
+    // background commit that erroneously slipped through has had its
+    // chance to land.
+    drv.daemon.requestShutdown();
+    if (drv.thread) |t| {
+        t.join();
+        drv.thread = null;
+    }
+
+    const log_after = try runGitCapture(a, s.abs_path, &.{ "log", "--oneline" });
+    defer a.free(log_after);
+    var after_lines: usize = 0;
+    {
+        var it = std.mem.splitScalar(u8, log_after, '\n');
+        while (it.next()) |line| if (line.len > 0) {
+            after_lines += 1;
+        };
+    }
+    try std.testing.expectEqual(before_lines, after_lines);
+}
+
+// ---------- coverage gap #5 (audit_10): illegal stack-name flows through policy first ----------
+
+test "authorization: illegal stack name denied by policy before handler validation" {
+    // The route matcher passes the raw stack-name to the policy
+    // evaluator (`policy.evaluate` runs before the handler's
+    // `isValidStackName` check). For an identity scoped to a specific
+    // stack, an illegal name will trip the 403 path before the 400.
+    // Confirm the policy verdict and audit shape match the canonical
+    // capability_denied vocabulary. See audit_10 coverage gap #5.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "illegal-stack");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedIdentityCapabilities(a, s.abs_path, "[\"stack.demo.append\"]");
+
+    var drv = Driver{ .allocator = a, .daemon = try startDaemonNoGit(a, s.abs_path) };
+    defer drv.deinit();
+    try drv.startWorker();
+    try drv.serve(1);
+
+    // `BadName` is not a route the daemon would accept anyway (uppercase
+    // is rejected by `isValidStackName`), but the policy layer runs
+    // first. With `stack.demo.append` only, this stack is outside scope.
+    const body = "{\"kind\":\"prompt\",\"slug\":\"hi\",\"prompt\":\"hi\"}";
+    const req = try buildPost(a, "/stacks/BadName/items", drv.daemon.token.bytes, body);
+    defer a.free(req);
+    const resp = try httpRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 403), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"code\":\"capability_denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"capability\":\"stack.BadName.append\"") != null);
 }

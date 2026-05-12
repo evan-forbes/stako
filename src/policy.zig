@@ -392,3 +392,72 @@ test "evaluate: unknown capability slugs are silently ignored" {
     try testing.expect(evaluate(id, .append_item, .{ .stack = "demo" }) == .allow);
     try testing.expect(evaluate(id, .append_item, .{ .stack = "other" }) == .capability_denied);
 }
+
+// Coverage gap #2 (audit_10): `[identity.local]` declared but no
+// `capabilities` key. `Identity.capabilities` is `null` in that case;
+// `evaluate` must fall through to `caps = &.{}` and deny every action.
+test "evaluate: declared identity without capabilities key denies all" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\type = "user"
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(id.explicitly_declared);
+    try testing.expect(id.entry != null);
+    try testing.expect(id.entry.?.capabilities == null);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "default" }) == .capability_denied);
+    try testing.expect(evaluate(id, .create_stack, .{ .stack_create = "x" }) == .capability_denied);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "anthropic" }) == .capability_denied);
+}
+
+// Coverage gap #3 (audit_10): wildcard `*` in non-supported positions.
+// These slugs fail every match function and fall through to default-deny.
+test "evaluate: wildcards in unsupported positions fall through to deny" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["*.append", "stack.*", "*.", "stack.", "provider."]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    // None of these caps grant anything; default-deny applies.
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "demo" }) == .capability_denied);
+    try testing.expect(evaluate(id, .pause_stack, .{ .stack = "demo" }) == .capability_denied);
+    try testing.expect(evaluate(id, .create_stack, .{ .stack_create = "x" }) == .capability_denied);
+    try testing.expect(evaluate(id, .dispatch_harness, .{ .provider = "anthropic" }) == .capability_denied);
+}
+
+// Coverage gap #5 (audit_10): policy evaluates against the raw stack-name
+// from the route match (e.g. `<illegal>` containing characters that
+// `storage.isValidStackName` rejects). Confirm policy still runs and
+// returns the expected default-deny — the handler layer rejects with 400
+// only after policy has been consulted.
+test "evaluate: illegal stack names flow through policy and deny by default" {
+    const a = testing.allocator;
+    var cfg = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["stack.demo.append"]
+        \\
+    );
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    // The route matcher would supply this stack-name verbatim; policy
+    // must not match the capability and must deny.
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "Bad/Name!" }) == .capability_denied);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = "" }) == .capability_denied);
+    // `stack.*.append` still matches even a structurally-invalid name —
+    // the policy evaluator is name-agnostic by design, the handler layer
+    // rejects 400 after policy.
+    var cfg2 = try cfgFromToml(a,
+        \\[identity.local]
+        \\capabilities = ["stack.*.append"]
+        \\
+    );
+    defer cfg2.deinit();
+    const id2 = resolveLocal(&cfg2);
+    try testing.expect(evaluate(id2, .append_item, .{ .stack = "Bad/Name!" }) == .allow);
+}
