@@ -36,4 +36,4 @@ Second pass: full-module audit (correctness, test coverage, readability, DRY/KIS
 | 7 | 07_claude_codex_adapters.md | _audit_07.md | 0 | 5 | 8 | 9e61339 | — | 0 | findStringValue depth-1 fix; Bash exit deferred to tool_result; 11/11 coverage; 436/436 (+18); unbounded line buf flagged cross-cutting (M6 sess_mgr) |
 | 8 | 08_provider_status_and_gemini.md | _audit_08.md | 0 | 3 | 10 | 3ec4b2d | — | 0 | 3/3 important; 7/9 coverage (2 in runtime.zig cross-cutting); 447/447 (+11); no credential leakage |
 | 9 | 09_html_rendering.md | _audit_09.md | 0 | 3 | 7 | 39234aa | — | 0 | 0 XSS in 39 escapes; 1/3 important (2 daemon.zig cross-cutting); 8/8 coverage + 4 fixtures; 456/456 (+9) |
-| 10 | 10_authorization.md | _audit_10.md | — | — | — | — | — | — | pending |
+| 10 | 10_authorization.md | _audit_10.md | 0 | 3 | 7 | 9f4f59b | — | 0 | fail-closed confirmed except null-ctx default (fixed); 1/3 important (2 cross-cutting); 6 coverage + new authorization_tests.zig; 462/462 (+6) |
