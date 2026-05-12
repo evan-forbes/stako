@@ -20,8 +20,9 @@ pub const Options = struct {
     /// "cwd default vs --root flag" before calling.
     root: []const u8,
     /// When true: skip prompts; auto `git init` non-git roots; proceed inside
-    /// existing git repos without asking. CLI default is false in
-    /// interactive mode; tests always pass true.
+    /// existing git repos without asking. When false: skip git init (the
+    /// layout itself is still created). CLI exposes this as `--yes`/`-y`;
+    /// tests always pass true.
     yes: bool = true,
     /// When true: emit only PASS/FAIL summary rather than per-line creates.
     /// Tests pass true to keep test output uncluttered.
@@ -104,11 +105,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
     if (git_state == .repo_here) {
         // Already a git repo in this dir; nothing to do for git.
     } else if (git_state == .parent_repo) {
+        // Design decision (resolved-was-to-decide section): proceed and let
+        // the CLI layer surface a warning to the user.
         report.inside_existing_git = true;
-        // Design decision (resolved-was-to-decide section): proceed; emit warn.
-        if (!opts.quiet) {
-            // Warning is written to stderr by the CLI layer; here we just flag.
-        }
     } else if (opts.yes) {
         try gitInitHere(&root_dir);
         report.git_initialized = true;
@@ -166,17 +165,16 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
     );
 
     // 7. .organo/local_token — generated once, perms 0600, gitignored.
-    {
-        const token = try generateLocalToken(r_arena, opts.rng_seed_override);
-        try writeFileIfAbsent(
-            &root_dir,
-            ".organo/local_token",
-            &report,
-            r_arena,
-            .{ .raw = token },
-            0o600,
-        );
-    }
+    // Token bytes are produced lazily inside writeFileIfAbsent so we don't
+    // burn kernel entropy on idempotent re-init runs.
+    try writeFileIfAbsent(
+        &root_dir,
+        ".organo/local_token",
+        &report,
+        r_arena,
+        .{ .local_token = opts.rng_seed_override },
+        0o600,
+    );
 
     // 8. .gitignore — append missing lines.
     try appendGitignoreLines(&root_dir, &report, r_arena);
@@ -309,6 +307,9 @@ const FileSpec = union(enum) {
     stack_defaults: struct { created_at: []const u8 },
     config_committed,
     config_local,
+    /// Generated lazily inside `writeFileIfAbsent` to avoid wasted entropy
+    /// when the file already exists.
+    local_token: ?u64,
     raw: []const u8,
 };
 
@@ -333,6 +334,10 @@ fn writeFileIfAbsent(
         .stack_defaults => |sd| try stack_config.writeDefaults(w, sd.created_at),
         .config_committed => try writeConfigCommitted(w),
         .config_local => try writeConfigLocal(w),
+        .local_token => |seed| {
+            const token = try generateLocalToken(arena, seed);
+            try w.writeAll(token);
+        },
         .raw => |s| try w.writeAll(s),
     }
 
@@ -351,9 +356,30 @@ fn writeAtomic(root_dir: *std.fs.Dir, rel: []const u8, content: []const u8) !voi
     if (std.fs.path.dirname(rel)) |parent| {
         if (parent.len > 0) try root_dir.makePath(parent);
     }
-    var f = try root_dir.createFile(rel, .{ .truncate = true });
-    defer f.close();
-    try f.writeAll(content);
+    // Write-to-temp + rename gives a half-or-nothing guarantee against crash
+    // or SIGKILL mid-write: a torn `local_token` would permanently break auth,
+    // and a torn `config.toml` would break daemon startup. The temp name is
+    // co-located with the target so `rename` stays within one filesystem.
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_rel = blk: {
+        var rng_bytes: [4]u8 = undefined;
+        std.crypto.random.bytes(&rng_bytes);
+        break :blk try std.fmt.bufPrint(
+            &tmp_buf,
+            "{s}.organo-tmp-{x}{x}{x}{x}",
+            .{ rel, rng_bytes[0], rng_bytes[1], rng_bytes[2], rng_bytes[3] },
+        );
+    };
+    {
+        var f = try root_dir.createFile(tmp_rel, .{ .truncate = true, .exclusive = true });
+        defer f.close();
+        try f.writeAll(content);
+        f.sync() catch {};
+    }
+    root_dir.rename(tmp_rel, rel) catch |e| {
+        root_dir.deleteFile(tmp_rel) catch {};
+        return e;
+    };
 }
 
 fn writeConfigCommitted(w: anytype) !void {
@@ -414,10 +440,10 @@ fn appendGitignoreLines(
     arena: std.mem.Allocator,
 ) !void {
     const path = ".gitignore";
-    // Read the existing file (if any).
-    var existing: []u8 = "";
-    var owned_existing = false;
-    defer if (owned_existing) arena.free(existing);
+    // Read the existing file (if any). Lifetime: arena-backed, freed with the
+    // report's arena — no per-slice free since `existing` is a subslice of
+    // the alloc and freeing it directly would mismatch the alloc size.
+    var existing: []const u8 = "";
 
     if (statExists(root_dir, path)) {
         var f = try root_dir.openFile(path, .{});
@@ -426,7 +452,6 @@ fn appendGitignoreLines(
         const buf = try arena.alloc(u8, stat.size);
         const n = try f.readAll(buf);
         existing = buf[0..n];
-        owned_existing = true;
     }
 
     // Determine which lines are missing.

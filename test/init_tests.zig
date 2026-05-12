@@ -402,6 +402,84 @@ test "init: inside an existing parent git repo emits a warning but proceeds" {
     try std.testing.expect(report.created.items.len > 0);
 }
 
+test "init: .organo/runtime is empty after a fresh init" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "runtime-empty");
+    defer s.deinit();
+
+    var report = try init_mod.run(a, .{
+        .root = s.abs_path,
+        .yes = true,
+        .quiet = true,
+        .now_override = "2026-05-10T14:00:00Z",
+        .rng_seed_override = 0x77,
+    });
+    defer report.deinit();
+
+    var d = try s.dir();
+    defer d.close();
+    var rt = try d.openDir(".organo/runtime", .{ .iterate = true });
+    defer rt.close();
+    var it = rt.iterate();
+    var count: usize = 0;
+    while (try it.next()) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 0), count);
+}
+
+test "init: yes=false skips auto git init on a non-git root" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "no-yes");
+    defer s.deinit();
+
+    var report = try init_mod.run(a, .{
+        .root = s.abs_path,
+        .yes = false,
+        .quiet = true,
+        .now_override = "2026-05-10T14:00:00Z",
+        .rng_seed_override = 0x88,
+    });
+    defer report.deinit();
+    try std.testing.expect(!report.git_initialized);
+
+    var d = try s.dir();
+    defer d.close();
+    // .git was not created, but the rest of the layout was.
+    try std.testing.expect(!fileExists(&d, ".git"));
+    try std.testing.expect(fileExists(&d, ".organo/local_token"));
+    try std.testing.expect(fileExists(&d, "stacks/default/stack.toml"));
+}
+
+test "init: existing stack.toml is never overwritten" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "stack-no-clobber");
+    defer s.deinit();
+
+    {
+        var d = try std.fs.openDirAbsolute(s.abs_path, .{});
+        defer d.close();
+        try d.makePath("stacks/default");
+        var f = try d.createFile("stacks/default/stack.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("# hand-edited\ndescription = \"keep me\"\n");
+    }
+
+    var report = try init_mod.run(a, .{
+        .root = s.abs_path,
+        .yes = true,
+        .quiet = true,
+        .now_override = "2026-05-10T14:00:00Z",
+        .rng_seed_override = 0x66,
+    });
+    defer report.deinit();
+
+    var d = try s.dir();
+    defer d.close();
+    const src = try readAll(a, &d, "stacks/default/stack.toml");
+    defer a.free(src);
+    try std.testing.expect(std.mem.indexOf(u8, src, "# hand-edited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "keep me") != null);
+}
+
 test "init: existing config.toml is never overwritten" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "no-clobber");

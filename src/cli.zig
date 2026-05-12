@@ -134,7 +134,7 @@ pub fn parseInitArgs(args: []const []const u8) UsageError!InitArgs {
             if (out.root.len == 0) return error.BadFlagValue;
         } else if (std.mem.startsWith(u8, a, "--now=")) {
             const v = a["--now=".len..];
-            if (v.len == 0) return error.BadFlagValue;
+            if (!isValidIsoUtc(v)) return error.BadFlagValue;
             out.now_override = v;
         } else if (std.mem.startsWith(u8, a, "--seed=")) {
             const v = a["--seed=".len..];
@@ -145,6 +145,18 @@ pub fn parseInitArgs(args: []const []const u8) UsageError!InitArgs {
         }
     }
     return out;
+}
+
+/// Strict shape check for `--now=` values: exactly `YYYY-MM-DDTHH:MM:SSZ`
+/// (20 bytes). The hidden override flows into `stack.toml` as a TOML datetime,
+/// so a malformed value would silently break readers downstream.
+fn isValidIsoUtc(s: []const u8) bool {
+    if (s.len != 20) return false;
+    const expect_digit = [_]usize{ 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18 };
+    for (expect_digit) |i| {
+        if (s[i] < '0' or s[i] > '9') return false;
+    }
+    return s[4] == '-' and s[7] == '-' and s[10] == 'T' and s[13] == ':' and s[16] == ':' and s[19] == 'Z';
 }
 
 /// Action under the `stack` subcommand. Each canonical name has one short
@@ -210,7 +222,7 @@ pub const StackArgs = struct {
     item_id: []const u8 = "",
     /// `supersede`: replacement item id.
     replacement: []const u8 = "",
-    /// `config`: one --set entries (key=value). Up to 8 in v1.
+    /// `config`: one or more --set entries (key=value). Up to 8 in v1.
     set_pairs: [8][]const u8 = std.mem.zeroes([8][]const u8),
     set_count: u8 = 0,
 };
@@ -642,7 +654,7 @@ fn runInit(
 
     var report = init_mod.run(allocator, .{
         .root = parsed.root,
-        .yes = parsed.yes or true, // non-interactive in this milestone
+        .yes = parsed.yes,
         .quiet = parsed.quiet,
         .now_override = parsed.now_override,
         .rng_seed_override = parsed.rng_seed_override,
@@ -652,7 +664,7 @@ fn runInit(
     };
     defer report.deinit();
 
-    try printReport(stdout, &report);
+    try printReport(stdout, &report, parsed.quiet);
     return 0;
 }
 
@@ -735,7 +747,7 @@ fn printStackUsage(w: anytype) !void {
     );
 }
 
-fn printReport(w: anytype, r: *const init_mod.Report) !void {
+fn printReport(w: anytype, r: *const init_mod.Report, quiet: bool) !void {
     if (r.inside_existing_git) {
         try w.writeAll("warning: notes root is inside an existing git repository;\n");
         try w.writeAll("         the organo layout will join that repo's history.\n");
@@ -745,6 +757,13 @@ fn printReport(w: anytype, r: *const init_mod.Report) !void {
     }
     if (r.created.items.len == 0) {
         try w.writeAll("organo init: already initialized — no changes.\n");
+        return;
+    }
+    if (quiet) {
+        try w.print(
+            "organo init: {d} created, {d} already present.\n",
+            .{ r.created.items.len, r.already_present.items.len },
+        );
         return;
     }
     try w.writeAll("created:\n");
@@ -791,6 +810,45 @@ test "parseInitArgs: unknown flag rejected" {
 
 test "parseInitArgs: --root missing value rejected" {
     try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--root"}));
+}
+
+test "parseInitArgs: --now= valid ISO UTC accepted" {
+    const a = try parseInitArgs(&.{"--now=2026-05-10T14:00:00Z"});
+    try std.testing.expectEqualStrings("2026-05-10T14:00:00Z", a.now_override.?);
+}
+
+test "parseInitArgs: --now= malformed rejected" {
+    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now=not a date"}));
+    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now="}));
+    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now=2026-05-10"}));
+    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now=2026-05-10T14:00:00"}));
+    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now=2026/05/10T14:00:00Z"}));
+}
+
+test "parseInitArgs: --seed= malformed rejected" {
+    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--seed=notanumber"}));
+}
+
+test "parseInitArgs: --seed= hex and decimal both accepted" {
+    const a = try parseInitArgs(&.{"--seed=0xCAFE"});
+    try std.testing.expectEqual(@as(?u64, 0xCAFE), a.rng_seed_override);
+    const b = try parseInitArgs(&.{"--seed=42"});
+    try std.testing.expectEqual(@as(?u64, 42), b.rng_seed_override);
+}
+
+test "parseInitArgs: -r requires value" {
+    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"-r"}));
+}
+
+test "parseInitArgs: flag ordering does not matter" {
+    const a = try parseInitArgs(&.{ "-y", "--root", "/tmp/x", "-q" });
+    try std.testing.expect(a.yes);
+    try std.testing.expect(a.quiet);
+    try std.testing.expectEqualStrings("/tmp/x", a.root);
+    const b = try parseInitArgs(&.{ "--root", "/tmp/x", "-y", "-q" });
+    try std.testing.expect(b.yes);
+    try std.testing.expect(b.quiet);
+    try std.testing.expectEqualStrings("/tmp/x", b.root);
 }
 
 test "Subcommand.fromString canonical names" {

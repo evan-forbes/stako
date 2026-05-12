@@ -442,6 +442,96 @@ test "cli: daemon st (short alias for status) reports `stopped` on empty root" {
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "stopped") != null);
 }
 
+// ---------- milestone 2: organo init via cli.dispatch ----------
+
+test "cli: init on a fresh dir exits 0 and prints created list" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "init-fresh");
+    defer s.deinit();
+
+    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--yes", "--now=2026-05-10T14:00:00Z", "--seed=0x1234" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, ".organo/local_token") != null);
+
+    // Layout actually landed on disk.
+    var d = try std.fs.openDirAbsolute(s.abs_path, .{});
+    defer d.close();
+    d.access(".organo/local_token", .{}) catch return error.LayoutNotCreated;
+    d.access("stacks/default/stack.toml", .{}) catch return error.LayoutNotCreated;
+}
+
+test "cli: init --quiet suppresses per-line output but prints a summary" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "init-quiet");
+    defer s.deinit();
+
+    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--yes", "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x5678" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    // No per-line `created:` block under --quiet.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created:\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "  .organo/local_token\n") == null);
+    // But a one-line summary is present.
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "organo init:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "already present") != null);
+}
+
+test "cli: init re-run prints the `already initialized` line and exits 0" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "init-rerun");
+    defer s.deinit();
+
+    var r1 = try runCli(a, &.{ "init", "--root", s.abs_path, "--yes", "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
+    defer r1.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r1.code);
+
+    var r2 = try runCli(a, &.{ "init", "--root", s.abs_path, "--yes", "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r2.code);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "already initialized") != null);
+}
+
+test "cli: init on a missing root exits 1 with a useful stderr message" {
+    const a = std.testing.allocator;
+    var r = try runCli(a, &.{ "init", "--root", "/path/does/not/exist/anywhere/12345", "--yes", "--quiet" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 1), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "organo init:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "RootNotADirectory") != null);
+}
+
+test "cli: init --now= malformed rejected at parse time (exit 2)" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "init-bad-now");
+    defer s.deinit();
+
+    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--now=not a date" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 2), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "BadFlagValue") != null);
+}
+
+test "cli: init without --yes does not auto-init git on a non-git root" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "init-no-yes");
+    defer s.deinit();
+
+    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x99" });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+
+    // Layout landed, but .git was NOT created because --yes was absent.
+    var d = try std.fs.openDirAbsolute(s.abs_path, .{});
+    defer d.close();
+    d.access(".organo/local_token", .{}) catch return error.LayoutNotCreated;
+    if (d.access(".git", .{})) |_| {
+        return error.GitInitShouldHaveBeenSkipped;
+    } else |_| {}
+}
+
 // ---------- subprocess test ----------
 //
 // One end-to-end test exec's the compiled binary so we cover the argv parsing
