@@ -29,7 +29,7 @@ Second pass: full-module audit (correctness, test coverage, readability, DRY/KIS
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | 01_item_format.md | _audit_01.md | 0 | 3 | 11 | 36dd8e5 | — | 0 | 3/3 important, 6/7 coverage added (1 terminal-result asymmetry deferred), 1/11 minor; 358/358 tests |
 | 2 | 02_init_and_layout.md | _audit_02.md | 2 | 5 | 10 | 5f8b0e5 | — | 0 | 2/2 blocking + 4/5 important + 10/10 coverage + 3 minor; 373/373 tests (+15) |
-| 3 | 03_daemon_skeleton.md | _audit_03.md | — | — | — | — | — | — | pending |
+| 3 | 03_daemon_skeleton.md | _audit_03.md | 2 | 8 | 14 | 42bf5b1 | — | 0 | 2/2 blocking (body+pid leaks); 3/8 important (5 skipped: cross-cutting or libc); 16 coverage; 389/389 (+16) |
 | 4 | 04_cli_read.md | _audit_04.md | — | — | — | — | — | — | pending |
 | 5 | 05_mutations_and_vcs.md | _audit_05.md | — | — | — | — | — | — | pending |
 | 6 | 06_runtime_core.md | _audit_06.md | — | — | — | — | — | — | pending |
