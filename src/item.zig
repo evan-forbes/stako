@@ -124,6 +124,9 @@ pub const Item = struct {
     sleep: ?Sleep = null,
     clear_present: bool = false,
     sleep_has_body: bool = false,
+    /// Name of the first unrecognized key under `[sleep]`, if any. Used so the
+    /// validator can surface "untill"/"reason"/etc. rather than just "sleep".
+    sleep_extra_key: ?[]const u8 = null,
     clear_has_body: bool = false,
     result: ?Result = null,
 
@@ -132,21 +135,16 @@ pub const Item = struct {
     }
 };
 
+/// Errors returnable from `parseSlice` / `parseFile`. Validation-time errors
+/// live in `ValidationError`; the two sets are intentionally disjoint so a
+/// caller's `catch |e| switch (e) { ... }` arms reflect the actual contract.
 pub const ParseError = error{
     Toml,
     MissingField,
     UnknownKind,
     UnknownStatus,
     UnknownMatch,
-    InvalidDatetime,
-    InvalidIdFormat,
-    InvalidSlugFormat,
-    InvalidParentId,
-    InvalidStateTransition,
     InvalidSleep,
-    MissingSleepTable,
-    MissingTargetTable,
-    UnexpectedTable,
     BadType,
     OutOfMemory,
 };
@@ -210,6 +208,7 @@ pub fn parseSlice(
 
     var sleep_until: ?[]const u8 = null;
     var sleep_has_extra_body = false;
+    var sleep_extra_key: ?[]const u8 = null;
     const have_sleep_table = doc.hasTable("sleep");
 
     var clear_has_body = false;
@@ -289,6 +288,7 @@ pub fn parseSlice(
                 sleep_until = try arena.dupe(u8, try requireDatetime(e.value, "sleep.until", diag));
             } else {
                 sleep_has_extra_body = true;
+                if (sleep_extra_key == null) sleep_extra_key = try arena.dupe(u8, e.key);
             }
         } else if (std.mem.eql(u8, e.table, "clear")) {
             // clear table is empty per design; validation reports any body.
@@ -338,6 +338,7 @@ pub fn parseSlice(
         item.sleep = Sleep{ .until = sleep_until.? };
     }
     item.sleep_has_body = sleep_has_extra_body;
+    item.sleep_extra_key = sleep_extra_key;
     item.clear_present = have_clear_table;
     item.clear_has_body = clear_has_body;
     if (have_result) item.result = result_obj;
@@ -573,7 +574,8 @@ pub fn validate(item: *const Item, diag: *ValidationDiagnostic) ValidationError!
                 return error.MissingSleepTable;
             }
             if (item.sleep_has_body) {
-                diag.* = .{ .err = error.SleepHasBody, .message = "sleep table only accepts `until`", .field = "sleep" };
+                const offender = item.sleep_extra_key orelse "sleep";
+                diag.* = .{ .err = error.SleepHasBody, .message = "sleep table only accepts `until`", .field = offender };
                 return error.SleepHasBody;
             }
             if (!isRfc3339(item.sleep.?.until)) {

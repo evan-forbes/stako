@@ -301,7 +301,10 @@ fn parseStringArray(arena: std.mem.Allocator, source: []const u8, i_ptr: *usize)
             i_ptr.* = i;
             return try items.toOwnedSlice(arena);
         }
-        return error.UnterminatedArray;
+        // Token after a string wasn't `,` or `]`, so the array can't be
+        // continued or closed; the right diagnostic is "unexpected", not
+        // "unterminated".
+        return error.UnexpectedCharacter;
     }
     return error.UnterminatedArray;
 }

@@ -351,6 +351,212 @@ test "negative: compact target requires provider harness" {
     try std.testing.expectEqualStrings("target.provider", vd.field);
 }
 
+test "sleep with datetime-shaped but out-of-range until is rejected by validator" {
+    // The TOML layer accepts any YYYY-MM-DD-prefixed token as a datetime
+    // literal; the stricter RFC3339 numeric-range check only runs inside
+    // validate(). This guards the kind=.sleep arm of that check.
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "sleep-bad-until"
+        \\kind = "sleep"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\
+        \\[sleep]
+        \\until = 2026-99-99T00:00:00Z
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    var vd: item.ValidationDiagnostic = .{};
+    const r = item.validate(&p, &vd);
+    try std.testing.expectError(error.InvalidDatetime, r);
+    try std.testing.expectEqualStrings("sleep.until", vd.field);
+}
+
+test "sleep extra-key diagnostic names the offending key" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "sleep-typo"
+        \\kind = "sleep"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\
+        \\[sleep]
+        \\until = 2026-05-10T16:00:00Z
+        \\untill = 2026-05-10T17:00:00Z
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    var vd: item.ValidationDiagnostic = .{};
+    const r = item.validate(&p, &vd);
+    try std.testing.expectError(error.SleepHasBody, r);
+    try std.testing.expectEqualStrings("untill", vd.field);
+}
+
+test "empty parents array parses and validates" {
+    // `parents = []` is structurally well-formed; the validator iterates zero
+    // times and accepts the item. Anchor that behavior so a future tightening
+    // (e.g. "review must have at least one parent") becomes a deliberate test
+    // change rather than a silent drift.
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "no-parents"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\parents = []
+        \\
+        \\[target]
+        \\provider = "anthropic"
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    try std.testing.expect(p.parents != null);
+    try std.testing.expectEqual(@as(usize, 0), p.parents.?.len);
+    var vd: item.ValidationDiagnostic = .{};
+    try item.validate(&p, &vd);
+}
+
+test "negative: compact item with no [target] table at all" {
+    // Distinct from `prompt_no_target`: exercises the compact arm of the
+    // kind switch, which has its own error message about harness-only target.
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "compact-no-target"
+        \\kind = "compact"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    var vd: item.ValidationDiagnostic = .{};
+    const r = item.validate(&p, &vd);
+    try std.testing.expectError(error.MissingTargetTable, r);
+    try std.testing.expectEqualStrings("target", vd.field);
+}
+
+test "negative: review item with no [target] table" {
+    // The review arm shares the prompt arm's target requirement; cover it
+    // explicitly so a future divergence between the two is caught.
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0006"
+        \\slug = "review-no-target"
+        \\kind = "review"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\parents = ["0005"]
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    var vd: item.ValidationDiagnostic = .{};
+    const r = item.validate(&p, &vd);
+    try std.testing.expectError(error.MissingTargetTable, r);
+    try std.testing.expectEqualStrings("target", vd.field);
+}
+
+test "commented and reordered source parses; writer output is canonical" {
+    // Demonstrates the documented "fixed point" property: a hand-edited file
+    // with comments and non-canonical key order is accepted, and the writer
+    // produces the canonical comment-free form.
+    const allocator = std.testing.allocator;
+    const src =
+        \\# top of file
+        \\kind = "prompt"  # out of canonical order
+        \\status = "queued"
+        \\id = "0001"
+        \\slug = "commented"
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\created_at = 2026-05-10T14:32:00Z
+        \\
+        \\# routing
+        \\[target]
+        \\provider = "anthropic"
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    try item.write(&p, out.writer(allocator));
+
+    const expected =
+        \\id = "0001"
+        \\slug = "commented"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\
+        \\[target]
+        \\provider = "anthropic"
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, out.items);
+}
+
+test "isValidTransition rejects identity transitions for every status" {
+    // Anchors the `from == to` short-circuit explicitly. The exhaustive
+    // "every unlisted pair" test in src/state.zig also covers these, but
+    // having a dedicated test makes the design intent loud.
+    inline for (@typeInfo(state.Status).@"enum".fields) |f| {
+        const s: state.Status = @enumFromInt(f.value);
+        try std.testing.expect(!state.isValidTransition(s, s));
+    }
+}
+
+test "raw UTF-8 in string values round-trips byte-for-byte" {
+    // The hand-rolled TOML parser is byte-oriented and does not interpret
+    // \uXXXX escapes; raw multi-byte UTF-8 in source must pass through
+    // unchanged so authored slugs/reasons in any locale survive a read/write
+    // cycle. (If we ever decide to forbid non-ASCII in slug, that becomes a
+    // validator change, not a parser change.)
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "utf-8"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\blocked_reason = "héllo wörld"
+        \\
+        \\[target]
+        \\provider = "anthropic"
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    try std.testing.expectEqualStrings("héllo wörld", p.blocked_reason.?);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    try item.write(&p, out.writer(allocator));
+    try std.testing.expectEqualStrings(src, out.items);
+}
+
 test "negative: sleep table rejects extra keys" {
     const allocator = std.testing.allocator;
     const src =
@@ -372,7 +578,7 @@ test "negative: sleep table rejects extra keys" {
     var vd: item.ValidationDiagnostic = .{};
     const r = item.validate(&p, &vd);
     try std.testing.expectError(error.SleepHasBody, r);
-    try std.testing.expectEqualStrings("sleep", vd.field);
+    try std.testing.expectEqualStrings("note", vd.field);
 }
 
 test "negative: clear table must be empty" {
