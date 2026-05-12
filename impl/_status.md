@@ -34,6 +34,6 @@ Second pass: full-module audit (correctness, test coverage, readability, DRY/KIS
 | 5 | 05_mutations_and_vcs.md | _audit_05.md | 2 | 8 | 12 | 031493c | — | 0 | B1 rollback now checkout+delete+prune; B2 audit mutex; 8×32 stress 10/10; 407/407 (+5); 5 important deferred (cross-cutting) |
 | 6 | 06_runtime_core.md | _audit_06.md | 0 | 4 | 11 | 0889fbb | — | 0 | 4/4 important, 11 coverage; SSE flake mitigated (flush head before worker takeover); 30+10 post-fix runs clean; 418/418 (+11) |
 | 7 | 07_claude_codex_adapters.md | _audit_07.md | 0 | 5 | 8 | 9e61339 | — | 0 | findStringValue depth-1 fix; Bash exit deferred to tool_result; 11/11 coverage; 436/436 (+18); unbounded line buf flagged cross-cutting (M6 sess_mgr) |
-| 8 | 08_provider_status_and_gemini.md | _audit_08.md | — | — | — | — | — | — | pending |
+| 8 | 08_provider_status_and_gemini.md | _audit_08.md | 0 | 3 | 10 | 3ec4b2d | — | 0 | 3/3 important; 7/9 coverage (2 in runtime.zig cross-cutting); 447/447 (+11); no credential leakage |
 | 9 | 09_html_rendering.md | _audit_09.md | — | — | — | — | — | — | pending |
 | 10 | 10_authorization.md | _audit_10.md | — | — | — | — | — | — | pending |
