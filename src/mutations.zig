@@ -108,6 +108,9 @@ pub fn applyCreateStack(
     input: CreateStackInput,
 ) Error!MutationOutput {
     try validateNewStackName(input.name);
+    if (input.max_concurrent_per_stack) |m| {
+        if (m < 1) return error.ValidationFailed;
+    }
 
     // Refuse if stack already exists.
     const stack_dir = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.name });
@@ -290,22 +293,10 @@ pub fn applyInsertItem(
     if (!item_mod.isValidSlug(input.slug)) return error.ValidationFailed;
     const kind = item_mod.Kind.fromString(input.kind) orelse return error.ValidationFailed;
 
-    // v1: insert means "insert before ref" but we only support inserting at
-    // the front; otherwise the user is expected to append. We pick the next
-    // id as max(existing)+1 — same as append — and reject if it would sort
-    // after `ref`. Renumbering existing items is a future enhancement (the
-    // commit grouping rule in design_version_control.md already permits it).
-    const next_id_int = try computeNextItemIdInt(allocator, stack_abs);
-    var id_buf: [16]u8 = undefined;
-    const new_id = try std.fmt.bufPrint(&id_buf, "{d:0>4}", .{next_id_int});
-
     const ref_int = std.fmt.parseInt(u32, input.ref, 10) catch return error.ValidationFailed;
-    if (next_id_int >= ref_int) {
-        // The new id wouldn't sort before ref. v1: reject.
-        return error.ValidationFailed;
-    }
+    try renumberItemsFrom(allocator, stack_abs, ref_int);
 
-    return writeItem(allocator, notes_root_abs, ident, .insert_item, input.stack, new_id, kind, input.slug, .{
+    return writeItem(allocator, notes_root_abs, ident, .insert_item, input.stack, input.ref, kind, input.slug, .{
         .prompt_body = input.prompt_body,
         .target_provider = input.target_provider,
         .target_model = input.target_model,
@@ -314,6 +305,7 @@ pub fn applyInsertItem(
         .parents = input.parents,
         .sleep_until = input.sleep_until,
         .created_at_override = input.created_at_override,
+        .commit_stack_dir = true,
     });
 }
 
@@ -752,6 +744,7 @@ const WriteItemOpts = struct {
     parents: ?[]const []const u8 = null,
     sleep_until: ?[]const u8 = null,
     created_at_override: ?[]const u8 = null,
+    commit_stack_dir: bool = false,
 };
 
 fn writeItem(
@@ -864,9 +857,15 @@ fn writeItem(
         for (paths_list.items) |p| allocator.free(p);
         paths_list.deinit(allocator);
     }
-    try paths_list.append(allocator, meta_rel);
-    if (prompt_rel) |pr| {
-        try paths_list.append(allocator, try allocator.dupe(u8, pr));
+    if (opts.commit_stack_dir) {
+        allocator.free(meta_rel);
+        const stack_rel = try std.fmt.allocPrint(allocator, "stacks/{s}", .{stack});
+        try paths_list.append(allocator, stack_rel);
+    } else {
+        try paths_list.append(allocator, meta_rel);
+        if (prompt_rel) |pr| {
+            try paths_list.append(allocator, try allocator.dupe(u8, pr));
+        }
     }
 
     const verb = if (action == .insert_item) "insert" else "append";
@@ -915,6 +914,81 @@ fn computeNextItemIdInt(allocator: std.mem.Allocator, stack_abs: []const u8) Err
     }
     _ = allocator;
     return max + 1;
+}
+
+const ItemDir = struct {
+    id: u32,
+    name: []u8,
+    slug: []const u8,
+};
+
+fn renumberItemsFrom(allocator: std.mem.Allocator, stack_abs: []const u8, start_id: u32) Error!void {
+    var d = std.fs.openDirAbsolute(stack_abs, .{ .iterate = true }) catch return error.NotFound;
+    defer d.close();
+
+    var items = std.ArrayList(ItemDir){};
+    defer {
+        for (items.items) |it| allocator.free(it.name);
+        items.deinit(allocator);
+    }
+
+    var it = d.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const dash = std.mem.indexOfScalar(u8, entry.name, '-') orelse continue;
+        const id_str = entry.name[0..dash];
+        if (!item_mod.isValidId(id_str)) continue;
+        const id = std.fmt.parseInt(u32, id_str, 10) catch continue;
+        if (id < start_id) continue;
+        const name_owned = try allocator.dupe(u8, entry.name);
+        try items.append(allocator, .{
+            .id = id,
+            .name = name_owned,
+            .slug = name_owned[dash + 1 ..],
+        });
+    }
+
+    std.mem.sort(ItemDir, items.items, {}, itemDirIdDesc);
+
+    for (items.items) |entry| {
+        const new_id = entry.id + 1;
+        var new_id_buf: [16]u8 = undefined;
+        const new_id_str = try std.fmt.bufPrint(&new_id_buf, "{d:0>4}", .{new_id});
+        const old_abs = try std.fs.path.join(allocator, &.{ stack_abs, entry.name });
+        defer allocator.free(old_abs);
+        const new_name = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ new_id_str, entry.slug });
+        defer allocator.free(new_name);
+        const new_abs = try std.fs.path.join(allocator, &.{ stack_abs, new_name });
+        defer allocator.free(new_abs);
+        try std.fs.cwd().rename(old_abs, new_abs);
+        try rewriteItemId(allocator, new_abs, new_id_str);
+    }
+}
+
+fn itemDirIdDesc(_: void, a: ItemDir, b: ItemDir) bool {
+    return a.id > b.id;
+}
+
+fn rewriteItemId(allocator: std.mem.Allocator, item_dir_abs: []const u8, new_id: []const u8) Error!void {
+    const meta_abs = try std.fs.path.join(allocator, &.{ item_dir_abs, "meta.toml" });
+    defer allocator.free(meta_abs);
+    var f = std.fs.cwd().openFile(meta_abs, .{}) catch return error.NotFound;
+    defer f.close();
+    const stat = try f.stat();
+    const src = try allocator.alloc(u8, stat.size);
+    defer allocator.free(src);
+    const n = try f.readAll(src);
+    var diag: item_mod.ParseDiagnostic = .{};
+    var parsed = item_mod.parseSlice(allocator, src[0..n], &diag) catch return error.ValidationFailed;
+    defer parsed.deinit();
+    parsed.id = try parsed.arena.allocator().dupe(u8, new_id);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    try item_mod.write(&parsed, out.writer(allocator));
+    var wf = try std.fs.cwd().createFile(meta_abs, .{ .truncate = true });
+    defer wf.close();
+    try wf.writeAll(out.items);
 }
 
 /// Find an existing item directory named `<id>-...` under stack_abs. Returns
@@ -1004,7 +1078,7 @@ fn patchTomlKeyString(allocator: std.mem.Allocator, source: []const u8, key: []c
         defer allocator.free(quoted);
         return patchTomlKeyRaw(allocator, source, key, quoted);
     } else if (std.mem.eql(u8, key, "description") or std.mem.eql(u8, key, "default_workdir")) {
-        const quoted = try std.fmt.allocPrint(allocator, "\"{s}\"", .{value});
+        const quoted = try tomlQuotedString(allocator, value);
         defer allocator.free(quoted);
         return patchTomlKeyRaw(allocator, source, key, quoted);
     }
@@ -1016,7 +1090,8 @@ fn validateConfigValue(allocator: std.mem.Allocator, key: []const u8, value: []c
         if (!std.mem.eql(u8, value, "true") and !std.mem.eql(u8, value, "false")) return error.BadConfigValue;
         return allocator.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "max_concurrent_per_stack")) {
-        _ = std.fmt.parseInt(i64, value, 10) catch return error.BadConfigValue;
+        const n = std.fmt.parseInt(i64, value, 10) catch return error.BadConfigValue;
+        if (n < 1) return error.BadConfigValue;
         return allocator.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "continuity")) {
         if (stack_config.Continuity.fromString(value) == null) return error.BadConfigValue;
@@ -1047,6 +1122,15 @@ fn writeTomlString(w: anytype, s: []const u8) !void {
             else => try w.writeByte(c),
         }
     }
+}
+
+fn tomlQuotedString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '"');
+    try writeTomlString(out.writer(allocator), s);
+    try out.append(allocator, '"');
+    return try out.toOwnedSlice(allocator);
 }
 
 // ---------- tests ----------
@@ -1159,6 +1243,54 @@ test "applyAppendItem: second item picks 0002" {
     });
     defer out.deinit();
     try std.testing.expectEqualStrings("stacks/demo/0002-second/meta.toml", out.paths[0]);
+}
+
+test "applyInsertItem: renumbers reference item and writes new item before it" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("stacks/demo/0001-first");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-first/meta.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\id = "0001"
+            \\slug = "first"
+            \\kind = "prompt"
+            \\status = "queued"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\match = "any"
+            \\
+        );
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    var out = try applyInsertItem(a, abs, .{ .api_path = "x" }, .{
+        .stack = "demo",
+        .ref = "0001",
+        .kind = "prompt",
+        .slug = "inserted",
+        .target_match = .any,
+        .created_at_override = "2026-05-10T14:00:00Z",
+    });
+    defer out.deinit();
+    try std.testing.expectEqualStrings("stacks/demo", out.paths[0]);
+
+    try tmp.dir.access("stacks/demo/0001-inserted/meta.toml", .{});
+    try tmp.dir.access("stacks/demo/0002-first/meta.toml", .{});
+
+    var f = try tmp.dir.openFile("stacks/demo/0002-first/meta.toml", .{});
+    defer f.close();
+    const stat = try f.stat();
+    const contents = try a.alloc(u8, stat.size);
+    defer a.free(contents);
+    _ = try f.readAll(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "id = \"0002\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "slug = \"first\"") != null);
 }
 
 test "applySetPaused: flips stack.toml without touching items" {
@@ -1313,4 +1445,31 @@ test "applyConfigPatch: paused via patch" {
     _ = try f.readAll(contents);
     try std.testing.expect(std.mem.indexOf(u8, contents, "paused = true") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "continuity = \"chain\"") != null);
+}
+
+test "applyConfigPatch: TOML-escapes string values" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("stacks/demo");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/stack.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("description = \"old\"\n");
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    var out = try applyConfigPatch(a, abs, .{ .api_path = "POST cfg" }, "demo", &.{
+        .{ .key = "description", .value = "quoted \"and\" backslash \\ newline\n" },
+    });
+    defer out.deinit();
+
+    var f = try tmp.dir.openFile("stacks/demo/stack.toml", .{});
+    defer f.close();
+    const stat = try f.stat();
+    const contents = try a.alloc(u8, stat.size);
+    defer a.free(contents);
+    _ = try f.readAll(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "description = \"quoted \\\"and\\\" backslash \\\\ newline\\n\"") != null);
 }

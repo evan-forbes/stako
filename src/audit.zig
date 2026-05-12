@@ -162,7 +162,7 @@ pub const Writer = struct {
 
         try f.writeAll(buf.items);
         // Fsync so a crash doesn't lose a recorded mutation.
-        f.sync() catch {};
+        try f.sync();
     }
 };
 

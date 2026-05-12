@@ -306,6 +306,98 @@ test "negative: prompt without target table (validator)" {
     try std.testing.expectError(error.MissingTargetTable, r);
 }
 
+test "negative: prompt target table must not be empty" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "empty-target"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\
+        \\[target]
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    var vd: item.ValidationDiagnostic = .{};
+    const r = item.validate(&p, &vd);
+    try std.testing.expectError(error.MissingTargetTable, r);
+    try std.testing.expectEqualStrings("target", vd.field);
+}
+
+test "negative: compact target requires provider harness" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "compact-no-provider"
+        \\kind = "compact"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    var vd: item.ValidationDiagnostic = .{};
+    const r = item.validate(&p, &vd);
+    try std.testing.expectError(error.MissingTargetTable, r);
+    try std.testing.expectEqualStrings("target.provider", vd.field);
+}
+
+test "negative: sleep table rejects extra keys" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "sleep-extra"
+        \\kind = "sleep"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\
+        \\[sleep]
+        \\until = 2026-05-10T16:00:00Z
+        \\note = "wake me"
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    var vd: item.ValidationDiagnostic = .{};
+    const r = item.validate(&p, &vd);
+    try std.testing.expectError(error.SleepHasBody, r);
+    try std.testing.expectEqualStrings("sleep", vd.field);
+}
+
+test "negative: clear table must be empty" {
+    const allocator = std.testing.allocator;
+    const src =
+        \\id = "0001"
+        \\slug = "clear-extra"
+        \\kind = "clear"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:32:00Z
+        \\updated_at = 2026-05-10T14:32:00Z
+        \\
+        \\[clear]
+        \\reason = "manual"
+        \\
+    ;
+    var diag: item.ParseDiagnostic = .{};
+    var p = try item.parseSlice(allocator, src, &diag);
+    defer p.deinit();
+    var vd: item.ValidationDiagnostic = .{};
+    const r = item.validate(&p, &vd);
+    try std.testing.expectError(error.ClearHasBody, r);
+    try std.testing.expectEqualStrings("clear", vd.field);
+}
+
 // ---------- state transition table (separately covered in src/state.zig
 // but we re-anchor the canonical-transitions invariant here too) ----------
 

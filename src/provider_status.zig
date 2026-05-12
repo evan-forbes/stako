@@ -138,8 +138,7 @@ pub fn probe(allocator: std.mem.Allocator, p: Provider) Status {
 fn probeAnthropic(binary_present: bool) Status {
     const has_env = envSet("ANTHROPIC_API_KEY");
     const has_cli_creds = homeFileExists(".claude/.credentials.json") or
-        homeFileExists(".claude/credentials.json") or
-        homeDirExists(".claude");
+        homeFileExists(".claude/credentials.json");
     const signed_in = has_env or has_cli_creds;
     return .{
         .provider = .anthropic,
@@ -165,8 +164,7 @@ fn probeAnthropic(binary_present: bool) Status {
 fn probeOpenai(binary_present: bool) Status {
     const has_env = envSet("OPENAI_API_KEY");
     const has_cli_creds = homeFileExists(".codex/auth.json") or
-        homeFileExists(".codex/credentials.json") or
-        homeDirExists(".codex");
+        homeFileExists(".codex/credentials.json");
     const signed_in = has_env or has_cli_creds;
     return .{
         .provider = .openai,
@@ -223,7 +221,7 @@ pub fn binaryOnPath(name: []const u8) bool {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const candidate = std.fmt.bufPrint(&buf, "{s}/{s}", .{ segment, name }) catch continue;
         const stat = std.fs.cwd().statFile(candidate) catch continue;
-        if (stat.kind == .file or stat.kind == .sym_link) return true;
+        if ((stat.kind == .file or stat.kind == .sym_link) and stat.mode & 0o111 != 0) return true;
     }
     return false;
 }
@@ -238,15 +236,7 @@ fn homeFileExists(rel: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, rel }) catch return false;
     const stat = std.fs.cwd().statFile(full) catch return false;
-    return stat.kind == .file or stat.kind == .sym_link;
-}
-
-fn homeDirExists(rel: []const u8) bool {
-    const home = std.posix.getenv("HOME") orelse return false;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, rel }) catch return false;
-    const stat = std.fs.cwd().statFile(full) catch return false;
-    return stat.kind == .directory;
+    return (stat.kind == .file or stat.kind == .sym_link) and stat.size > 0;
 }
 
 // ---------- JSON rendering ----------

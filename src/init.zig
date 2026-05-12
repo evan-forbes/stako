@@ -67,6 +67,7 @@ pub const Report = struct {
 /// for documentation purposes only.
 pub const InitError = error{
     RootNotADirectory,
+    PathTypeMismatch,
 };
 
 /// The gitignore lines added by init. Order matches the design doc.
@@ -252,12 +253,49 @@ fn ensureDir(
     report: *Report,
     arena: std.mem.Allocator,
 ) !void {
-    if (statExists(root_dir, rel)) {
-        try report.already_present.append(report.allocator, try arena.dupe(u8, rel));
-        return;
-    }
-    try root_dir.makePath(rel);
+    var existing = root_dir.openDir(rel, .{}) catch |e| switch (e) {
+        error.FileNotFound => {
+            try root_dir.makePath(rel);
+            try report.created.append(report.allocator, try arena.dupe(u8, rel));
+            return;
+        },
+        error.NotDir => return error.PathTypeMismatch,
+        else => return e,
+    };
+    existing.close();
+    try report.already_present.append(report.allocator, try arena.dupe(u8, rel));
+}
+
+fn fileExistsStrict(root_dir: *std.fs.Dir, rel: []const u8) !bool {
+    var f = root_dir.openFile(rel, .{}) catch |e| switch (e) {
+        error.FileNotFound => return false,
+        error.IsDir, error.NotDir => return error.PathTypeMismatch,
+        else => return e,
+    };
+    defer f.close();
+    const stat = try f.stat();
+    if (stat.kind != .file) return error.PathTypeMismatch;
+    return true;
+}
+
+fn appendCreated(report: *Report, arena: std.mem.Allocator, rel: []const u8) !void {
     try report.created.append(report.allocator, try arena.dupe(u8, rel));
+}
+
+fn appendAlreadyPresent(report: *Report, arena: std.mem.Allocator, rel: []const u8) !void {
+    try report.already_present.append(report.allocator, try arena.dupe(u8, rel));
+}
+
+fn ensureWritableFileAbsent(root_dir: *std.fs.Dir, rel: []const u8) !bool {
+    if (try fileExistsStrict(root_dir, rel)) return false;
+    if (std.fs.path.dirname(rel)) |parent| {
+        var parent_dir = root_dir.openDir(parent, .{}) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => return error.PathTypeMismatch,
+            else => return e,
+        };
+        parent_dir.close();
+    }
+    return true;
 }
 
 /// On POSIX, chmod a path under `root_dir` to `mode`. No-op on non-POSIX.
@@ -282,8 +320,8 @@ fn writeFileIfAbsent(
     spec: FileSpec,
     posix_mode: ?u32,
 ) !void {
-    if (statExists(root_dir, rel)) {
-        try report.already_present.append(report.allocator, try arena.dupe(u8, rel));
+    if (!try ensureWritableFileAbsent(root_dir, rel)) {
+        try appendAlreadyPresent(report, arena, rel);
         return;
     }
 
@@ -305,7 +343,7 @@ fn writeFileIfAbsent(
         }
     }
 
-    try report.created.append(report.allocator, try arena.dupe(u8, rel));
+    try appendCreated(report, arena, rel);
 }
 
 fn writeAtomic(root_dir: *std.fs.Dir, rel: []const u8, content: []const u8) !void {

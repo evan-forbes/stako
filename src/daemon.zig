@@ -4,15 +4,22 @@
 //! Single-port surface (see `todos/design_daemon.md`). v1 is loopback-only:
 //! the binder explicitly refuses non-loopback hosts.
 //!
-//! Endpoint set in milestone 3:
+//! Endpoint set in core v1:
 //!     GET  /healthz                                  → "ok\n"
+//!     GET  /                                         → HTML stack index
+//!     GET  /static/style.css                         → HTML stylesheet
 //!     GET  /stacks                                   → JSON list of names
 //!     GET  /stacks/{name}                            → JSON {name, config}
 //!     GET  /stacks/{name}/config                     → JSON config view
 //!     GET  /stacks/{name}/items                      → JSON list of items
 //!     GET  /stacks/{name}/items/{id}                 → JSON item detail
-//!
-//! Mutations and SSE are out of scope until milestones 5 and 6 respectively.
+//!     GET  /stacks/{name}/events                     → SSE event stream
+//!     GET  /providers                                → JSON provider status list
+//!     GET  /providers/{name}                         → JSON provider status
+//!     POST /stacks                                   → create stack
+//!     POST /stacks/{name}/items                      → append item
+//!     POST /stacks/{name}/items/{id}/...             → item transitions
+//!     POST /stacks/{name}/config                     → patch stack config
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -207,11 +214,13 @@ pub const Daemon = struct {
             std.posix.shutdown(handle, .both) catch {};
         }
         // SSE worker threads block on stream.read; wake them by half-closing
-        // each tracked connection. (Per-conn close happens in the worker.)
-        // Note: we don't have direct references here; the workers also poll
-        // shutdown_requested every read return, so the most important
-        // wake-up is at deinit time when the test code typically calls
-        // requestShutdown then closes the daemon.
+        // each tracked connection. Per-connection close happens in the
+        // worker; deinit joins the threads.
+        self.sse_threads_mu.lock();
+        for (self.sse_handles.items) |h| {
+            std.posix.shutdown(h, .both) catch {};
+        }
+        self.sse_threads_mu.unlock();
     }
 
     /// Start the mutation-queue worker thread and emit the daemon_started
@@ -1173,6 +1182,7 @@ fn respondHtml(req: *std.http.Server.Request, body: []const u8) !void {
         .status = .ok,
         .extra_headers = &.{
             .{ .name = "content-type", .value = "text/html; charset=utf-8" },
+            .{ .name = "content-security-policy", .value = "default-src 'none'; style-src 'self'; script-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; base-uri 'none'" },
         },
     });
 }
@@ -1292,8 +1302,8 @@ fn respondItemHtml(
     defer it.deinit();
 
     // Load prompt.md and transcript.jsonl if present, both owned by the
-    // local allocator and freed after rendering. Errors are swallowed —
-    // missing files are normal for non-prompt items.
+    // local allocator and freed after rendering. Missing/empty files are
+    // normal for non-prompt items; other IO errors are surfaced.
     const item_dir = blk: {
         const dir_name = try std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ it.id, it.slug });
         defer self.allocator.free(dir_name);
@@ -1301,10 +1311,16 @@ fn respondItemHtml(
     };
     defer self.allocator.free(item_dir);
 
-    const prompt_body = readSmallFile(self.allocator, item_dir, "prompt.md") catch null;
+    const prompt_body = readSmallFile(self.allocator, item_dir, "prompt.md") catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
     defer if (prompt_body) |b| self.allocator.free(b);
 
-    const transcript_jsonl = readSmallFile(self.allocator, item_dir, "transcript.jsonl") catch null;
+    const transcript_jsonl = readSmallFile(self.allocator, item_dir, "transcript.jsonl") catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
     defer if (transcript_jsonl) |b| self.allocator.free(b);
 
     // SSE is wired only when the runtime hub is live; otherwise the page is
@@ -1331,7 +1347,7 @@ fn respondItemHtml(
     try respondHtml(req, buf.items);
 }
 
-/// Read a single small file under `dir`. Returns null on missing/error so
+/// Read a single small file under `dir`. Returns null on missing/empty so
 /// the caller can render a "no transcript yet" placeholder without bailing.
 /// Caller frees the returned buffer.
 fn readSmallFile(
@@ -1354,8 +1370,12 @@ fn readSmallFile(
     const sz = if (stat.size > cap) cap else @as(usize, @intCast(stat.size));
     const buf = try allocator.alloc(u8, sz);
     errdefer allocator.free(buf);
-    _ = try f.readAll(buf);
-    return buf;
+    const n = try f.readAll(buf);
+    if (n == 0) {
+        allocator.free(buf);
+        return null;
+    }
+    return try allocator.realloc(buf, n);
 }
 
 // ---------- JSON writers (typed views) ----------
@@ -2025,20 +2045,6 @@ fn handleStackEventsDetached(
         return;
     }
 
-    // Send SSE headers via the std HTTP server. We use `respond` with
-    // chunked transfer disabled by sending an empty body and the right
-    // headers; the std HTTP API doesn't expose a streaming response in v1,
-    // so we write the response head directly to the underlying writer.
-    // This avoids depending on Server.Request's flush behavior.
-    const sse_head =
-        "HTTP/1.1 200 OK\r\n" ++
-        "Content-Type: text/event-stream\r\n" ++
-        "Cache-Control: no-cache\r\n" ++
-        "Connection: keep-alive\r\n" ++
-        "X-Accel-Buffering: no\r\n" ++
-        "\r\n";
-    try conn.stream.writeAll(sse_head);
-
     // Hand off the connection to a background thread + subscribe to the
     // hub. The accept loop is now free.
     const ctx = try self.allocator.create(SseConnCtx);
@@ -2054,15 +2060,35 @@ fn handleStackEventsDetached(
         .ctx = @ptrCast(ctx),
         .write_fn = sseSinkWrite,
     });
+    errdefer if (ctx.sub) |s| self.sse_hub.?.unsubscribe(s);
+
+    self.sse_threads_mu.lock();
+    self.sse_threads.ensureUnusedCapacity(self.allocator, 1) catch |e| {
+        self.sse_threads_mu.unlock();
+        return e;
+    };
+    self.sse_handles.ensureUnusedCapacity(self.allocator, 1) catch |e| {
+        self.sse_threads_mu.unlock();
+        return e;
+    };
+    self.sse_threads_mu.unlock();
+
+    // Send SSE headers via the std HTTP server. We write the response head
+    // directly because this connection is handed to a streaming worker.
+    const sse_head =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: keep-alive\r\n" ++
+        "X-Accel-Buffering: no\r\n" ++
+        "\r\n";
+    try conn.stream.writeAll(sse_head);
 
     // Track the worker thread so deinit can join.
     const t = try std.Thread.spawn(.{}, sseWorkerThread, .{ctx});
     self.sse_threads_mu.lock();
-    self.sse_threads.append(self.allocator, t) catch {
-        // If we can't track the thread, detach it.
-        t.detach();
-    };
-    self.sse_handles.append(self.allocator, conn.stream.handle) catch {};
+    self.sse_threads.appendAssumeCapacity(t);
+    self.sse_handles.appendAssumeCapacity(conn.stream.handle);
     self.sse_threads_mu.unlock();
 
     // The connection is now owned by the SSE thread; the caller must NOT

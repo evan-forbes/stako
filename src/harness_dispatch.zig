@@ -100,13 +100,7 @@ pub fn buildArgv(
     } else if (std.mem.eql(u8, harness, Names.codex)) {
         return buildCodexArgv(allocator, prompt);
     } else {
-        // Unknown harness: return a no-op argv. The session will simply exit
-        // with status 0 and produce no events; preflight should have already
-        // blocked this case.
-        allocator.free(prompt);
-        var out = try allocator.alloc([]u8, 1);
-        out[0] = try allocator.dupe(u8, "/usr/bin/true");
-        return out;
+        return error.UnsupportedHarness;
     }
 }
 
@@ -117,19 +111,15 @@ fn resolvePrompt(
 ) ![]u8 {
     const path = try std.fs.path.join(allocator, &.{ item_dir_abs, "prompt.md" });
     defer allocator.free(path);
-    var f = std.fs.cwd().openFile(path, .{}) catch {
-        return allocator.dupe(u8, item.slug);
+    var f = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return allocator.dupe(u8, item.slug),
+        else => return e,
     };
     defer f.close();
-    const stat = f.stat() catch {
-        return allocator.dupe(u8, item.slug);
-    };
+    const stat = try f.stat();
     const buf = try allocator.alloc(u8, stat.size);
     errdefer allocator.free(buf);
-    const n = f.readAll(buf) catch {
-        allocator.free(buf);
-        return allocator.dupe(u8, item.slug);
-    };
+    const n = try f.readAll(buf);
     if (n == 0) {
         allocator.free(buf);
         return allocator.dupe(u8, item.slug);
@@ -283,4 +273,19 @@ test "buildArgv: codex shape" {
     try std.testing.expectEqualStrings("exec", argv[1]);
     try std.testing.expectEqualStrings("--json", argv[2]);
     try std.testing.expectEqualStrings("say-hi", argv[3]);
+}
+
+test "buildArgv: unknown harness fails instead of running a no-op" {
+    const a = std.testing.allocator;
+    var it = item_mod.Item{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0001",
+        .slug = "say-hi",
+        .kind = .prompt,
+        .status = .queued,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer it.deinit();
+    try std.testing.expectError(error.UnsupportedHarness, buildArgv(a, "unknown", &it, "/nonexistent-dir-9003"));
 }

@@ -644,6 +644,59 @@ test "m7 routing: item.target.provider denied when stack excludes the mapped har
     try std.testing.expect(std.mem.indexOf(u8, mbuf, "blocked_reason = \"harness_denied\"") != null);
 }
 
+test "m7 routing: clear item blocks when routed harness lacks clear capability" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "cap-clear");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false, "[\"codex\"]");
+
+    const item_body =
+        \\id = "0001"
+        \\slug = "clear"
+        \\kind = "clear"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\provider = "openai"
+        \\match = "exact"
+        \\
+        \\[clear]
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "clear", item_body);
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
+    q.enable_git = false;
+    defer q.deinit();
+    try q.start();
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .queue = &q,
+        .audit_writer = &aw,
+        .dispatch = scriptedDispatch(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-clear/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "blocked_reason = \"harness_unsupported_capability\"") != null);
+}
+
 test "m7 review item routes the same way as prompt (fresh session)" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "review-claude");

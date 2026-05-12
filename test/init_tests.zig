@@ -197,6 +197,44 @@ test "init: rerunning with a different seed does NOT rotate local_token" {
     try std.testing.expectEqualSlices(u8, token_before, token_after);
 }
 
+test "init: directory path occupied by file is rejected" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "dir-collision");
+    defer s.deinit();
+
+    var d = try s.dir();
+    defer d.close();
+    try d.makePath(".organo");
+    var f = try d.createFile(".organo/credentials", .{ .truncate = true });
+    f.close();
+
+    try std.testing.expectError(error.PathTypeMismatch, init_mod.run(a, .{
+        .root = s.abs_path,
+        .yes = true,
+        .quiet = true,
+        .now_override = "2026-05-10T14:00:00Z",
+        .rng_seed_override = 0x1234,
+    }));
+}
+
+test "init: file path occupied by directory is rejected" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "file-collision");
+    defer s.deinit();
+
+    var d = try s.dir();
+    defer d.close();
+    try d.makePath(".organo/local_token");
+
+    try std.testing.expectError(error.PathTypeMismatch, init_mod.run(a, .{
+        .root = s.abs_path,
+        .yes = true,
+        .quiet = true,
+        .now_override = "2026-05-10T14:00:00Z",
+        .rng_seed_override = 0x1234,
+    }));
+}
+
 test "init: config.toml is valid TOML and parseable by the milestone-1 reader" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "config-parse");

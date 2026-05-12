@@ -76,11 +76,11 @@ pub fn loadFromRoot(allocator: std.mem.Allocator, notes_root: []const u8) LoadEr
     defer root.close();
 
     // Layer 1: config.toml.
-    if (readOptional(arena, &root, ".organo/config.toml")) |bytes| {
+    if (try readOptional(arena, &root, ".organo/config.toml")) |bytes| {
         try applyLayer(arena, &cfg, bytes, .committed);
     }
     // Layer 2: config.local.toml (overrides).
-    if (readOptional(arena, &root, ".organo/config.local.toml")) |bytes| {
+    if (try readOptional(arena, &root, ".organo/config.local.toml")) |bytes| {
         try applyLayer(arena, &cfg, bytes, .local);
     }
 
@@ -89,12 +89,15 @@ pub fn loadFromRoot(allocator: std.mem.Allocator, notes_root: []const u8) LoadEr
 
 const Layer = enum { committed, local };
 
-fn readOptional(arena: std.mem.Allocator, dir: *std.fs.Dir, rel: []const u8) ?[]const u8 {
-    var f = dir.openFile(rel, .{}) catch return null;
+fn readOptional(arena: std.mem.Allocator, dir: *std.fs.Dir, rel: []const u8) LoadError!?[]const u8 {
+    var f = dir.openFile(rel, .{}) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
     defer f.close();
-    const stat = f.stat() catch return null;
-    const buf = arena.alloc(u8, stat.size) catch return null;
-    const n = f.readAll(buf) catch return null;
+    const stat = try f.stat();
+    const buf = try arena.alloc(u8, stat.size);
+    const n = try f.readAll(buf);
     return buf[0..n];
 }
 
@@ -348,4 +351,14 @@ test "loadFromRoot: invalid port rejected" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
     try std.testing.expectError(error.PortOutOfRange, loadFromRoot(a, abs));
+}
+
+test "loadFromRoot: config read errors are not treated as missing config" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".organo/config.toml");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    try std.testing.expectError(error.IsDir, loadFromRoot(a, abs));
 }

@@ -15,6 +15,10 @@ pub fn run(
     stdout: anytype,
     stderr: anytype,
 ) !u8 {
+    if (args.action == .signout) {
+        return try runSignout(args, stdout, stderr);
+    }
+
     var client = http_client.open(allocator, .{
         .root = args.flags.root,
         .port_override = args.flags.port_override,
@@ -28,7 +32,7 @@ pub fn run(
     switch (args.action) {
         .status => return try runStatus(allocator, &client, args.flags, stdout, stderr),
         .provider => return try runOne(allocator, &client, args, stdout, stderr),
-        .signout => return try runSignout(args, stdout, stderr),
+        .signout => unreachable,
     }
 }
 

@@ -75,9 +75,9 @@ fn readToken(allocator: std.mem.Allocator, f: std.fs.File) TokenError!Token {
 }
 
 fn isHexLike(s: []const u8) bool {
-    if (s.len < 16) return false; // Don't accept absurdly short tokens.
+    if (s.len != 64) return false;
     for (s) |c| {
-        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
         if (!ok) return false;
     }
     return true;
@@ -110,14 +110,14 @@ test "ensureAndLoad: existing token read verbatim" {
     defer tmp.cleanup();
     try tmp.dir.makePath(".organo");
     var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true });
-    try f.writeAll("0123456789abcdef0123456789abcdef\n");
+    try f.writeAll("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n");
     f.close();
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
     const tok = try ensureAndLoad(a, abs);
     defer a.free(tok.bytes);
-    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef", tok.bytes);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", tok.bytes);
 }
 
 test "ensureAndLoad: absent token generated with hex shape" {
@@ -149,4 +149,19 @@ test "ensureAndLoad: rejects malformed token file" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
     try std.testing.expectError(error.BadShape, ensureAndLoad(a, abs));
+}
+
+test "ensureAndLoad: rejects short uppercase and overlong token files" {
+    const a = std.testing.allocator;
+    inline for (.{ "0123456789abcdef\n", "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef\n", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef00\n" }) |contents| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.makePath(".organo");
+        var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true });
+        try f.writeAll(contents);
+        f.close();
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs = try tmp.dir.realpath(".", &buf);
+        try std.testing.expectError(error.BadShape, ensureAndLoad(a, abs));
+    }
 }

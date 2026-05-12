@@ -48,6 +48,7 @@ pub const ParseError = error{
     Toml,
     BadType,
     UnknownContinuity,
+    InvalidConcurrency,
     OutOfMemory,
 };
 
@@ -81,6 +82,7 @@ pub fn parseSlice(allocator: std.mem.Allocator, source: []const u8) ParseError!S
             cfg.continuity = Continuity.fromString(e.value.string) orelse return error.UnknownContinuity;
         } else if (std.mem.eql(u8, e.key, "max_concurrent_per_stack")) {
             if (e.value != .integer) return error.BadType;
+            if (e.value.integer < 1) return error.InvalidConcurrency;
             cfg.max_concurrent_per_stack = e.value.integer;
         } else if (std.mem.eql(u8, e.key, "default_workdir")) {
             if (e.value != .string) return error.BadType;
@@ -162,4 +164,9 @@ test "parseSlice: allowed_harnesses array" {
     try std.testing.expect(cfg.allowed_harnesses != null);
     try std.testing.expectEqual(@as(usize, 2), cfg.allowed_harnesses.?.len);
     try std.testing.expectEqualStrings("claude", cfg.allowed_harnesses.?[0]);
+}
+
+test "parseSlice: max_concurrent_per_stack must be positive" {
+    try std.testing.expectError(error.InvalidConcurrency, parseSlice(std.testing.allocator, "max_concurrent_per_stack = 0\n"));
+    try std.testing.expectError(error.InvalidConcurrency, parseSlice(std.testing.allocator, "max_concurrent_per_stack = -1\n"));
 }

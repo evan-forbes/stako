@@ -110,13 +110,13 @@ pub const Supervisor = struct {
     pub fn deinit(self: *Supervisor) void {
         // Signal all workers to stop, then wait.
         self.requestShutdown();
-        self.sm.deinit();
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.workers.deinit(self.allocator);
+        self.sm.deinit();
         self.status_cache.deinit(self.allocator);
     }
 
@@ -246,7 +246,9 @@ pub const Supervisor = struct {
                     if (req.output) |*o| o.deinit();
                 },
                 .proceed => |proceed| {
-                    try self.dispatchItem(stack_name, &cfg, &item, proceed);
+                    var owned_proceed = proceed;
+                    defer owned_proceed.deinit(self.allocator);
+                    try self.dispatchItem(stack_name, &cfg, &item, owned_proceed);
                     running_in_stack += 1;
                 },
             }
@@ -296,6 +298,15 @@ pub const Supervisor = struct {
     pub const ProceedInfo = struct {
         harness: []const u8,
         cwd: ?[]const u8 = null,
+        cwd_owned: bool = false,
+
+        fn deinit(self: *ProceedInfo, allocator: std.mem.Allocator) void {
+            if (self.cwd_owned) {
+                if (self.cwd) |cwd| allocator.free(cwd);
+            }
+            self.cwd = null;
+            self.cwd_owned = false;
+        }
     };
 
     fn routingPreflight(self: *Supervisor, cfg: *const stack_config.StackConfig, item: *const item_mod.Item) !PreflightDecision {
@@ -349,27 +360,25 @@ pub const Supervisor = struct {
             if (!ok) return .{ .blocked = "harness_denied" };
         }
 
-        // Workdir allowlist.
-        var workdir_opt: ?[]const u8 = null;
-        if (item.target) |t| workdir_opt = t.workdir;
-        if (workdir_opt == null) workdir_opt = cfg.default_workdir;
-        if (workdir_opt) |wd| {
+        var workdir = try self.resolveWorkdir(cfg, item);
+        errdefer workdir.deinit(self.allocator);
+        if (workdir.path) |wd| {
             if (self.opts.workdir_allowlist.len > 0) {
-                var ok = false;
-                for (self.opts.workdir_allowlist) |allowed| {
-                    if (std.mem.startsWith(u8, wd, allowed)) {
-                        ok = true;
-                        break;
-                    }
+                if (!try workdirAllowed(self.allocator, wd, self.opts.workdir_allowlist)) {
+                    return .{ .blocked = "workdir_denied" };
                 }
-                if (!ok) return .{ .blocked = "workdir_denied" };
             }
         }
 
         // Harness availability (the adapter factory must accept it).
         const probe = self.opts.dispatch.factory(self.allocator, harness_name) catch null;
         if (probe == null) return .{ .blocked = "harness_unavailable" };
-        if (probe) |p| p.deinit(self.allocator);
+        if (probe) |p| {
+            defer p.deinit(self.allocator);
+            if (requiredCapability(item.kind)) |cap| {
+                if (!p.supports(cap)) return .{ .blocked = "harness_unsupported_capability" };
+            }
+        }
 
         // Per-provider preflight: binary-presence + auth-state checks.
         // Only runs when (a) the supervisor is configured to enforce it
@@ -412,7 +421,37 @@ pub const Supervisor = struct {
             }
         }
 
-        return .{ .proceed = .{ .harness = harness_name, .cwd = workdir_opt } };
+        const cwd = workdir.path;
+        const cwd_owned = workdir.owned;
+        workdir.path = null;
+        workdir.owned = false;
+        return .{ .proceed = .{ .harness = harness_name, .cwd = cwd, .cwd_owned = cwd_owned } };
+    }
+
+    const ResolvedWorkdir = struct {
+        path: ?[]const u8 = null,
+        owned: bool = false,
+
+        fn deinit(self: *ResolvedWorkdir, allocator: std.mem.Allocator) void {
+            if (self.owned) {
+                if (self.path) |path| allocator.free(path);
+            }
+            self.path = null;
+            self.owned = false;
+        }
+    };
+
+    fn resolveWorkdir(self: *Supervisor, cfg: *const stack_config.StackConfig, item: *const item_mod.Item) !ResolvedWorkdir {
+        if (self.opts.dispatch.resolve_workdir) |resolver| {
+            if (try resolver(self.allocator, item, cfg, self.opts.notes_root_abs)) |wd| {
+                return .{ .path = wd, .owned = true };
+            }
+        }
+        if (item.target) |t| {
+            if (t.workdir) |wd| return .{ .path = wd };
+        }
+        if (cfg.default_workdir) |wd| return .{ .path = wd };
+        return .{ .path = self.opts.notes_root_abs };
     }
 
     fn dispatchItem(
@@ -466,6 +505,49 @@ pub const Supervisor = struct {
         };
     }
 };
+
+fn requiredCapability(kind: item_mod.Kind) ?adapter_mod.Capability {
+    return switch (kind) {
+        .compact => .compact,
+        .clear => .clear,
+        else => null,
+    };
+}
+
+fn workdirAllowed(allocator: std.mem.Allocator, workdir: []const u8, allowlist: []const []const u8) !bool {
+    const canonical_workdir = try canonicalOrOriginal(allocator, workdir);
+    defer allocator.free(canonical_workdir);
+
+    for (allowlist) |allowed| {
+        const canonical_allowed = try canonicalOrOriginal(allocator, allowed);
+        defer allocator.free(canonical_allowed);
+        if (pathWithin(canonical_workdir, canonical_allowed)) return true;
+    }
+    return false;
+}
+
+fn canonicalOrOriginal(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return std.fs.realpathAlloc(allocator, path) catch allocator.dupe(u8, path);
+}
+
+fn pathWithin(candidate_raw: []const u8, allowed_raw: []const u8) bool {
+    const candidate = trimTrailingSeparators(candidate_raw);
+    const allowed = trimTrailingSeparators(allowed_raw);
+    if (allowed.len == 0) return false;
+    if (std.mem.eql(u8, candidate, allowed)) return true;
+    if (!std.mem.startsWith(u8, candidate, allowed)) return false;
+    return candidate.len > allowed.len and isPathSeparator(candidate[allowed.len]);
+}
+
+fn trimTrailingSeparators(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and isPathSeparator(path[end - 1])) end -= 1;
+    return path[0..end];
+}
+
+fn isPathSeparator(c: u8) bool {
+    return c == '/' or c == '\\';
+}
 
 pub const Worker = struct {
     allocator: std.mem.Allocator,
@@ -611,4 +693,12 @@ fn parseRfc3339ToUnix(s: []const u8) ?i64 {
 test "parseRfc3339ToUnix: epoch and known date" {
     try std.testing.expectEqual(@as(?i64, 0), parseRfc3339ToUnix("1970-01-01T00:00:00Z"));
     try std.testing.expectEqual(@as(?i64, 1746878400), parseRfc3339ToUnix("2025-05-10T12:00:00Z"));
+}
+
+test "workdir allowlist matching requires a path boundary" {
+    try std.testing.expect(pathWithin("/tmp/allowed", "/tmp/allowed"));
+    try std.testing.expect(pathWithin("/tmp/allowed/project", "/tmp/allowed"));
+    try std.testing.expect(pathWithin("/tmp/allowed/project", "/tmp/allowed/"));
+    try std.testing.expect(!pathWithin("/tmp/allowed-other", "/tmp/allowed"));
+    try std.testing.expect(!pathWithin("/tmp/allowedness/project", "/tmp/allowed"));
 }

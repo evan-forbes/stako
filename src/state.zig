@@ -92,32 +92,27 @@ test "unknown status string returns null" {
     try std.testing.expect(Status.fromString("") == null);
 }
 
-test "valid transitions" {
-    try std.testing.expect(isValidTransition(.queued, .running));
-    try std.testing.expect(isValidTransition(.queued, .canceled));
-    try std.testing.expect(isValidTransition(.running, .completed));
-    try std.testing.expect(isValidTransition(.running, .failed));
-    try std.testing.expect(isValidTransition(.running, .canceled));
-    try std.testing.expect(isValidTransition(.paused, .queued));
-    try std.testing.expect(isValidTransition(.blocked, .queued));
+test "valid transitions match transition table" {
+    for (VALID_TRANSITIONS) |t| {
+        try std.testing.expect(isValidTransition(t.from, t.to));
+    }
 }
 
-test "invalid transitions" {
-    // No transitions out of terminals.
-    try std.testing.expect(!isValidTransition(.completed, .queued));
-    try std.testing.expect(!isValidTransition(.failed, .queued));
-    try std.testing.expect(!isValidTransition(.canceled, .running));
-    try std.testing.expect(!isValidTransition(.superseded, .queued));
-    // No direct queued -> completed.
-    try std.testing.expect(!isValidTransition(.queued, .completed));
-    // No direct queued -> failed.
-    try std.testing.expect(!isValidTransition(.queued, .failed));
-    // No running -> queued.
-    try std.testing.expect(!isValidTransition(.running, .queued));
-    // No paused -> running directly (must re-queue first).
-    try std.testing.expect(!isValidTransition(.paused, .running));
-    // Identity.
-    try std.testing.expect(!isValidTransition(.queued, .queued));
+test "invalid transitions are every unlisted pair" {
+    inline for (@typeInfo(Status).@"enum".fields) |from_field| {
+        inline for (@typeInfo(Status).@"enum".fields) |to_field| {
+            const from: Status = @enumFromInt(from_field.value);
+            const to: Status = @enumFromInt(to_field.value);
+            var listed = false;
+            for (VALID_TRANSITIONS) |t| {
+                if (t.from == from and t.to == to) {
+                    listed = true;
+                    break;
+                }
+            }
+            if (!listed) try std.testing.expect(!isValidTransition(from, to));
+        }
+    }
 }
 
 test "terminal predicate" {

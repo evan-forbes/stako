@@ -452,9 +452,8 @@ pub fn renderItem(
             \\  var statusEl = document.querySelector("[data-status]");
             \\  var itemId =
         );
-        try w.writeAll("\"");
-        try escape(w, input.item.id);
-        try w.writeAll("\";");
+        try writeJsStringLiteral(w, input.item.id);
+        try w.writeAll(";");
         try w.writeAll(
             \\  es.onmessage = function(ev){
             \\    try {
@@ -510,30 +509,114 @@ fn renderTranscript(w: anytype, raw: []const u8) !void {
     try w.writeAll("</ul>");
 }
 
+fn writeJsStringLiteral(w: anytype, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |c| switch (c) {
+        '"' => try w.writeAll("\\\""),
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        '<' => try w.writeAll("\\u003c"),
+        '>' => try w.writeAll("\\u003e"),
+        '&' => try w.writeAll("\\u0026"),
+        else => if (c < 0x20) {
+            try w.print("\\u{x:0>4}", .{c});
+        } else {
+            try w.writeByte(c);
+        },
+    };
+    try w.writeByte('"');
+}
+
 /// Return true if the request's `Accept` header prefers HTML over JSON.
-/// The rule is simple: HTML is preferred if `text/html` appears anywhere in
-/// the Accept value and `application/json` does not appear, OR if no
-/// `Accept` header is present at all (browsers like curl-from-a-link don't
-/// always send one, but real browsers do).
-///
-/// Tests typically pass `Accept: application/json` explicitly to get JSON,
-/// and `Accept: text/html` to get HTML.
+/// Missing headers default to JSON for programmatic clients. Media types
+/// are matched case-insensitively and basic `q=` weights are honored.
 pub fn acceptHeaderWantsHtml(accept_value: ?[]const u8) bool {
     const v = accept_value orelse return false; // default to JSON for programmatic clients with no Accept
-    // Quick win: explicit application/json with no html mention.
-    const has_html = std.mem.indexOf(u8, v, "text/html") != null;
-    const has_json = std.mem.indexOf(u8, v, "application/json") != null;
-    if (has_html and !has_json) return true;
-    if (has_html and has_json) {
-        // Both present; pick the one that appears first to honor browser
-        // ordering (e.g. Firefox sends `text/html,...,application/json;q=0.9`).
-        const i_html = std.mem.indexOf(u8, v, "text/html").?;
-        const i_json = std.mem.indexOf(u8, v, "application/json").?;
-        return i_html < i_json;
+
+    const html = mediaPreference(v, "text/html");
+    const json = mediaPreference(v, "application/json");
+    if (html) |h| {
+        if (json) |j| {
+            if (h.q != j.q) return h.q > j.q;
+            return h.index < j.index;
+        }
+        return h.q > 0;
     }
-    // Only json (or only `*/*`) — keep JSON.
-    if (std.mem.indexOf(u8, v, "*/*") != null and !has_json) return true;
+    if (json != null) return false;
+    if (mediaPreference(v, "*/*")) |wild| return wild.q > 0;
     return false;
+}
+
+const MediaPreference = struct {
+    q: u16,
+    index: usize,
+};
+
+fn mediaPreference(accept_value: []const u8, media_type: []const u8) ?MediaPreference {
+    var best: ?MediaPreference = null;
+    var offset: usize = 0;
+    var it = std.mem.splitScalar(u8, accept_value, ',');
+    while (it.next()) |raw_part| {
+        const part_start = offset;
+        offset += raw_part.len + 1;
+
+        const part = std.mem.trim(u8, raw_part, " \t");
+        const semi = std.mem.indexOfScalar(u8, part, ';') orelse part.len;
+        const media = std.mem.trim(u8, part[0..semi], " \t");
+        if (!asciiEqlIgnoreCase(media, media_type)) continue;
+
+        const q = parseAcceptQ(part[semi..]);
+        if (best == null or q > best.?.q) {
+            best = .{ .q = q, .index = part_start };
+        }
+    }
+    return best;
+}
+
+fn parseAcceptQ(params: []const u8) u16 {
+    var it = std.mem.splitScalar(u8, params, ';');
+    while (it.next()) |raw_param| {
+        const param = std.mem.trim(u8, raw_param, " \t");
+        if (param.len < 2) continue;
+        if (param[0] != 'q' and param[0] != 'Q') continue;
+        var i: usize = 1;
+        while (i < param.len and (param[i] == ' ' or param[i] == '\t')) i += 1;
+        if (i >= param.len or param[i] != '=') continue;
+        i += 1;
+        while (i < param.len and (param[i] == ' ' or param[i] == '\t')) i += 1;
+        return parseQThousand(param[i..]);
+    }
+    return 1000;
+}
+
+fn parseQThousand(raw: []const u8) u16 {
+    const s = std.mem.trim(u8, raw, " \t");
+    if (s.len == 0) return 0;
+    if (s[0] == '0') {
+        if (s.len == 1) return 0;
+        if (s[1] != '.') return 0;
+        var value: u16 = 0;
+        var scale: u16 = 100;
+        var i: usize = 2;
+        while (i < s.len and scale > 0) : (i += 1) {
+            if (!std.ascii.isDigit(s[i])) break;
+            value += @as(u16, @intCast(s[i] - '0')) * scale;
+            scale /= 10;
+        }
+        return value;
+    }
+    if (s[0] == '1') return 1000;
+    return 0;
+}
+
+fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (std.ascii.toLower(x) != std.ascii.toLower(y)) return false;
+    }
+    return true;
 }
 
 // ---------- tests ----------
@@ -574,6 +657,17 @@ test "acceptHeaderWantsHtml: browser-shape header prefers html" {
     try std.testing.expect(acceptHeaderWantsHtml(
         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     ));
+}
+
+test "acceptHeaderWantsHtml: media types are case-insensitive" {
+    try std.testing.expect(acceptHeaderWantsHtml("Text/Html"));
+    try std.testing.expect(!acceptHeaderWantsHtml("Application/Json"));
+}
+
+test "acceptHeaderWantsHtml: q weights beat ordering" {
+    try std.testing.expect(acceptHeaderWantsHtml("application/json;q=0.1, text/html;q=0.9"));
+    try std.testing.expect(!acceptHeaderWantsHtml("text/html;q=0.2, application/json;q=0.8"));
+    try std.testing.expect(!acceptHeaderWantsHtml("text/html;q=0, application/json"));
 }
 
 test "renderIndex: empty stack list" {

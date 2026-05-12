@@ -120,17 +120,17 @@ fn onExit(impl: *anyopaque, allocator: std.mem.Allocator, exit_code: i32, ran_to
     try w.writeAll("\"");
     if (st.session_id.len > 0) {
         try w.writeAll(",\"session_id\":\"");
-        try jsonEscape(w, st.session_id);
+        try writeParsedJsonStringContent(w, st.session_id);
         try w.writeAll("\"");
     }
     if (st.session_file.len > 0) {
         try w.writeAll(",\"session_file\":\"");
-        try jsonEscape(w, st.session_file);
+        try writeParsedJsonStringContent(w, st.session_file);
         try w.writeAll("\"");
     }
     if (st.model.len > 0) {
         try w.writeAll(",\"model\":\"");
-        try jsonEscape(w, st.model);
+        try writeParsedJsonStringContent(w, st.model);
         try w.writeAll("\"");
     }
     try w.writeAll("}");
@@ -152,7 +152,7 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
     const line = stripEol(raw);
     if (line.len == 0) return allocator.alloc(adapter.OwnedEvent, 0);
 
-    const type_str = findStringValue(line, "\"type\":") orelse return emitErrorList(allocator, "adapter_parse_error", true);
+    const type_str = findTopLevelStringValue(line, "\"type\":") orelse return emitErrorList(allocator, "adapter_parse_error", true);
 
     var out = std.ArrayList(adapter.OwnedEvent){};
     errdefer {
@@ -207,7 +207,7 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
             var argbuf = std.ArrayList(u8){};
             defer argbuf.deinit(allocator);
             try argbuf.writer(allocator).writeAll("{\"command\":\"");
-            try jsonEscape(argbuf.writer(allocator), cmd);
+            try writeParsedJsonStringContent(argbuf.writer(allocator), cmd);
             try argbuf.writer(allocator).writeAll("\"}");
             try emitToolCall(allocator, &out, "command_execution", argbuf.items, call_id);
             try emitCommandExecuted(allocator, &out, cmd, @intCast(exit_code));
@@ -224,6 +224,8 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
         }
         // Other item_types (mcp_tool_call, web_search, plan_update) are not
         // projected to normalized kinds in v1.
+    } else {
+        try emitError(allocator, &out, "adapter_unknown_event", true);
     }
 
     return out.toOwnedSlice(allocator);
@@ -270,12 +272,12 @@ fn emitSessionStarted(
     try w.writeAll("{\"harness\":\"codex\"");
     if (st.model.len > 0) {
         try w.writeAll(",\"model\":\"");
-        try jsonEscape(w, st.model);
+        try writeParsedJsonStringContent(w, st.model);
         try w.writeAll("\"");
     }
     if (st.session_id.len > 0) {
         try w.writeAll(",\"session\":\"");
-        try jsonEscape(w, st.session_id);
+        try writeParsedJsonStringContent(w, st.session_id);
         try w.writeAll("\"");
     }
     try w.writeAll("}");
@@ -337,7 +339,7 @@ fn emitMessage(
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try w.writeAll("{\"text\":\"");
-    try jsonEscape(w, text);
+    try writeParsedJsonStringContent(w, text);
     try w.writeAll("\",\"role\":\"");
     try w.writeAll(role);
     try w.writeAll("\"}");
@@ -364,11 +366,11 @@ fn emitToolCall(
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try w.writeAll("{\"tool\":\"");
-    try jsonEscape(w, tool);
+    try writeParsedJsonStringContent(w, tool);
     try w.writeAll("\",\"args\":");
     if (args_obj_with_braces.len == 0) try w.writeAll("{}") else try w.writeAll(args_obj_with_braces);
     try w.writeAll(",\"call_id\":\"");
-    try jsonEscape(w, call_id);
+    try writeParsedJsonStringContent(w, call_id);
     try w.writeAll("\"}");
     const storage = try buf.toOwnedSlice(allocator);
     try out.append(allocator, .{
@@ -392,7 +394,7 @@ fn emitFileChanged(
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try w.writeAll("{\"path\":\"");
-    try jsonEscape(w, path);
+    try writeParsedJsonStringContent(w, path);
     try w.writeAll("\",\"op\":\"");
     try jsonEscape(w, op);
     try w.writeAll("\",\"bytes\":0}");
@@ -418,7 +420,7 @@ fn emitCommandExecuted(
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try w.writeAll("{\"cmd\":\"");
-    try jsonEscape(w, cmd);
+    try writeParsedJsonStringContent(w, cmd);
     try w.writeAll("\",\"exit\":");
     try w.print("{d}", .{exit_code});
     try w.writeAll(",\"stdout_truncated\":false,\"stderr_truncated\":false}");
@@ -444,7 +446,7 @@ fn emitError(
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try w.writeAll("{\"message\":\"");
-    try jsonEscape(w, msg);
+    try writeParsedJsonStringContent(w, msg);
     try w.writeAll("\",\"recoverable\":");
     try w.writeAll(if (recoverable) "true" else "false");
     try w.writeAll("}");
@@ -514,6 +516,53 @@ fn findStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
             if (src[i] == '"') return src[start..i];
         }
         return null;
+    }
+    return null;
+}
+
+fn findTopLevelStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    var depth: usize = 0;
+    var in_str = false;
+    var escape = false;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_str) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
+                var j = i + key_with_colon.len;
+                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
+                if (j >= src.len or src[j] != '"') return null;
+                j += 1;
+                const start = j;
+                while (j < src.len) : (j += 1) {
+                    if (src[j] == '\\') {
+                        j += 1;
+                        continue;
+                    }
+                    if (src[j] == '"') return src[start..j];
+                }
+                return null;
+            }
+            in_str = true;
+            continue;
+        }
+        if (c == '{' or c == '[') depth += 1;
+        if (c == '}' or c == ']') {
+            if (depth == 0) return null;
+            depth -= 1;
+        }
     }
     return null;
 }
@@ -652,6 +701,10 @@ fn jsonEscape(w: anytype, s: []const u8) !void {
     };
 }
 
+fn writeParsedJsonStringContent(w: anytype, s: []const u8) !void {
+    try w.writeAll(s);
+}
+
 // ---------- tests ----------
 
 test "codex: thread.started -> session_started with id + model" {
@@ -755,4 +808,38 @@ test "codex: on_exit success carries session_id + model in data" {
     try std.testing.expect(std.mem.indexOf(u8, ev.ev.data_json, "\"terminal_status\":\"completed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ev.ev.data_json, "\"session_id\":\"th-xyz\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, ev.ev.data_json, "\"model\":\"gpt-5\"") != null);
+}
+
+test "codex: top-level type wins over nested type fields" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"item\":{\"type\":\"not-top-level\"},\"type\":\"thread.started\",\"thread_id\":\"th-ordered\",\"model\":\"gpt-5\"}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.session_started, evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"session\":\"th-ordered\"") != null);
+}
+
+test "codex: escaped provider strings preserve JSON semantics" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"item.completed\",\"item\":{\"item_type\":\"agent_message\",\"text\":\"quote: \\\"ok\\\"\"}}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.message, evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"text\":\"quote: \\\"ok\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\\\\\\\"ok") == null);
+}
+
+test "codex: unknown top-level event emits recoverable error" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"future.event\",\"data\":{}}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"recoverable\":true") != null);
 }

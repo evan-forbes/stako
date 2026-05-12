@@ -51,6 +51,7 @@ pub const Session = struct {
     item_dir_abs: []u8,
     harness_name: []u8,
     adapter: adapter_mod.Adapter,
+    adapter_owned: bool = true,
     child: std.process.Child,
     transcript: transcript_mod.Writer,
     started_at: []u8 = "",
@@ -61,18 +62,16 @@ pub const Session = struct {
 
     stdout_thread: ?std.Thread = null,
     stderr_thread: ?std.Thread = null,
+    wait_thread: ?std.Thread = null,
 
     fn deinit(self: *Session) void {
-        if (self.stdout_thread) |t| {
+        if (self.wait_thread) |t| {
             t.join();
-            self.stdout_thread = null;
+            self.wait_thread = null;
         }
-        if (self.stderr_thread) |t| {
-            t.join();
-            self.stderr_thread = null;
-        }
+        joinPumpThreads(self);
         self.transcript.deinit();
-        self.adapter.deinit(self.allocator);
+        if (self.adapter_owned) self.adapter.deinit(self.allocator);
         self.allocator.free(self.stack);
         self.allocator.free(self.item_id);
         self.allocator.free(self.item_dir_abs);
@@ -162,14 +161,9 @@ pub const Manager = struct {
             self.mutex.unlock();
             defer self.allocator.free(snap);
             for (snap) |s| {
-                // Pump threads finish themselves; we just join them.
-                if (s.stdout_thread) |t| {
+                if (s.wait_thread) |t| {
                     t.join();
-                    s.stdout_thread = null;
-                }
-                if (s.stderr_thread) |t| {
-                    t.join();
-                    s.stderr_thread = null;
+                    s.wait_thread = null;
                 }
             }
         }
@@ -205,12 +199,13 @@ pub const Manager = struct {
         }
         self.running_count += 1;
         self.mutex.unlock();
-        errdefer {
+        var slot_owned = true;
+        errdefer if (slot_owned) {
             self.mutex.lock();
             self.running_count -= 1;
             self.slot_cv.signal();
             self.mutex.unlock();
-        }
+        };
 
         // Dup argv into a flat buffer.
         const argv_owned = try self.allocator.alloc([]const u8, input.argv.len);
@@ -284,6 +279,7 @@ pub const Manager = struct {
             self.mutex.unlock();
             _ = sess.child.kill() catch {};
             _ = sess.child.wait() catch {};
+            sess.adapter_owned = false;
             sess.deinit();
             self.allocator.destroy(sess);
             return error.OutOfMemory;
@@ -291,14 +287,15 @@ pub const Manager = struct {
         self.mutex.unlock();
 
         // Audit: dispatch_harness.
-        const target = std.fmt.allocPrint(self.allocator, "stack/{s}/item/{s}", .{ input.stack, input.item_id }) catch return sess;
-        defer self.allocator.free(target);
-        self.audit_writer.append(.{
-            .identity = "system",
-            .action = .dispatch_harness,
-            .target = target,
-            .outcome = .allowed,
-        }) catch {};
+        if (std.fmt.allocPrint(self.allocator, "stack/{s}/item/{s}", .{ input.stack, input.item_id })) |target| {
+            defer self.allocator.free(target);
+            self.audit_writer.append(.{
+                .identity = "system",
+                .action = .dispatch_harness,
+                .target = target,
+                .outcome = .allowed,
+            }) catch {};
+        } else |_| {}
 
         // Apply queued → running through the shared mutation queue.
         applyTransition(self.queue, .{
@@ -311,21 +308,36 @@ pub const Manager = struct {
         {
             var b = std.ArrayList(u8){};
             defer b.deinit(self.allocator);
-            try b.writer(self.allocator).print("{{\"harness\":\"{s}\",\"started_at\":\"{s}\"}}", .{ input.harness, start_ts });
-            const data_owned = try b.toOwnedSlice(self.allocator);
-            defer self.allocator.free(data_owned);
-            const ev: events.Event = .{
-                .stack = sess.stack,
-                .item = sess.item_id,
-                .kind = .session_started,
-                .data_json = data_owned,
-            };
-            sess.transcript.append(ev) catch {};
-            if (sess.manager.hub) |h| h.publish(ev) catch {};
+            b.writer(self.allocator).print("{{\"harness\":\"{s}\",\"started_at\":\"{s}\"}}", .{ input.harness, start_ts }) catch {};
+            if (b.toOwnedSlice(self.allocator)) |data_owned| {
+                defer self.allocator.free(data_owned);
+                const ev: events.Event = .{
+                    .stack = sess.stack,
+                    .item = sess.item_id,
+                    .kind = .session_started,
+                    .data_json = data_owned,
+                };
+                sess.transcript.append(ev) catch {};
+                if (sess.manager.hub) |h| h.publish(ev) catch {};
+            } else |_| {}
         }
 
-        sess.stdout_thread = std.Thread.spawn(.{}, stdoutPump, .{sess}) catch null;
-        sess.stderr_thread = std.Thread.spawn(.{}, stderrPump, .{sess}) catch null;
+        sess.stdout_thread = std.Thread.spawn(.{}, stdoutPump, .{sess}) catch {
+            self.cleanupRegisteredSpawnFailure(sess);
+            slot_owned = false;
+            return error.SpawnFailed;
+        };
+        sess.stderr_thread = std.Thread.spawn(.{}, stderrPump, .{sess}) catch {
+            self.cleanupRegisteredSpawnFailure(sess);
+            slot_owned = false;
+            return error.SpawnFailed;
+        };
+        sess.wait_thread = std.Thread.spawn(.{}, waitForExit, .{sess}) catch {
+            self.cleanupRegisteredSpawnFailure(sess);
+            slot_owned = false;
+            return error.SpawnFailed;
+        };
+        slot_owned = false;
         return sess;
     }
 
@@ -388,6 +400,29 @@ pub const Manager = struct {
             }
         }
     }
+
+    fn cleanupRegisteredSpawnFailure(self: *Manager, sess: *Session) void {
+        _ = sess.child.kill() catch {};
+        _ = sess.child.wait() catch {};
+        joinPumpThreads(sess);
+        runtime_file.deleteFor(self.allocator, self.notes_root_abs, sess.stack, sess.item_id) catch {};
+
+        self.mutex.lock();
+        var i: usize = 0;
+        while (i < self.sessions.items.len) : (i += 1) {
+            if (self.sessions.items[i] == sess) {
+                _ = self.sessions.orderedRemove(i);
+                break;
+            }
+        }
+        if (self.running_count > 0) self.running_count -= 1;
+        self.slot_cv.signal();
+        self.mutex.unlock();
+
+        sess.adapter_owned = false;
+        sess.deinit();
+        self.allocator.destroy(sess);
+    }
 };
 
 pub const TerminalReason = enum {
@@ -425,7 +460,23 @@ fn stdoutPump(s: *Session) void {
             }
         }
     }
-    onExitMain(s);
+}
+
+fn waitForExit(s: *Session) void {
+    const term = s.child.wait() catch null;
+    joinPumpThreads(s);
+    onExitMain(s, term);
+}
+
+fn joinPumpThreads(s: *Session) void {
+    if (s.stdout_thread) |t| {
+        t.join();
+        s.stdout_thread = null;
+    }
+    if (s.stderr_thread) |t| {
+        t.join();
+        s.stderr_thread = null;
+    }
 }
 
 fn processStdoutLine(s: *Session, line: []const u8) void {
@@ -493,8 +544,10 @@ fn processStderrLine(s: *Session, line: []const u8) void {
     }
 }
 
-fn onExitMain(s: *Session) void {
-    const term = s.child.wait() catch return;
+fn onExitMain(s: *Session, term_opt: ?std.process.Child.Term) void {
+    defer s.manager.markFinished(s);
+
+    const term = term_opt orelse std.process.Child.Term{ .Unknown = 1 };
     const exit_code: i32 = switch (term) {
         .Exited => |c| @as(i32, c),
         .Signal => |c| -@as(i32, @intCast(c)),
@@ -503,7 +556,7 @@ fn onExitMain(s: *Session) void {
     const canceled = s.outcome.canceled.load(.seq_cst);
     const ran_to_completion = !canceled and term == .Exited;
 
-    const ev = s.adapter.onExit(s.allocator, exit_code, ran_to_completion) catch return;
+    const maybe_ev = s.adapter.onExit(s.allocator, exit_code, ran_to_completion) catch null;
     // Snapshot adapter-captured `[result]` fields from the session_ended
     // payload BEFORE freeing the event. Each adapter emits a JSON object on
     // `data_json` whose keys are stable (`session_id`, `session_file`,
@@ -517,16 +570,16 @@ fn onExitMain(s: *Session) void {
     defer if (result_sid_owned) |x| s.allocator.free(x);
     defer if (result_sf_owned) |x| s.allocator.free(x);
     defer if (result_model_owned) |x| s.allocator.free(x);
-    if (extractJsonString(ev.ev.data_json, "\"session_id\":")) |x| {
-        result_sid_owned = s.allocator.dupe(u8, x) catch null;
-    }
-    if (extractJsonString(ev.ev.data_json, "\"session_file\":")) |x| {
-        result_sf_owned = s.allocator.dupe(u8, x) catch null;
-    }
-    if (extractJsonString(ev.ev.data_json, "\"model\":")) |x| {
-        result_model_owned = s.allocator.dupe(u8, x) catch null;
-    }
-    {
+    if (maybe_ev) |ev| {
+        if (extractJsonString(ev.ev.data_json, "\"session_id\":")) |x| {
+            result_sid_owned = s.allocator.dupe(u8, x) catch null;
+        }
+        if (extractJsonString(ev.ev.data_json, "\"session_file\":")) |x| {
+            result_sf_owned = s.allocator.dupe(u8, x) catch null;
+        }
+        if (extractJsonString(ev.ev.data_json, "\"model\":")) |x| {
+            result_model_owned = s.allocator.dupe(u8, x) catch null;
+        }
         defer adapter_mod.freeOwned(s.allocator, ev);
         var event = ev.ev;
         event.stack = s.stack;
@@ -580,8 +633,6 @@ fn onExitMain(s: *Session) void {
     if (tag == .failed) input.failed_reason = "subprocess_nonzero_exit";
     if (tag == .canceled) input.canceled_by = "system";
     applyTransition(s.manager.queue, input);
-
-    s.manager.markFinished(s);
 }
 
 /// Extract a JSON string value for `key_with_colon` (e.g. `"\"foo\":"`)

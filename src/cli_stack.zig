@@ -419,33 +419,12 @@ fn runAdd(
     // POST /stacks/{name}/items with body {kind, slug, target?, prompt?}.
     const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items", .{args.name});
     defer allocator.free(path);
-
-    var prompt_buf: ?[]u8 = null;
-    defer if (prompt_buf) |p| allocator.free(p);
-    if (args.prompt_file.len > 0) {
-        prompt_buf = readPromptFile(allocator, args.prompt_file) catch |e| {
-            try stderr.print("organo: failed to read --prompt-file: {s}\n", .{@errorName(e)});
-            return 1;
-        };
-    }
-
-    var body = std.ArrayList(u8){};
-    defer body.deinit(allocator);
-    const w = body.writer(allocator);
-    try w.writeAll("{");
-    try w.print("\"kind\":\"{s}\"", .{args.kind});
-    const slug = if (args.slug.len > 0) args.slug else deriveDefaultSlug(args.kind, args.prompt_file);
-    try w.writeAll(",\"slug\":\"");
-    try writeJsonStr(w, slug);
-    try w.writeAll("\"");
-    try writeTargetFieldFromShorthand(w, args.target);
-    if (prompt_buf) |p| {
-        try w.writeAll(",\"prompt\":\"");
-        try writeJsonStr(w, p);
-        try w.writeAll("\"");
-    }
-    try w.writeAll("}");
-    return try postAndReport(allocator, client, path, body.items, args.flags, stdout, stderr);
+    const body = buildItemBody(allocator, args, stderr) catch |e| switch (e) {
+        error.PromptFileReadFailed => return 1,
+        else => return e,
+    };
+    defer allocator.free(body);
+    return try postAndReport(allocator, client, path, body, args.flags, stdout, stderr);
 }
 
 fn runInsert(
@@ -457,18 +436,45 @@ fn runInsert(
 ) !u8 {
     const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/insert", .{ args.name, args.ref });
     defer allocator.free(path);
+    const body = buildItemBody(allocator, args, stderr) catch |e| switch (e) {
+        error.PromptFileReadFailed => return 1,
+        else => return e,
+    };
+    defer allocator.free(body);
+    return try postAndReport(allocator, client, path, body, args.flags, stdout, stderr);
+}
+
+const BuildItemBodyError = error{PromptFileReadFailed} || anyerror;
+
+fn buildItemBody(allocator: std.mem.Allocator, args: cli.StackArgs, stderr: anytype) BuildItemBodyError![]u8 {
+    var prompt_buf: ?[]u8 = null;
+    defer if (prompt_buf) |p| allocator.free(p);
+    if (args.prompt_file.len > 0) {
+        prompt_buf = readPromptFile(allocator, args.prompt_file) catch |e| {
+            try stderr.print("organo: failed to read --prompt-file: {s}\n", .{@errorName(e)});
+            return error.PromptFileReadFailed;
+        };
+    }
+
     var body = std.ArrayList(u8){};
-    defer body.deinit(allocator);
+    errdefer body.deinit(allocator);
     const w = body.writer(allocator);
     try w.writeAll("{");
-    try w.print("\"kind\":\"{s}\"", .{args.kind});
+    try w.writeAll("\"kind\":\"");
+    try writeJsonStr(w, args.kind);
+    try w.writeAll("\"");
     const slug = if (args.slug.len > 0) args.slug else deriveDefaultSlug(args.kind, args.prompt_file);
     try w.writeAll(",\"slug\":\"");
     try writeJsonStr(w, slug);
     try w.writeAll("\"");
     try writeTargetFieldFromShorthand(w, args.target);
+    if (prompt_buf) |p| {
+        try w.writeAll(",\"prompt\":\"");
+        try writeJsonStr(w, p);
+        try w.writeAll("\"");
+    }
     try w.writeAll("}");
-    return try postAndReport(allocator, client, path, body.items, args.flags, stdout, stderr);
+    return try body.toOwnedSlice(allocator);
 }
 
 fn runTransition(
@@ -493,10 +499,19 @@ fn runSupersede(
 ) !u8 {
     const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/supersede", .{ args.name, args.item_id });
     defer allocator.free(path);
+    const body = try buildSupersedeBody(allocator, args.replacement);
+    defer allocator.free(body);
+    return try postAndReport(allocator, client, path, body, args.flags, stdout, stderr);
+}
+
+fn buildSupersedeBody(allocator: std.mem.Allocator, replacement: []const u8) ![]u8 {
     var body = std.ArrayList(u8){};
-    defer body.deinit(allocator);
-    try body.writer(allocator).print("{{\"replacement\":\"{s}\"}}", .{args.replacement});
-    return try postAndReport(allocator, client, path, body.items, args.flags, stdout, stderr);
+    errdefer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{\"replacement\":\"");
+    try writeJsonStr(w, replacement);
+    try w.writeAll("\"}");
+    return try body.toOwnedSlice(allocator);
 }
 
 fn runPauseResume(
@@ -663,4 +678,56 @@ test "extractJsonStringArray: parses harness list" {
     try std.testing.expectEqual(@as(usize, 2), arr.len);
     try std.testing.expectEqualStrings("claude", arr[0]);
     try std.testing.expectEqualStrings("codex", arr[1]);
+}
+
+test "buildItemBody: insert/add payload includes prompt and escapes strings" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f = try tmp.dir.createFile("prompt-body.md", .{ .truncate = true });
+    try f.writeAll("hello \"quoted\"\\path\n");
+    f.close();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buf);
+    const prompt_path = try std.fs.path.join(a, &.{ dir, "prompt-body.md" });
+    defer a.free(prompt_path);
+
+    var stderr_buf: std.Io.Writer.Allocating = .init(a);
+    defer stderr_buf.deinit();
+    const body = try buildItemBody(a, .{
+        .action = .insert,
+        .name = "demo",
+        .ref = "0001",
+        .kind = "prompt",
+        .target = "anthropic/claude",
+        .prompt_file = prompt_path,
+    }, &stderr_buf.writer);
+    defer a.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"kind\":\"prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"slug\":\"prompt-body\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"provider\":\"anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"claude\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"prompt\":\"hello \\\"quoted\\\"\\\\path\\n\"") != null);
+}
+
+test "buildItemBody: kind is JSON escaped" {
+    const a = std.testing.allocator;
+    var stderr_buf: std.Io.Writer.Allocating = .init(a);
+    defer stderr_buf.deinit();
+    const body = try buildItemBody(a, .{
+        .action = .add,
+        .name = "demo",
+        .kind = "bad\"kind",
+        .slug = "explicit",
+    }, &stderr_buf.writer);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"kind\":\"bad\\\"kind\"") != null);
+}
+
+test "buildSupersedeBody: replacement is JSON escaped" {
+    const a = std.testing.allocator;
+    const body = try buildSupersedeBody(a, "00\"\\\\01");
+    defer a.free(body);
+    try std.testing.expectEqualStrings("{\"replacement\":\"00\\\"\\\\\\\\01\"}", body);
 }

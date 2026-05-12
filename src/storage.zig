@@ -139,28 +139,9 @@ pub const Reader = struct {
             if (!item_mod.isValidId(id_part)) continue;
             if (!item_mod.isValidSlug(slug_part)) continue;
 
-            // Read meta.toml just enough to extract kind+status without the
-            // full item validation pass.
-            const meta_path = try std.fs.path.join(self.allocator, &.{ entry.name, "meta.toml" });
-            defer self.allocator.free(meta_path);
-
-            var f = d.openFile(meta_path, .{}) catch continue; // skip malformed
-            defer f.close();
-            const stat = try f.stat();
-            const src = try self.allocator.alloc(u8, stat.size);
-            defer self.allocator.free(src);
-            const n = try f.readAll(src);
-
-            var diag: item_mod.ParseDiagnostic = .{};
-            var parsed = item_mod.parseSlice(self.allocator, src[0..n], &diag) catch continue;
-            defer parsed.deinit();
-
-            try out.append(self.allocator, .{
-                .id = try self.allocator.dupe(u8, parsed.id),
-                .slug = try self.allocator.dupe(u8, parsed.slug),
-                .kind = try self.allocator.dupe(u8, parsed.kind.toString()),
-                .status = try self.allocator.dupe(u8, parsed.status.toString()),
-            });
+            if (try self.readItemSummary(&d, entry.name)) |summary| {
+                try out.append(self.allocator, summary);
+            }
         }
 
         std.mem.sort(ItemSummary, out.items, {}, lessThanItem);
@@ -196,6 +177,34 @@ pub const Reader = struct {
         }
         return error.NotFound;
     }
+
+    /// Return null for incomplete or malformed item directories. Operational
+    /// read errors still propagate so real items do not disappear silently.
+    fn readItemSummary(self: *const Reader, stack_dir: *std.fs.Dir, dir_name: []const u8) !?ItemSummary {
+        const meta_path = try std.fs.path.join(self.allocator, &.{ dir_name, "meta.toml" });
+        defer self.allocator.free(meta_path);
+
+        var f = stack_dir.openFile(meta_path, .{}) catch |e| switch (e) {
+            error.FileNotFound, error.IsDir => return null,
+            else => return e,
+        };
+        defer f.close();
+        const stat = try f.stat();
+        const src = try self.allocator.alloc(u8, stat.size);
+        defer self.allocator.free(src);
+        const n = try f.readAll(src);
+
+        var diag: item_mod.ParseDiagnostic = .{};
+        var parsed = item_mod.parseSlice(self.allocator, src[0..n], &diag) catch return null;
+        defer parsed.deinit();
+
+        return .{
+            .id = try self.allocator.dupe(u8, parsed.id),
+            .slug = try self.allocator.dupe(u8, parsed.slug),
+            .kind = try self.allocator.dupe(u8, parsed.kind.toString()),
+            .status = try self.allocator.dupe(u8, parsed.status.toString()),
+        };
+    }
 };
 
 fn freeOwnedSummaries(a: std.mem.Allocator, items: []const ItemSummary) void {
@@ -207,13 +216,19 @@ fn freeOwnedSummaries(a: std.mem.Allocator, items: []const ItemSummary) void {
     }
 }
 
-/// Stack-name rules per the design docs: kebab-case lowercase identifiers.
+/// Stack-name rules per the design docs: lowercase identifiers with words
+/// separated by single dashes or underscores.
 pub fn isValidStackName(s: []const u8) bool {
     if (s.len == 0) return false;
-    if (s[0] == '.' or s[0] == '-') return false;
+    if (s[0] == '.' or s[0] == '-' or s[0] == '_') return false;
+    if (s[s.len - 1] == '-' or s[s.len - 1] == '_') return false;
+    var prev_sep = false;
     for (s) |c| {
         const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
         if (!ok) return false;
+        const sep = c == '-' or c == '_';
+        if (sep and prev_sep) return false;
+        prev_sep = sep;
     }
     return true;
 }
@@ -231,10 +246,16 @@ fn lessThanItem(_: void, a: ItemSummary, b: ItemSummary) bool {
 test "isValidStackName" {
     try std.testing.expect(isValidStackName("default"));
     try std.testing.expect(isValidStackName("foo-bar"));
+    try std.testing.expect(isValidStackName("foo_bar"));
     try std.testing.expect(isValidStackName("smoke"));
     try std.testing.expect(!isValidStackName(""));
     try std.testing.expect(!isValidStackName(".hidden"));
     try std.testing.expect(!isValidStackName("-leading"));
+    try std.testing.expect(!isValidStackName("_leading"));
+    try std.testing.expect(!isValidStackName("trailing-"));
+    try std.testing.expect(!isValidStackName("trailing_"));
+    try std.testing.expect(!isValidStackName("double--dash"));
+    try std.testing.expect(!isValidStackName("double__underscore"));
     try std.testing.expect(!isValidStackName("Upper"));
     try std.testing.expect(!isValidStackName("../bad"));
     try std.testing.expect(!isValidStackName("with space"));

@@ -120,14 +120,15 @@ pub fn read(
     const stat = try f.stat();
     const buf = try allocator.alloc(u8, stat.size);
     defer allocator.free(buf);
-    _ = try f.readAll(buf);
+    const bytes_read = try f.readAll(buf);
+    const src = buf[0..bytes_read];
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const aa = arena.allocator();
     var rf: RuntimeFile = .{};
 
-    var it = std.mem.splitScalar(u8, buf, '\n');
+    var it = std.mem.splitScalar(u8, src, '\n');
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0) continue;

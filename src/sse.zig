@@ -27,13 +27,17 @@ pub const Subscription = struct {
     id: u64,
     stack: []u8,
     sink: Sink,
+    active: bool = true,
+    ref_count: usize = 0,
 };
 
 /// Hub state. Safe to access from multiple threads under its internal mutex.
 pub const Hub = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
     subs: std.ArrayList(*Subscription) = .{},
+    retired: std.ArrayList(*Subscription) = .{},
     next_id: u64 = 1,
 
     pub fn init(allocator: std.mem.Allocator) Hub {
@@ -44,10 +48,15 @@ pub const Hub = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.subs.items) |s| {
-            self.allocator.free(s.stack);
-            self.allocator.destroy(s);
+            while (s.ref_count > 0) self.cond.wait(&self.mutex);
+            self.destroySubscription(s);
+        }
+        for (self.retired.items) |s| {
+            while (s.ref_count > 0) self.cond.wait(&self.mutex);
+            self.destroySubscription(s);
         }
         self.subs.deinit(self.allocator);
+        self.retired.deinit(self.allocator);
     }
 
     /// Subscribe to one stack's events. Caller owns the returned pointer
@@ -73,15 +82,13 @@ pub const Hub = struct {
     pub fn unsubscribe(self: *Hub, sub: *Subscription) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        var i: usize = 0;
-        while (i < self.subs.items.len) : (i += 1) {
-            if (self.subs.items[i] == sub) {
-                _ = self.subs.orderedRemove(i);
-                self.allocator.free(sub.stack);
-                self.allocator.destroy(sub);
-                return;
-            }
+        if (self.removeActiveLocked(sub)) {
+            sub.active = false;
+        } else if (!self.removeRetiredLocked(sub)) {
+            return;
         }
+        while (sub.ref_count > 0) self.cond.wait(&self.mutex);
+        self.destroySubscription(sub);
     }
 
     /// Publish a single event to all subscribers of `event.stack`. Errors
@@ -103,9 +110,9 @@ pub const Hub = struct {
         try sse_line.appendSlice(self.allocator, raw_line);
         try sse_line.appendSlice(self.allocator, "\n\n");
 
-        // Snapshot subscriber list under the mutex, then release before
-        // calling each sink — sinks may do slow IO and we don't want to
-        // hold the mutex while a TCP write to a stalled client blocks.
+        // Snapshot subscriber pointers under the mutex and bump refcounts
+        // before releasing it. Unsubscribe waits for those refs to drain, so
+        // the subscription and its sink context stay valid during callbacks.
         self.mutex.lock();
         var snapshot = self.allocator.alloc(*Subscription, self.subs.items.len) catch {
             self.mutex.unlock();
@@ -114,21 +121,53 @@ pub const Hub = struct {
         defer self.allocator.free(snapshot);
         var n: usize = 0;
         for (self.subs.items) |s| {
-            if (std.mem.eql(u8, s.stack, event.stack)) {
+            if (s.active and std.mem.eql(u8, s.stack, event.stack)) {
+                s.ref_count += 1;
                 snapshot[n] = s;
                 n += 1;
             }
         }
         self.mutex.unlock();
 
-        var dead = std.ArrayList(*Subscription){};
-        defer dead.deinit(self.allocator);
         for (snapshot[0..n]) |s| {
-            s.sink.write_fn(s.sink.ctx, sse_line.items) catch {
-                try dead.append(self.allocator, s);
-            };
+            const failed = if (s.sink.write_fn(s.sink.ctx, sse_line.items)) |_| false else |_| true;
+            self.releasePublishedSubscription(s, failed);
         }
-        for (dead.items) |s| self.unsubscribe(s);
+    }
+
+    fn releasePublishedSubscription(self: *Hub, sub: *Subscription, failed: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (failed and sub.active and self.removeActiveLocked(sub)) {
+            sub.active = false;
+            self.retired.append(self.allocator, sub) catch {};
+        }
+        sub.ref_count -= 1;
+        if (sub.ref_count == 0) self.cond.broadcast();
+    }
+
+    fn removeActiveLocked(self: *Hub, sub: *Subscription) bool {
+        return removeFromList(&self.subs, sub);
+    }
+
+    fn removeRetiredLocked(self: *Hub, sub: *Subscription) bool {
+        return removeFromList(&self.retired, sub);
+    }
+
+    fn removeFromList(list: *std.ArrayList(*Subscription), sub: *Subscription) bool {
+        var i: usize = 0;
+        while (i < list.items.len) : (i += 1) {
+            if (list.items[i] == sub) {
+                _ = list.orderedRemove(i);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn destroySubscription(self: *Hub, sub: *Subscription) void {
+        self.allocator.free(sub.stack);
+        self.allocator.destroy(sub);
     }
 };
 
@@ -207,10 +246,11 @@ test "Hub: failing sink is auto-removed" {
     var buf = std.ArrayList(u8){};
     defer buf.deinit(a);
     var ctx = CaptureCtx{ .buf = &buf, .allocator = a, .fail_after = 1 };
-    _ = try hub.subscribe("demo", .{ .ctx = &ctx, .write_fn = captureWrite });
+    const sub = try hub.subscribe("demo", .{ .ctx = &ctx, .write_fn = captureWrite });
 
     try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .session_started });
     try hub.publish(.{ .stack = "demo", .item = "0001", .kind = .message });
     // Second publish should have triggered SinkFailure → subscriber removed.
     try std.testing.expectEqual(@as(usize, 0), hub.subs.items.len);
+    hub.unsubscribe(sub);
 }

@@ -417,6 +417,20 @@ test "daemon: GET /stacks/smoke/items/0001 serves HTML item page" {
     try std.testing.expect(std.mem.indexOf(u8, parsed.body, "session_started") != null);
 }
 
+test "daemon: HTML responses include a CSP" {
+    const a = std.testing.allocator;
+    var root = try buildInitializedRoot(a, "html-csp");
+    defer root.deinit();
+    var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
+    defer drv.deinit();
+    try drv.serve(1);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "content-security-policy:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "form-action 'self'") != null);
+}
+
 test "daemon: GET /static/style.css returns CSS" {
     const a = std.testing.allocator;
     var root = try buildInitializedRoot(a, "static-css");

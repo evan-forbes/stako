@@ -124,6 +124,7 @@ pub fn writeEvent(w: anytype, event: Event, ts_now: ?[]const u8) !void {
     if (event.data_json.len == 0) {
         try w.writeAll("{}");
     } else {
+        if (!isJsonObjectLiteral(event.data_json)) return error.InvalidEventData;
         try w.writeAll(event.data_json);
     }
     try w.writeAll("}\n");
@@ -241,6 +242,48 @@ fn findObjectField(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
     return null;
 }
 
+fn isJsonObjectLiteral(src: []const u8) bool {
+    if (findObjectEnd(src, 0)) |end| return end == src.len;
+    return false;
+}
+
+fn findObjectEnd(src: []const u8, start: usize) ?usize {
+    if (start >= src.len or src[start] != '{') return null;
+
+    var i = start;
+    var depth: usize = 0;
+    var in_str = false;
+    var escape = false;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_str) {
+            if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (c == '"') {
+            in_str = true;
+            continue;
+        }
+        if (c == '{') {
+            depth += 1;
+            continue;
+        }
+        if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return i + 1;
+        }
+    }
+    return null;
+}
+
 // ---------- tests ----------
 
 test "Kind: round-trip" {
@@ -267,6 +310,40 @@ test "writeEvent: minimal session_started" {
         "{\"v\":1,\"ts\":\"2026-05-10T14:32:00.123Z\",\"stack\":\"smoke\",\"item\":\"0001\",\"session\":\"abc-123\",\"kind\":\"session_started\",\"data\":{\"harness\":\"claude\",\"model\":\"claude-opus-4-7\"}}\n",
         got,
     );
+}
+
+test "writeEvent: empty data defaults to object" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try writeEvent(&w, .{
+        .ts = "2026-05-10T14:32:00.123Z",
+        .stack = "smoke",
+        .item = "0001",
+        .kind = .message,
+        .data_json = "",
+    }, null);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..w.end], "\"data\":{}") != null);
+}
+
+test "writeEvent: data must be a single JSON object literal" {
+    var buf: [256]u8 = undefined;
+    var w1 = std.Io.Writer.fixed(&buf);
+    try std.testing.expectError(error.InvalidEventData, writeEvent(&w1, .{
+        .ts = "2026-05-10T14:32:00.123Z",
+        .stack = "smoke",
+        .item = "0001",
+        .kind = .message,
+        .data_json = "[]",
+    }, null));
+
+    var w2 = std.Io.Writer.fixed(&buf);
+    try std.testing.expectError(error.InvalidEventData, writeEvent(&w2, .{
+        .ts = "2026-05-10T14:32:00.123Z",
+        .stack = "smoke",
+        .item = "0001",
+        .kind = .message,
+        .data_json = "{\"ok\":true} trailing",
+    }, null));
 }
 
 test "parseEvent: round-trip" {

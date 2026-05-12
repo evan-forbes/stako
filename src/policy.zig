@@ -165,55 +165,50 @@ pub fn evaluate(
 
     const caps = if (id.entry) |e| (e.capabilities orelse &.{}) else &.{};
 
-    // The capability slugs we're looking to match. For `create_stack`
-    // the probe is fixed; for stack verbs we iterate the four
-    // specificity tiers; for `dispatch_harness` we iterate three.
-    var probe_buf: [4][]const u8 = undefined;
-    var probes: []const []const u8 = &.{};
-
-    var stack_specific_buf: [128]u8 = undefined;
-    var stack_wild_verb_buf: [64]u8 = undefined;
-    var stack_specific_wild_buf: [128]u8 = undefined;
-    switch (action) {
-        .create_stack => {
-            probe_buf[0] = "stack.create";
-            probe_buf[1] = "*";
-            probes = probe_buf[0..2];
-        },
-        .dispatch_harness => {
-            const provider = switch (target) {
-                .provider => |p| p,
-                else => return .{ .capability_denied = {} },
-            };
-            const specific = std.fmt.bufPrint(&stack_specific_buf, "provider.{s}", .{provider}) catch return .{ .capability_denied = {} };
-            probe_buf[0] = specific;
-            probe_buf[1] = "provider.*";
-            probe_buf[2] = "*";
-            probes = probe_buf[0..3];
-        },
-        else => {
-            const verb = action.stackVerb() orelse return .{ .capability_denied = {} };
-            const stack_name = switch (target) {
-                .stack => |s| s,
-                .stack_create => |s| s,
-                else => return .{ .capability_denied = {} },
-            };
-            const specific = std.fmt.bufPrint(&stack_specific_buf, "stack.{s}.{s}", .{ stack_name, verb }) catch return .{ .capability_denied = {} };
-            const specific_wild = std.fmt.bufPrint(&stack_specific_wild_buf, "stack.{s}.*", .{stack_name}) catch return .{ .capability_denied = {} };
-            const wild_verb = std.fmt.bufPrint(&stack_wild_verb_buf, "stack.*.{s}", .{verb}) catch return .{ .capability_denied = {} };
-            probe_buf[0] = specific;
-            probe_buf[1] = specific_wild;
-            probe_buf[2] = wild_verb;
-            probe_buf[3] = "*";
-            probes = probe_buf[0..4];
-        },
-    }
-
     for (caps) |c| {
         if (std.mem.eql(u8, c, "*")) return .{ .allow = {} };
-        for (probes) |p| if (std.mem.eql(u8, c, p)) return .{ .allow = {} };
+        switch (action) {
+            .create_stack => {
+                if (std.mem.eql(u8, c, "stack.create")) return .{ .allow = {} };
+            },
+            .dispatch_harness => {
+                const provider = switch (target) {
+                    .provider => |p| p,
+                    else => return .{ .capability_denied = {} },
+                };
+                if (matchesProviderCapability(c, provider)) return .{ .allow = {} };
+            },
+            else => {
+                const verb = action.stackVerb() orelse return .{ .capability_denied = {} };
+                const stack_name = switch (target) {
+                    .stack => |s| s,
+                    .stack_create => |s| s,
+                    else => return .{ .capability_denied = {} },
+                };
+                if (matchesStackCapability(c, stack_name, verb)) return .{ .allow = {} };
+            },
+        }
     }
     return .{ .capability_denied = {} };
+}
+
+fn matchesProviderCapability(cap: []const u8, provider: []const u8) bool {
+    const prefix = "provider.";
+    if (!std.mem.startsWith(u8, cap, prefix)) return false;
+    const name = cap[prefix.len..];
+    return std.mem.eql(u8, name, "*") or std.mem.eql(u8, name, provider);
+}
+
+fn matchesStackCapability(cap: []const u8, stack_name: []const u8, verb: []const u8) bool {
+    const prefix = "stack.";
+    if (!std.mem.startsWith(u8, cap, prefix)) return false;
+    const rest = cap[prefix.len..];
+    const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return false;
+    const cap_stack = rest[0..dot];
+    const cap_verb = rest[dot + 1 ..];
+    const stack_matches = std.mem.eql(u8, cap_stack, "*") or std.mem.eql(u8, cap_stack, stack_name);
+    const verb_matches = std.mem.eql(u8, cap_verb, "*") or std.mem.eql(u8, cap_verb, verb);
+    return stack_matches and verb_matches;
 }
 
 // ---------- unit tests ----------
@@ -304,6 +299,22 @@ test "evaluate: stack.<name>.* matches any verb for that stack" {
     try testing.expect(evaluate(id, .pause_stack, .{ .stack = "demo" }) == .allow);
     try testing.expect(evaluate(id, .update_stack_config, .{ .stack = "demo" }) == .allow);
     try testing.expect(evaluate(id, .append_item, .{ .stack = "other" }) == .capability_denied);
+}
+
+test "evaluate: long stack names are matched structurally" {
+    const a = testing.allocator;
+    const long_stack = "this-is-a-long-stack-name-that-used-to-overflow-the-fixed-policy-probe-buffer-because-it-keeps-going-past-one-hundred-twenty-eight-bytes";
+    const src = try std.fmt.allocPrint(a,
+        \\[identity.local]
+        \\capabilities = ["stack.{s}.append"]
+        \\
+    , .{long_stack});
+    defer a.free(src);
+    var cfg = try cfgFromToml(a, src);
+    defer cfg.deinit();
+    const id = resolveLocal(&cfg);
+    try testing.expect(evaluate(id, .append_item, .{ .stack = long_stack }) == .allow);
+    try testing.expect(evaluate(id, .cancel_item, .{ .stack = long_stack }) == .capability_denied);
 }
 
 test "evaluate: create_stack requires stack.create or *" {

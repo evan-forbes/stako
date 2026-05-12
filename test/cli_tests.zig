@@ -571,16 +571,8 @@ test "cli: auth status --json passes daemon body through unchanged" {
 
 test "cli: auth signout always exits non-zero with helpful note" {
     const a = std.testing.allocator;
-    var s = try Scratch.create(a, "auth-signout");
-    defer s.deinit();
-    try initNotesRoot(a, s.abs_path);
-
-    var drv = try buildDriver(a, s.abs_path);
-    defer drv.deinit();
-    // No serve() — signout never hits the daemon.
-    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
-
-    var r = try runCli(a, &.{ "auth", "signout", "anthropic", "--root", s.abs_path });
+    // No root setup and no daemon: signout is intentionally local-only.
+    var r = try runCli(a, &.{ "auth", "signout", "anthropic", "--root", "/path/that/does/not/exist" });
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 1), r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "signout not supported") != null);

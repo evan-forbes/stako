@@ -139,7 +139,9 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!Docume
             }
             if (i < source.len) {
                 if (source[i] == '\r') i += 1;
-                if (i < source.len and source[i] == '\n') i += 1;
+                if (i < source.len and source[i] == '\n') i += 1 else if (i < source.len) {
+                    return error.TrailingGarbage;
+                }
             }
             continue;
         }
@@ -374,4 +376,13 @@ test "parse datetime" {
     var doc = try parse(std.testing.allocator, src);
     defer doc.deinit();
     try std.testing.expectEqualStrings("2026-05-10T14:32:00Z", doc.entries.items[0].value.datetime);
+}
+
+test "parse table header rejects trailing garbage" {
+    const src =
+        \\[target] junk
+        \\provider = "anthropic"
+        \\
+    ;
+    try std.testing.expectError(error.TrailingGarbage, parse(std.testing.allocator, src));
 }

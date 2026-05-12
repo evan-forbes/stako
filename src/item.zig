@@ -123,6 +123,8 @@ pub const Item = struct {
     requires: ?Requires = null,
     sleep: ?Sleep = null,
     clear_present: bool = false,
+    sleep_has_body: bool = false,
+    clear_has_body: bool = false,
     result: ?Result = null,
 
     pub fn deinit(self: *Item) void {
@@ -207,8 +209,10 @@ pub fn parseSlice(
     const have_requires = doc.hasTable("requires");
 
     var sleep_until: ?[]const u8 = null;
+    var sleep_has_extra_body = false;
     const have_sleep_table = doc.hasTable("sleep");
 
+    var clear_has_body = false;
     const have_clear_table = doc.hasTable("clear");
 
     var result_obj = Result{};
@@ -283,9 +287,12 @@ pub fn parseSlice(
         } else if (std.mem.eql(u8, e.table, "sleep")) {
             if (std.mem.eql(u8, e.key, "until")) {
                 sleep_until = try arena.dupe(u8, try requireDatetime(e.value, "sleep.until", diag));
+            } else {
+                sleep_has_extra_body = true;
             }
         } else if (std.mem.eql(u8, e.table, "clear")) {
-            // clear table is empty per design — any keys here are ignored.
+            // clear table is empty per design; validation reports any body.
+            clear_has_body = true;
         } else if (std.mem.eql(u8, e.table, "result")) {
             if (std.mem.eql(u8, e.key, "harness")) {
                 result_obj.harness = try arena.dupe(u8, try requireString(e.value, "result.harness", diag));
@@ -330,7 +337,9 @@ pub fn parseSlice(
         }
         item.sleep = Sleep{ .until = sleep_until.? };
     }
+    item.sleep_has_body = sleep_has_extra_body;
     item.clear_present = have_clear_table;
+    item.clear_has_body = clear_has_body;
     if (have_result) item.result = result_obj;
 
     // Required-field check (kind-independent for top level).
@@ -543,10 +552,18 @@ pub fn validate(item: *const Item, diag: *ValidationDiagnostic) ValidationError!
                 diag.* = .{ .err = error.MissingTargetTable, .message = "prompt/review items require [target]", .field = "target" };
                 return error.MissingTargetTable;
             }
+            if (!targetHasAnyField(item.target.?)) {
+                diag.* = .{ .err = error.MissingTargetTable, .message = "target table must set at least one routing field", .field = "target" };
+                return error.MissingTargetTable;
+            }
         },
         .compact => {
             if (item.target == null) {
                 diag.* = .{ .err = error.MissingTargetTable, .message = "compact items require [target] (harness only)", .field = "target" };
+                return error.MissingTargetTable;
+            }
+            if (item.target.?.provider == null) {
+                diag.* = .{ .err = error.MissingTargetTable, .message = "compact items require target.provider as the harness", .field = "target.provider" };
                 return error.MissingTargetTable;
             }
         },
@@ -555,19 +572,30 @@ pub fn validate(item: *const Item, diag: *ValidationDiagnostic) ValidationError!
                 diag.* = .{ .err = error.MissingSleepTable, .message = "sleep items require [sleep] with `until`", .field = "sleep" };
                 return error.MissingSleepTable;
             }
+            if (item.sleep_has_body) {
+                diag.* = .{ .err = error.SleepHasBody, .message = "sleep table only accepts `until`", .field = "sleep" };
+                return error.SleepHasBody;
+            }
             if (!isRfc3339(item.sleep.?.until)) {
                 diag.* = .{ .err = error.InvalidDatetime, .message = "sleep.until must be RFC3339", .field = "sleep.until" };
                 return error.InvalidDatetime;
             }
         },
         .clear => {
-            // No structural requirements beyond top-level.
+            if (item.clear_has_body) {
+                diag.* = .{ .err = error.ClearHasBody, .message = "clear table must be empty", .field = "clear" };
+                return error.ClearHasBody;
+            }
         },
     }
 
     // Workdir presence is parsed but its allowlist check is deferred to
     // milestone 6 per the plan. The validator only confirms the field is a
     // string (already enforced by the parser).
+}
+
+fn targetHasAnyField(t: Target) bool {
+    return t.provider != null or t.model != null or t.match != null or t.workdir != null;
 }
 
 pub fn isValidId(id: []const u8) bool {
@@ -591,21 +619,24 @@ pub fn isValidSlug(slug: []const u8) bool {
     return true;
 }
 
-/// Minimal RFC3339 shape check: YYYY-MM-DDTHH:MM:SS(.fff)?(Z|[+-]HH:MM)
+/// RFC3339 profile check: YYYY-MM-DDTHH:MM:SS(.fff)?(Z|[+-]HH:MM).
+/// This validates numeric ranges, including leap-year February bounds, but
+/// intentionally does not validate leap seconds.
 pub fn isRfc3339(s: []const u8) bool {
     if (s.len < 20) return false;
-    // Date part
-    for (0..4) |i| if (!std.ascii.isDigit(s[i])) return false;
+    const year = parseFixedDigits(s, 0, 4) orelse return false;
     if (s[4] != '-') return false;
-    for (5..7) |i| if (!std.ascii.isDigit(s[i])) return false;
+    const month = parseFixedDigits(s, 5, 7) orelse return false;
     if (s[7] != '-') return false;
-    for (8..10) |i| if (!std.ascii.isDigit(s[i])) return false;
+    const day = parseFixedDigits(s, 8, 10) orelse return false;
+    if (!validDate(year, month, day)) return false;
     if (s[10] != 'T' and s[10] != 't' and s[10] != ' ') return false;
-    for (11..13) |i| if (!std.ascii.isDigit(s[i])) return false;
+    const hour = parseFixedDigits(s, 11, 13) orelse return false;
     if (s[13] != ':') return false;
-    for (14..16) |i| if (!std.ascii.isDigit(s[i])) return false;
+    const minute = parseFixedDigits(s, 14, 16) orelse return false;
     if (s[16] != ':') return false;
-    for (17..19) |i| if (!std.ascii.isDigit(s[i])) return false;
+    const second = parseFixedDigits(s, 17, 19) orelse return false;
+    if (hour > 23 or minute > 59 or second > 59) return false;
     var i: usize = 19;
     if (i < s.len and s[i] == '.') {
         i += 1;
@@ -619,12 +650,42 @@ pub fn isRfc3339(s: []const u8) bool {
     }
     if (s[i] == '+' or s[i] == '-') {
         if (i + 6 != s.len) return false;
-        for ((i + 1)..(i + 3)) |j| if (!std.ascii.isDigit(s[j])) return false;
+        const offset_hour = parseFixedDigits(s, i + 1, i + 3) orelse return false;
         if (s[i + 3] != ':') return false;
-        for ((i + 4)..(i + 6)) |j| if (!std.ascii.isDigit(s[j])) return false;
+        const offset_minute = parseFixedDigits(s, i + 4, i + 6) orelse return false;
+        if (offset_hour > 23 or offset_minute > 59) return false;
         return true;
     }
     return false;
+}
+
+fn parseFixedDigits(s: []const u8, start: usize, end: usize) ?u16 {
+    if (end > s.len or start >= end) return null;
+    var n: u16 = 0;
+    for (s[start..end]) |c| {
+        if (!std.ascii.isDigit(c)) return null;
+        n = n * 10 + @as(u16, c - '0');
+    }
+    return n;
+}
+
+fn validDate(year: u16, month: u16, day: u16) bool {
+    if (month < 1 or month > 12) return false;
+    if (day < 1) return false;
+    return day <= daysInMonth(year, month);
+}
+
+fn daysInMonth(year: u16, month: u16) u16 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) 29 else 28,
+        else => 0,
+    };
+}
+
+fn isLeapYear(year: u16) bool {
+    return (year % 4 == 0 and year % 100 != 0) or year % 400 == 0;
 }
 
 // ---------- unit tests (internal) ----------
@@ -658,4 +719,11 @@ test "isRfc3339" {
     try std.testing.expect(!isRfc3339("2026-05-10"));
     try std.testing.expect(!isRfc3339("yesterday"));
     try std.testing.expect(!isRfc3339("2026-05-10T14:32:00")); // missing offset
+    try std.testing.expect(!isRfc3339("2026-99-10T14:32:00Z"));
+    try std.testing.expect(!isRfc3339("2026-02-29T14:32:00Z"));
+    try std.testing.expect(isRfc3339("2028-02-29T14:32:00Z"));
+    try std.testing.expect(!isRfc3339("2026-05-10T24:32:00Z"));
+    try std.testing.expect(!isRfc3339("2026-05-10T14:60:00Z"));
+    try std.testing.expect(!isRfc3339("2026-05-10T14:32:00+24:00"));
+    try std.testing.expect(!isRfc3339("2026-05-10T14:32:00+02:60"));
 }

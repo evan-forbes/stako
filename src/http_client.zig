@@ -215,14 +215,19 @@ pub fn parseResponse(allocator: std.mem.Allocator, raw: []const u8) ClientError!
     const sp2 = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
     const code = std.fmt.parseInt(u16, after[0..sp2], 10) catch return error.BadResponse;
 
-    // Detect Transfer-Encoding: chunked.
+    // Detect Transfer-Encoding and Content-Length.
     var chunked = false;
+    var content_length: ?usize = null;
     var it = std.mem.splitSequence(u8, head, "\r\n");
     _ = it.next(); // skip status line
     while (it.next()) |line| {
-        if (asciiEqlIgnoreCase(line, "transfer-encoding: chunked")) {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        if (asciiEqlIgnoreCase(name, "transfer-encoding") and asciiEqlIgnoreCase(value, "chunked")) {
             chunked = true;
-            break;
+        } else if (asciiEqlIgnoreCase(name, "content-length")) {
+            content_length = std.fmt.parseInt(usize, value, 10) catch return error.BadResponse;
         }
     }
 
@@ -230,6 +235,9 @@ pub fn parseResponse(allocator: std.mem.Allocator, raw: []const u8) ClientError!
     var body_owned: []u8 = undefined;
     if (chunked) {
         body_owned = try decodeChunked(allocator, body_raw);
+    } else if (content_length) |len| {
+        if (body_raw.len < len) return error.BadResponse;
+        body_owned = try allocator.dupe(u8, body_raw[0..len]);
     } else {
         body_owned = try allocator.dupe(u8, body_raw);
     }
@@ -277,13 +285,20 @@ test "parseResponse: simple 200" {
     var r = try parseResponse(a, raw);
     defer r.deinit();
     try std.testing.expectEqual(@as(u16, 200), r.status);
-    // body includes everything past CRLFCRLF
-    try std.testing.expect(std.mem.startsWith(u8, r.body, "{\"ok\":true}"));
+    try std.testing.expectEqualStrings("{\"ok\":true}\r\n", r.body);
+}
+
+test "parseResponse: content-length trims trailing bytes" {
+    const a = std.testing.allocator;
+    const raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokignored";
+    var r = try parseResponse(a, raw);
+    defer r.deinit();
+    try std.testing.expectEqualStrings("ok", r.body);
 }
 
 test "parseResponse: 404 with JSON body" {
     const a = std.testing.allocator;
-    const raw = "HTTP/1.1 404 not found\r\ncontent-length: 33\r\n\r\n{\"error\":{\"code\":\"not_found\"}}";
+    const raw = "HTTP/1.1 404 not found\r\ncontent-length: 30\r\n\r\n{\"error\":{\"code\":\"not_found\"}}";
     var r = try parseResponse(a, raw);
     defer r.deinit();
     try std.testing.expectEqual(@as(u16, 404), r.status);

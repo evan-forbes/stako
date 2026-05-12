@@ -304,6 +304,7 @@ pub const Queue = struct {
                 .subject = out.commit_subject,
                 .body = out.commit_body,
             }) catch |e| {
+                vcs.rollbackPaths(self.allocator, self.notes_root_abs, sliceConst(out.paths)) catch {};
                 out.deinit();
                 req.err = switch (e) {
                     error.GitNotFound => .git_not_found,
@@ -365,6 +366,10 @@ fn computePreflightPaths(
         },
         .config_patch => |p| {
             const path = try std.fmt.allocPrint(allocator, "stacks/{s}/stack.toml", .{p.stack});
+            try out.append(allocator, path);
+        },
+        .insert_item => |inp| {
+            const path = try std.fmt.allocPrint(allocator, "stacks/{s}", .{inp.stack});
             try out.append(allocator, path);
         },
         .transition => |inp| {
