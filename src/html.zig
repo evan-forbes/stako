@@ -480,16 +480,23 @@ pub fn renderItem(
 }
 
 /// Walk transcript.jsonl line by line, render each parseable event as a
-/// `<li>` row. Lines that don't parse are skipped silently (the file may be
-/// being appended to while we read).
+/// `<li>` row. Lines that don't parse are skipped (the file may be being
+/// appended to while we read), but we surface the skipped count in a
+/// trailing `<li>` so a transcript full of malformed lines doesn't render
+/// identically to an empty transcript — otherwise a real diagnostic surface
+/// would silently disappear behind "No events recorded."
 fn renderTranscript(w: anytype, raw: []const u8) !void {
     const events = @import("events.zig");
     try w.writeAll("<ul class=\"transcript\">");
     var count: usize = 0;
+    var skipped: usize = 0;
     var it = std.mem.splitScalar(u8, raw, '\n');
     while (it.next()) |line| {
         if (line.len == 0) continue;
-        const p = events.parseEvent(line) orelse continue;
+        const p = events.parseEvent(line) orelse {
+            skipped += 1;
+            continue;
+        };
         try w.writeAll("<li><span class=\"transcript-kind\">");
         try escape(w, p.kind.toString());
         try w.writeAll("</span> <span class=\"transcript-ts\">");
@@ -505,7 +512,14 @@ fn renderTranscript(w: anytype, raw: []const u8) !void {
         try w.writeAll("</li>");
         count += 1;
     }
-    if (count == 0) try w.writeAll("<li><em>No events recorded.</em></li>");
+    if (count == 0 and skipped == 0) {
+        try w.writeAll("<li><em>No events recorded.</em></li>");
+    } else if (skipped > 0) {
+        try w.print(
+            "<li class=\"transcript-skipped\"><em>({d} unparseable line{s} skipped)</em></li>",
+            .{ skipped, if (skipped == 1) "" else "s" },
+        );
+    }
     try w.writeAll("</ul>");
 }
 

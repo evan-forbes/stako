@@ -32,6 +32,11 @@ const EXPECTED_DIR = "test/fixtures/html";
 /// `<name>.actual` next to the expected file so a failure leaves a diffable
 /// artifact. When `ORGANO_UPDATE_HTML_SNAPSHOTS=1` is set, overwrite the
 /// expected file instead.
+///
+/// `.actual` files are intentionally truncated/regenerated on every run and
+/// kept gitignored (see `.gitignore`). They are NOT cleaned up at test end
+/// because a developer who just saw a mismatch wants to `diff` against the
+/// last `.actual`. Treat them as scratch output, not state to leak.
 fn assertSnapshot(allocator: std.mem.Allocator, expected_name: []const u8, actual: []const u8) !void {
     try std.fs.cwd().makePath(EXPECTED_DIR);
     const expected_path = try std.fs.path.join(allocator, &.{ EXPECTED_DIR, expected_name });
@@ -659,6 +664,251 @@ test "daemon: POST /pause with valid form token succeeds" {
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
     try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"ok\":true") != null);
+}
+
+// ---------- additional snapshot coverage (m9 audit) ----------
+
+test "html snapshot: index (many stacks)" {
+    // Audit coverage gap #8: a many-stack snapshot to pin the `<ul>`
+    // rendering for index pages with more than one entry. Locks in element
+    // ordering and href-vs-text escaping for repeated rows.
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    const stacks = [_][]const u8{ "alpha", "default", "smoke", "z-many-stacks" };
+    try html.renderIndex(a, &out, &stacks);
+    try assertSnapshot(a, "index_many.html", out.items);
+}
+
+test "html snapshot: paused stack" {
+    // Audit coverage gap #1: a paused-stack snapshot to pin the resume-form
+    // branch of `writeStackControls` plus the `<span class="badge
+    // status-paused">paused</span>` chip in the config-summary table.
+    const a = std.testing.allocator;
+    var cfg: stack_config_mod.StackConfig = .{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .paused = true,
+        .continuity = .chain,
+        .max_concurrent_per_stack = 1,
+    };
+    defer cfg.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderStack(a, &out, .{
+        .name = "paused-fixture",
+        .config = &cfg,
+        .items = &.{},
+        .running_count = 0,
+        .local_token = "deadbeefdeadbeefdeadbeefdeadbeef",
+    });
+    try assertSnapshot(a, "stack_paused.html", out.items);
+
+    // Light structural assertions on top of the byte-snapshot: the resume
+    // form (not the pause form) MUST surface, and the paused badge MUST
+    // appear in the config block.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/paused-fixture/resume\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/paused-fixture/pause\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Resume stack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<span class=\"badge status-paused\">paused</span>") != null);
+}
+
+test "html snapshot: blocked item with retry control" {
+    // Audit coverage gap #2: a blocked-status item snapshot exercises both
+    // the `show_retry` branch of `writeItemControls` and the
+    // `blocked_reason` KV row that the running/queued fixtures don't reach.
+    const a = std.testing.allocator;
+    var item: item_mod.Item = .{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0003",
+        .slug = "blocked-fixture",
+        .kind = .prompt,
+        .status = .blocked,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:05:00Z",
+        .blocked_reason = "session manager not running",
+    };
+    defer item.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderItem(a, &out, .{
+        .stack = "smoke",
+        .item = &item,
+        .prompt_body = "Try again once the harness is up.",
+        .transcript_jsonl = null,
+        .enable_sse = false,
+        .local_token = "0123456789abcdef0123456789abcdef",
+    });
+    try assertSnapshot(a, "item_blocked.html", out.items);
+
+    // Structural sanity checks alongside the snapshot.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/items/0003/cancel\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/items/0003/retry\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Retry item") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "blocked_reason") != null);
+}
+
+test "html snapshot: item with sse enabled" {
+    // Audit coverage gap #3: pin the inline SSE bootstrap so accidental
+    // edits to the JS template are caught. Two dynamic insertions live in
+    // that block (stack name + item id) and they must stay escaped.
+    const a = std.testing.allocator;
+    var root = try SmokeRoot.create(a, "item-sse-snapshot");
+    defer root.deinit();
+    var reader = try storage.Reader.init(a, root.abs_path);
+    defer reader.deinit();
+    var item = try reader.readItem("smoke", "0001");
+    defer item.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderItem(a, &out, .{
+        .stack = "smoke",
+        .item = &item,
+        .prompt_body = null,
+        .transcript_jsonl = null,
+        .enable_sse = true,
+    });
+    try assertSnapshot(a, "item_sse.html", out.items);
+
+    // Sanity: the SSE script subscribes to the stack-level event stream
+    // and embeds the item id as a JS string literal.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "new EventSource(\"/stacks/smoke/events\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "var itemId =\"0001\"") != null);
+}
+
+test "renderItem: multi-parent items render comma-joined anchor list" {
+    // Audit coverage gap #5: the smoke fixture exercises a single-parent
+    // item only. With two parents the loop emits a ", " separator and one
+    // anchor per id — confirm both anchors render with escaped hrefs and
+    // visible text.
+    const a = std.testing.allocator;
+    var item: item_mod.Item = .{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0099",
+        .slug = "fanin",
+        .kind = .prompt,
+        .status = .queued,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer item.deinit();
+    const aa = item.arena.allocator();
+    const parents = try aa.alloc([]const u8, 2);
+    parents[0] = "0001";
+    parents[1] = "0042";
+    item.parents = parents;
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderItem(a, &out, .{
+        .stack = "smoke",
+        .item = &item,
+        .prompt_body = null,
+        .transcript_jsonl = null,
+        .enable_sse = false,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "href=\"/stacks/smoke/items/0001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "href=\"/stacks/smoke/items/0042\"") != null);
+    // The two anchors must be separated by a literal comma-space, not
+    // squished or duplicated.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "</a>, <a href=\"/stacks/smoke/items/0042\"") != null);
+}
+
+test "renderTranscript: malformed-only transcript surfaces skipped count" {
+    // Audit Important #1: a transcript file with only unparseable bytes
+    // must not render identically to an empty file. The renderer's
+    // "(N unparseable lines skipped)" trailing row gives the user a real
+    // diagnostic surface instead of a misleading "No events recorded."
+    const a = std.testing.allocator;
+    var item: item_mod.Item = .{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0001",
+        .slug = "corrupt",
+        .kind = .prompt,
+        .status = .running,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer item.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderItem(a, &out, .{
+        .stack = "smoke",
+        .item = &item,
+        .prompt_body = null,
+        .transcript_jsonl = "not-json\n{also not}\nbroken\n",
+        .enable_sse = false,
+    });
+
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "unparseable line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "3 unparseable lines skipped") != null);
+    // And the misleading "No events recorded." branch MUST NOT fire when
+    // skipped > 0.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "No events recorded") == null);
+}
+
+test "daemon: HTML stack page includes CSP header" {
+    // Audit coverage gap #7: CSP is asserted for `/` but not for the
+    // per-stack or per-item HTML routes. The header is set by a single
+    // helper (`respondHtml`), so this is a defensive pin against a future
+    // refactor that adds a new HTML response path bypassing the helper.
+    const a = std.testing.allocator;
+    var root = try buildInitializedRoot(a, "stack-csp");
+    defer root.deinit();
+    var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
+    defer drv.deinit();
+    try drv.serve(1);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
+        "GET /stacks/smoke HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "content-security-policy:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "form-action 'self'") != null);
+}
+
+test "daemon: HTML item page includes CSP header" {
+    // Companion to the stack-page CSP test; same rationale.
+    const a = std.testing.allocator;
+    var root = try buildInitializedRoot(a, "item-csp");
+    defer root.deinit();
+    var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
+    defer drv.deinit();
+    try drv.serve(1);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
+        "GET /stacks/smoke/items/0001 HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "content-security-policy:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "form-action 'self'") != null);
+}
+
+test "daemon: HTML stack page is open to malicious-looking stack-name lookups" {
+    // Audit coverage gap #4 (server-side complement): a hostile-looking
+    // stack name in the URL is validated by `isValidStackName` and rejected
+    // with `validation_failed` long before reaching the renderer — i.e. the
+    // HTML escape path doesn't need to defend against names containing
+    // `<>"&` because the storage layer never lets such names exist. Pin
+    // that behavior so a future relaxation of `isValidStackName` is forced
+    // to re-confront the escape contract.
+    const a = std.testing.allocator;
+    var root = try buildInitializedRoot(a, "html-hostile-name");
+    defer root.deinit();
+    var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
+    defer drv.deinit();
+    try drv.serve(1);
+    // `%3Cscript%3E` → `<script>` after percent decode. The daemon's
+    // router does its own normalization; the validator rejects bytes
+    // outside `[a-zA-Z0-9_-]`.
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
+        "GET /stacks/%3Cscript%3E HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    // Either a 400-class rejection or a 404; what matters is that no
+    // `<script>` bytes survive into the response body.
+    try std.testing.expect(parsed.status >= 400);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "<script>") == null);
 }
 
 test "daemon: HTML stack page embeds working pause form" {

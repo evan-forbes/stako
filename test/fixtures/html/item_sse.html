@@ -1,0 +1,20 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>item: smoke / 0001</title><link rel="stylesheet" href="/static/style.css"></head><body><nav class="crumbs"><a href="/">home</a> / stacks / <a href="/stacks/smoke">smoke</a> / items / 0001</nav><header><h1>0001 — hello</h1></header><dl class="kv"><dt>kind</dt><dd>prompt</dd><dt>status</dt><dd><span class="badge status-running" data-status>running</span></dd><dt>created_at</dt><dd>2026-05-10T14:00:00Z</dd><dt>updated_at</dt><dd>2026-05-10T14:00:00Z</dd><dt>target</dt><dd>provider=anthropic, model=claude-opus-4-7, match=exact</dd></dl><h2>Transcript</h2><p><em>No transcript yet.</em></p><script>(function(){
+  var es = new EventSource("/stacks/smoke/events");  var transcriptUl = document.querySelector("ul.transcript") || (function(){var u=document.createElement("ul");u.className="transcript";var h=document.querySelectorAll("h2");(h[h.length-1]||document.body).insertAdjacentElement("afterend",u);return u;})();
+  var statusEl = document.querySelector("[data-status]");
+  var itemId ="0001";  es.onmessage = function(ev){
+    try {
+      var d = JSON.parse(ev.data);
+      if (d.item && d.item !== itemId) return;
+      if (d.kind === "item_status" && statusEl && d.data && d.data.to) {
+        statusEl.textContent = d.data.to;
+        statusEl.className = "badge status-" + d.data.to;
+      } else {
+        var li = document.createElement("li");
+        var ks = document.createElement("span"); ks.className = "transcript-kind"; ks.textContent = d.kind;
+        var ts = document.createElement("span"); ts.className = "transcript-ts"; ts.textContent = " " + (d.ts||"");
+        li.appendChild(ks); li.appendChild(ts);
+        transcriptUl.appendChild(li);
+      }
+    } catch (e) {}
+  };
+})();</script><footer>organo daemon</footer></body></html>
