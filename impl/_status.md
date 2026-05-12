@@ -27,7 +27,7 @@ Second pass: full-module audit (correctness, test coverage, readability, DRY/KIS
 
 | # | Plan | Audit doc | Blocking | Important | Minor | Fix SHA | Retry SHA | Unresolved | Notes |
 |---|---|---|---|---|---|---|---|---|---|
-| 1 | 01_item_format.md | _audit_01.md | — | — | — | — | — | — | pending |
+| 1 | 01_item_format.md | _audit_01.md | 0 | 3 | 11 | 36dd8e5 | — | 0 | 3/3 important, 6/7 coverage added (1 terminal-result asymmetry deferred), 1/11 minor; 358/358 tests |
 | 2 | 02_init_and_layout.md | _audit_02.md | — | — | — | — | — | — | pending |
 | 3 | 03_daemon_skeleton.md | _audit_03.md | — | — | — | — | — | — | pending |
 | 4 | 04_cli_read.md | _audit_04.md | — | — | — | — | — | — | pending |
