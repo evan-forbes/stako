@@ -844,3 +844,198 @@ test "daemon: stop returns not_running and cleans pidfile when pid is dead" {
     const info = try daemon_mod.readPidFile(a, s.abs_path);
     try std.testing.expect(info == null);
 }
+
+// ---------- F3 (follow-up): HTTP plumbing coverage ----------
+//
+// These tests pin daemon-layer behavior that previously had no direct
+// regression coverage: pidfile recovery from a dead-pid sentinel, the
+// daemon's response to chunked transfer-encoding, content-length=0 on a
+// mutation route, body-too-large rejection, and case-insensitive
+// Authorization header matching. They focus on the public HTTP surface
+// (request → response → audit/disk side effects), not internal
+// daemon-struct shape, so they survive future routing refactors.
+
+fn writeStalePidFile(a: std.mem.Allocator, root: []const u8, pid: i32) !void {
+    const dir = try std.fs.path.join(a, &.{ root, ".stako" });
+    defer a.free(dir);
+    try std.fs.cwd().makePath(dir);
+    const pid_path = try std.fs.path.join(a, &.{ dir, "daemon.pid" });
+    defer a.free(pid_path);
+    var f = try std.fs.cwd().createFile(pid_path, .{ .truncate = true, .mode = 0o600 });
+    defer f.close();
+    var buf: [64]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{d}\n0\n0\n", .{pid});
+    try f.writeAll(out);
+}
+
+test "F3: stale pidfile pointing at a dead pid is recovered on startup" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "stale-pid-dead");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    // 2^31 - 2: not a live pid on any practical system.
+    try writeStalePidFile(a, s.abs_path, 2147483646);
+
+    // Start should succeed (the writePidFile path treats the existing
+    // pidfile as stale once isProcessAlive returns false) and overwrite
+    // the file with this process's pid.
+    var d = try daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = false,
+    });
+    defer {
+        d.deinit();
+        daemon_mod.removePidFile(a, s.abs_path) catch {};
+    }
+    const info = try daemon_mod.readPidFile(a, s.abs_path);
+    try std.testing.expect(info != null);
+    try std.testing.expect(info.?.pid != 2147483646);
+    try std.testing.expectEqual(d.bound_port, info.?.port);
+}
+
+test "F3: stale pidfile pointing at a live unrelated pid refuses startup" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "stale-pid-live");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    // PID 1 is always alive on Linux; kill(1, 0) returns EPERM, which
+    // isProcessAlive maps to "alive". The daemon must NOT clobber a
+    // pidfile that names an unrelated live process.
+    try writeStalePidFile(a, s.abs_path, 1);
+    defer daemon_mod.removePidFile(a, s.abs_path) catch {};
+
+    try std.testing.expectError(error.AlreadyRunning, daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = false,
+    }));
+
+    // The pidfile is unchanged — refusing didn't truncate it.
+    const info = try daemon_mod.readPidFile(a, s.abs_path);
+    try std.testing.expect(info != null);
+    try std.testing.expectEqual(@as(std.posix.pid_t, 1), info.?.pid);
+}
+
+test "F3: pins behavior for Transfer-Encoding: chunked on POST" {
+    // Daemon has no first-class chunked handling — what comes back is
+    // whatever Zig's std.http.Server decides. This test does NOT assert
+    // a specific status; it asserts that the request completes cleanly
+    // (does not hang, does not crash, returns *some* HTTP response) so
+    // a regression that breaks the framing path is caught.
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "te-chunked");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    // POST to a GET-only route with a valid empty chunked body. Any
+    // sensible response is acceptable (405 / 400 / 411 / 200 — all
+    // legitimate framings); the assertion is "we got a response".
+    const req = "POST /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expect(parsed.status >= 200 and parsed.status < 600);
+}
+
+test "F3: POST with Content-Length: 0 on a mutation route handled cleanly" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "cl-zero");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedDemoStack(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    // POST /stacks/demo/resume is a no-body mutation — Content-Length: 0
+    // should reach the handler, which (with default identity caps = "*")
+    // applies the resume mutation. The assertion is "no 500/crash"; the
+    // exact 2xx/4xx is recorded for the regression guard.
+    const token = drv.daemon.token.bytes;
+    const req = try std.fmt.allocPrint(a,
+        "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Length: 0\r\n\r\n",
+        .{token});
+    defer a.free(req);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expect(parsed.status < 500);
+}
+
+test "F3: request body exceeding MAX_BODY_BYTES is rejected with 400 validation_failed" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "body-too-large");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedDemoStack(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(1);
+    const token = drv.daemon.token.bytes;
+    // MAX_BODY_BYTES is 256 KiB; send 300 KiB of 'a' to comfortably
+    // exceed it. The body is intentionally not JSON — the body-size
+    // gate must fire before parse.
+    const body_size: usize = 300 * 1024;
+    const body = try a.alloc(u8, body_size);
+    defer a.free(body);
+    @memset(body, 'a');
+    const head = try std.fmt.allocPrint(a,
+        "POST /stacks/demo/items HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n",
+        .{ token, body_size });
+    defer a.free(head);
+    const req = try a.alloc(u8, head.len + body.len);
+    defer a.free(req);
+    @memcpy(req[0..head.len], head);
+    @memcpy(req[head.len..], body);
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+    defer a.free(resp);
+    const parsed = splitResponse(resp);
+    try std.testing.expectEqual(@as(u16, 400), parsed.status);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "\"code\":\"validation_failed\"") != null);
+}
+
+test "F3: Authorization header lookup is case-insensitive in both name and scheme" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "header-case");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedDemoStack(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(2);
+    const token = drv.daemon.token.bytes;
+
+    // Lowercase header name + lowercase scheme.
+    {
+        const req = try std.fmt.allocPrint(a,
+            "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nauthorization: bearer {s}\r\nContent-Length: 0\r\n\r\n",
+            .{token});
+        defer a.free(req);
+        const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+        defer a.free(resp);
+        const parsed = splitResponse(resp);
+        // Must NOT be 401 — auth would have failed with the case-sensitive
+        // header check that used to live here.
+        try std.testing.expect(parsed.status != 401);
+        try std.testing.expect(parsed.status != 403);
+    }
+
+    // ALLCAPS header name + canonical scheme.
+    {
+        const req = try std.fmt.allocPrint(a,
+            "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAUTHORIZATION: Bearer {s}\r\nContent-Length: 0\r\n\r\n",
+            .{token});
+        defer a.free(req);
+        const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
+        defer a.free(resp);
+        const parsed = splitResponse(resp);
+        try std.testing.expect(parsed.status != 401);
+        try std.testing.expect(parsed.status != 403);
+    }
+}
