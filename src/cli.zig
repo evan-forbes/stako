@@ -32,6 +32,45 @@ pub const UsageError = error{
     OutOfMemory,
 };
 
+fn nextFlagValue(args: []const []const u8, index: *usize) UsageError![]const u8 {
+    if (index.* + 1 >= args.len) return error.BadFlagValue;
+    index.* += 1;
+    return args[index.*];
+}
+
+fn flagValue(
+    args: []const []const u8,
+    index: *usize,
+    long: []const u8,
+    short: ?[]const u8,
+    long_eq: []const u8,
+) UsageError!?[]const u8 {
+    const a = args[index.*];
+    if (std.mem.eql(u8, a, long) or (short != null and std.mem.eql(u8, a, short.?))) {
+        return try nextFlagValue(args, index);
+    }
+    if (std.mem.startsWith(u8, a, long_eq)) return a[long_eq.len..];
+    return null;
+}
+
+fn parsePort(v: []const u8) UsageError!u16 {
+    return std.fmt.parseInt(u16, v, 10) catch error.BadFlagValue;
+}
+
+fn Alias(comptime T: type) type {
+    return struct {
+        name: []const u8,
+        value: T,
+    };
+}
+
+fn matchAlias(comptime T: type, s: []const u8, comptime aliases: []const Alias(T)) ?T {
+    inline for (aliases) |a| {
+        if (std.mem.eql(u8, s, a.name)) return a.value;
+    }
+    return null;
+}
+
 pub const Subcommand = enum {
     init,
     daemon,
@@ -41,11 +80,16 @@ pub const Subcommand = enum {
     /// Accepts the canonical name and the short alias documented in
     /// `todos/implement_cli_client.md`.
     pub fn fromString(s: []const u8) ?Subcommand {
-        if (std.mem.eql(u8, s, "init")) return .init;
-        if (std.mem.eql(u8, s, "daemon") or std.mem.eql(u8, s, "d")) return .daemon;
-        if (std.mem.eql(u8, s, "stack") or std.mem.eql(u8, s, "s")) return .stack;
-        if (std.mem.eql(u8, s, "auth") or std.mem.eql(u8, s, "a")) return .auth;
-        return null;
+        const aliases = [_]Alias(Subcommand){
+            .{ .name = "init", .value = .init },
+            .{ .name = "daemon", .value = .daemon },
+            .{ .name = "d", .value = .daemon },
+            .{ .name = "stack", .value = .stack },
+            .{ .name = "s", .value = .stack },
+            .{ .name = "auth", .value = .auth },
+            .{ .name = "a", .value = .auth },
+        };
+        return matchAlias(Subcommand, s, &aliases);
     }
 };
 
@@ -56,10 +100,13 @@ pub const DaemonAction = enum {
 
     /// `st` is the short alias for `status` per the design doc.
     pub fn fromString(s: []const u8) ?DaemonAction {
-        if (std.mem.eql(u8, s, "start")) return .start;
-        if (std.mem.eql(u8, s, "stop")) return .stop;
-        if (std.mem.eql(u8, s, "status") or std.mem.eql(u8, s, "st")) return .status;
-        return null;
+        const aliases = [_]Alias(DaemonAction){
+            .{ .name = "start", .value = .start },
+            .{ .name = "stop", .value = .stop },
+            .{ .name = "status", .value = .status },
+            .{ .name = "st", .value = .status },
+        };
+        return matchAlias(DaemonAction, s, &aliases);
     }
 };
 
@@ -81,20 +128,11 @@ pub fn parseDaemonArgs(args: []const []const u8) UsageError!DaemonArgs {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--root") or std.mem.eql(u8, a, "-r")) {
-            if (i + 1 >= args.len) return error.BadFlagValue;
-            i += 1;
-            out.root = args[i];
-        } else if (std.mem.startsWith(u8, a, "--root=")) {
-            out.root = a["--root=".len..];
+        if (try flagValue(args, &i, "--root", "-r", "--root=")) |v| {
+            out.root = v;
             if (out.root.len == 0) return error.BadFlagValue;
-        } else if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
-            if (i + 1 >= args.len) return error.BadFlagValue;
-            i += 1;
-            out.port_override = std.fmt.parseInt(u16, args[i], 10) catch return error.BadFlagValue;
-        } else if (std.mem.startsWith(u8, a, "--port=")) {
-            const v = a["--port=".len..];
-            out.port_override = std.fmt.parseInt(u16, v, 10) catch return error.BadFlagValue;
+        } else if (try flagValue(args, &i, "--port", "-p", "--port=")) |v| {
+            out.port_override = try parsePort(v);
         } else if (std.mem.eql(u8, a, "--foreground")) {
             out.foreground = true;
         } else {
@@ -125,12 +163,8 @@ pub fn parseInitArgs(args: []const []const u8) UsageError!InitArgs {
             out.yes = true;
         } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
             out.quiet = true;
-        } else if (std.mem.eql(u8, a, "--root") or std.mem.eql(u8, a, "-r")) {
-            if (i + 1 >= args.len) return error.BadFlagValue;
-            i += 1;
-            out.root = args[i];
-        } else if (std.mem.startsWith(u8, a, "--root=")) {
-            out.root = a["--root=".len..];
+        } else if (try flagValue(args, &i, "--root", "-r", "--root=")) |v| {
+            out.root = v;
             if (out.root.len == 0) return error.BadFlagValue;
         } else if (std.mem.startsWith(u8, a, "--now=")) {
             const v = a["--now=".len..];
@@ -176,18 +210,29 @@ pub const StackAction = enum {
     @"resume",
 
     pub fn fromString(s: []const u8) ?StackAction {
-        if (std.mem.eql(u8, s, "list") or std.mem.eql(u8, s, "ls")) return .list;
-        if (std.mem.eql(u8, s, "show") or std.mem.eql(u8, s, "sh")) return .show;
-        if (std.mem.eql(u8, s, "config") or std.mem.eql(u8, s, "cfg")) return .config;
-        if (std.mem.eql(u8, s, "new")) return .new;
-        if (std.mem.eql(u8, s, "add")) return .add;
-        if (std.mem.eql(u8, s, "insert") or std.mem.eql(u8, s, "ins")) return .insert;
-        if (std.mem.eql(u8, s, "retry") or std.mem.eql(u8, s, "rt")) return .retry;
-        if (std.mem.eql(u8, s, "cancel") or std.mem.eql(u8, s, "cx")) return .cancel;
-        if (std.mem.eql(u8, s, "supersede") or std.mem.eql(u8, s, "sup")) return .supersede;
-        if (std.mem.eql(u8, s, "pause") or std.mem.eql(u8, s, "p")) return .pause;
-        if (std.mem.eql(u8, s, "resume") or std.mem.eql(u8, s, "r")) return .@"resume";
-        return null;
+        const aliases = [_]Alias(StackAction){
+            .{ .name = "list", .value = .list },
+            .{ .name = "ls", .value = .list },
+            .{ .name = "show", .value = .show },
+            .{ .name = "sh", .value = .show },
+            .{ .name = "config", .value = .config },
+            .{ .name = "cfg", .value = .config },
+            .{ .name = "new", .value = .new },
+            .{ .name = "add", .value = .add },
+            .{ .name = "insert", .value = .insert },
+            .{ .name = "ins", .value = .insert },
+            .{ .name = "retry", .value = .retry },
+            .{ .name = "rt", .value = .retry },
+            .{ .name = "cancel", .value = .cancel },
+            .{ .name = "cx", .value = .cancel },
+            .{ .name = "supersede", .value = .supersede },
+            .{ .name = "sup", .value = .supersede },
+            .{ .name = "pause", .value = .pause },
+            .{ .name = "p", .value = .pause },
+            .{ .name = "resume", .value = .@"resume" },
+            .{ .name = "r", .value = .@"resume" },
+        };
+        return matchAlias(StackAction, s, &aliases);
     }
 };
 
@@ -199,6 +244,28 @@ pub const ApiFlags = struct {
     json: bool = false,
     verbose: bool = false,
 };
+
+fn parseApiFlag(args: []const []const u8, index: *usize, flags: *ApiFlags) UsageError!bool {
+    const a = args[index.*];
+    if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-j")) {
+        flags.json = true;
+        return true;
+    }
+    if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
+        flags.verbose = true;
+        return true;
+    }
+    if (try flagValue(args, index, "--root", "-r", "--root=")) |v| {
+        flags.root = v;
+        if (flags.root.len == 0) return error.BadFlagValue;
+        return true;
+    }
+    if (try flagValue(args, index, "--port", "-p", "--port=")) |v| {
+        flags.port_override = try parsePort(v);
+        return true;
+    }
+    return false;
+}
 
 pub const StackArgs = struct {
     action: StackAction,
@@ -238,82 +305,27 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         // Global flags shared by every action.
-        if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-j")) {
-            out.flags.json = true;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
-            out.flags.verbose = true;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--root") or std.mem.eql(u8, a, "-r")) {
-            if (i + 1 >= args.len) return error.BadFlagValue;
-            i += 1;
-            out.flags.root = args[i];
-            continue;
-        }
-        if (std.mem.startsWith(u8, a, "--root=")) {
-            out.flags.root = a["--root=".len..];
-            if (out.flags.root.len == 0) return error.BadFlagValue;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
-            if (i + 1 >= args.len) return error.BadFlagValue;
-            i += 1;
-            out.flags.port_override = std.fmt.parseInt(u16, args[i], 10) catch return error.BadFlagValue;
-            continue;
-        }
-        if (std.mem.startsWith(u8, a, "--port=")) {
-            const v = a["--port=".len..];
-            out.flags.port_override = std.fmt.parseInt(u16, v, 10) catch return error.BadFlagValue;
-            continue;
-        }
+        if (try parseApiFlag(args, &i, &out.flags)) continue;
 
         // Action-specific flags.
         if (out.action == .add or out.action == .insert) {
-            if (std.mem.eql(u8, a, "--target") or std.mem.eql(u8, a, "-t")) {
-                if (i + 1 >= args.len) return error.BadFlagValue;
-                i += 1;
-                out.target = args[i];
+            if (try flagValue(args, &i, "--target", "-t", "--target=")) |v| {
+                out.target = v;
                 continue;
             }
-            if (std.mem.startsWith(u8, a, "--target=")) {
-                out.target = a["--target=".len..];
+            if (try flagValue(args, &i, "--prompt-file", "-f", "--prompt-file=")) |v| {
+                out.prompt_file = v;
                 continue;
             }
-            if (std.mem.eql(u8, a, "--prompt-file") or std.mem.eql(u8, a, "-f")) {
-                if (i + 1 >= args.len) return error.BadFlagValue;
-                i += 1;
-                out.prompt_file = args[i];
-                continue;
-            }
-            if (std.mem.startsWith(u8, a, "--prompt-file=")) {
-                out.prompt_file = a["--prompt-file=".len..];
-                continue;
-            }
-            if (std.mem.eql(u8, a, "--slug")) {
-                if (i + 1 >= args.len) return error.BadFlagValue;
-                i += 1;
-                out.slug = args[i];
-                continue;
-            }
-            if (std.mem.startsWith(u8, a, "--slug=")) {
-                out.slug = a["--slug=".len..];
+            if (try flagValue(args, &i, "--slug", null, "--slug=")) |v| {
+                out.slug = v;
                 continue;
             }
         }
         if (out.action == .config) {
-            if (std.mem.eql(u8, a, "--set") or std.mem.eql(u8, a, "-s")) {
-                if (i + 1 >= args.len) return error.BadFlagValue;
-                i += 1;
+            if (try flagValue(args, &i, "--set", "-s", "--set=")) |v| {
                 if (out.set_count >= out.set_pairs.len) return error.BadFlagValue;
-                out.set_pairs[out.set_count] = args[i];
-                out.set_count += 1;
-                continue;
-            }
-            if (std.mem.startsWith(u8, a, "--set=")) {
-                if (out.set_count >= out.set_pairs.len) return error.BadFlagValue;
-                out.set_pairs[out.set_count] = a["--set=".len..];
+                out.set_pairs[out.set_count] = v;
                 out.set_count += 1;
                 continue;
             }
@@ -396,9 +408,13 @@ pub const AuthAction = enum {
     signout,
 
     pub fn fromString(s: []const u8) ?AuthAction {
-        if (std.mem.eql(u8, s, "status") or std.mem.eql(u8, s, "st")) return .status;
-        if (std.mem.eql(u8, s, "signout") or std.mem.eql(u8, s, "out")) return .signout;
-        return null;
+        const aliases = [_]Alias(AuthAction){
+            .{ .name = "status", .value = .status },
+            .{ .name = "st", .value = .status },
+            .{ .name = "signout", .value = .signout },
+            .{ .name = "out", .value = .signout },
+        };
+        return matchAlias(AuthAction, s, &aliases);
     }
 };
 
@@ -422,36 +438,7 @@ pub fn parseAuthArgs(args: []const []const u8) UsageError!AuthArgs {
     while (i < args.len) : (i += 1) {
         const a = args[i];
         // Shared API flags.
-        if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-j")) {
-            out.flags.json = true;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
-            out.flags.verbose = true;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--root") or std.mem.eql(u8, a, "-r")) {
-            if (i + 1 >= args.len) return error.BadFlagValue;
-            i += 1;
-            out.flags.root = args[i];
-            continue;
-        }
-        if (std.mem.startsWith(u8, a, "--root=")) {
-            out.flags.root = a["--root=".len..];
-            if (out.flags.root.len == 0) return error.BadFlagValue;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--port") or std.mem.eql(u8, a, "-p")) {
-            if (i + 1 >= args.len) return error.BadFlagValue;
-            i += 1;
-            out.flags.port_override = std.fmt.parseInt(u16, args[i], 10) catch return error.BadFlagValue;
-            continue;
-        }
-        if (std.mem.startsWith(u8, a, "--port=")) {
-            const v = a["--port=".len..];
-            out.flags.port_override = std.fmt.parseInt(u16, v, 10) catch return error.BadFlagValue;
-            continue;
-        }
+        if (try parseApiFlag(args, &i, &out.flags)) continue;
         if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
 
         // Positionals.

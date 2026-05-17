@@ -20,7 +20,13 @@
 
 const std = @import("std");
 const adapter = @import("adapter.zig");
+const adapter_json = @import("adapter_json.zig");
 const events = @import("events.zig");
+
+const stripEol = adapter_json.stripEol;
+const findStringValue = adapter_json.findStringValue;
+const findObjectValue = adapter_json.findObjectValue;
+const jsonEscape = adapter_json.jsonEscape;
 
 pub const State = struct {
     /// Most-recent session_id parsed from `session_started.data.session`.
@@ -53,9 +59,7 @@ const vtable: adapter.Adapter.VTable = .{
 
 fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) anyerror![]adapter.OwnedEvent {
     const st: *State = @ptrCast(@alignCast(impl));
-    var line = raw;
-    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+    const line = stripEol(raw);
     if (line.len == 0) return allocator.alloc(adapter.OwnedEvent, 0);
 
     // Extract `kind` (string) and `data` (object substring) directly from
@@ -91,9 +95,7 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
 
 fn parseStderrLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) anyerror![]adapter.OwnedEvent {
     const st: *State = @ptrCast(@alignCast(impl));
-    var line = raw;
-    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+    const line = stripEol(raw);
     if (line.len == 0) return allocator.alloc(adapter.OwnedEvent, 0);
     // Wrap as a non-terminal error event. Attach the captured session id so
     // the event is self-describing even before session_manager rewrites the
@@ -176,70 +178,6 @@ fn emitError(allocator: std.mem.Allocator, slug: []const u8) ![]adapter.OwnedEve
         .storage = storage,
     };
     return arr;
-}
-
-fn findStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    const idx = std.mem.indexOf(u8, src, key_with_colon) orelse return null;
-    var i = idx + key_with_colon.len;
-    while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-    if (i >= src.len or src[i] != '"') return null;
-    i += 1;
-    const start = i;
-    while (i < src.len) : (i += 1) {
-        if (src[i] == '\\') {
-            i += 1;
-            continue;
-        }
-        if (src[i] == '"') return src[start..i];
-    }
-    return null;
-}
-
-fn findObjectValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    const idx = std.mem.indexOf(u8, src, key_with_colon) orelse return null;
-    var i = idx + key_with_colon.len;
-    while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-    if (i >= src.len or src[i] != '{') return null;
-    var depth: usize = 0;
-    const start = i;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            in_str = true;
-            continue;
-        }
-        if (c == '{') depth += 1;
-        if (c == '}') {
-            depth -= 1;
-            if (depth == 0) return src[start .. i + 1];
-        }
-    }
-    return null;
-}
-
-fn jsonEscape(w: anytype, s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => try w.writeByte(c),
-    };
 }
 
 // ---------- tests ----------

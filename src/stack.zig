@@ -357,6 +357,60 @@ const MutationKind = union(enum) {
     resume_stack: struct { stack: []const u8 },
     config_patch: struct { stack: []const u8, patches: []const mutations.ConfigPatch },
     runtime_transition: mutations.RuntimeTransitionInput,
+
+    const ItemTarget = struct {
+        stack: []const u8,
+        id: []const u8,
+    };
+
+    fn apply(
+        self: MutationKind,
+        allocator: std.mem.Allocator,
+        notes_root_abs: []const u8,
+        ident: mutations.IdentityCtx,
+    ) !mutations.MutationOutput {
+        return switch (self) {
+            .create_stack => |inp| mutations.applyCreateStack(allocator, notes_root_abs, ident, inp),
+            .append_item => |inp| mutations.applyAppendItem(allocator, notes_root_abs, ident, inp),
+            .insert_item => |inp| mutations.applyInsertItem(allocator, notes_root_abs, ident, inp),
+            .transition => |inp| mutations.applyTransition(allocator, notes_root_abs, ident, inp),
+            .pause_stack => |p| mutations.applySetPaused(allocator, notes_root_abs, ident, p.stack, true),
+            .resume_stack => |p| mutations.applySetPaused(allocator, notes_root_abs, ident, p.stack, false),
+            .config_patch => |p| mutations.applyConfigPatch(allocator, notes_root_abs, ident, p.stack, p.patches),
+            .runtime_transition => |inp| mutations.applyRuntimeTransition(allocator, notes_root_abs, ident, inp),
+        };
+    }
+
+    fn skipsCommit(self: MutationKind) bool {
+        return switch (self) {
+            .runtime_transition => |inp| inp.to == .running,
+            else => false,
+        };
+    }
+
+    fn stackConfigPreflight(self: MutationKind) ?[]const u8 {
+        return switch (self) {
+            .pause_stack => |p| p.stack,
+            .resume_stack => |p| p.stack,
+            .config_patch => |p| p.stack,
+            else => null,
+        };
+    }
+
+    fn stackDirPreflight(self: MutationKind) ?[]const u8 {
+        return switch (self) {
+            .insert_item => |inp| inp.stack,
+            else => null,
+        };
+    }
+
+    fn itemMetaPreflight(self: MutationKind) ?ItemTarget {
+        return switch (self) {
+            .transition => |inp| .{ .stack = inp.stack, .id = inp.id },
+            .runtime_transition => |inp| .{ .stack = inp.stack, .id = inp.id },
+            else => null,
+        };
+    }
 };
 
 fn runMutation(
@@ -381,34 +435,10 @@ fn runMutation(
         }
     }
 
-    var maybe_output: ?mutations.MutationOutput = null;
-    const op_err: ?MutationFailureKind = blk: {
-        const out = switch (kind) {
-            .create_stack => |inp| mutations.applyCreateStack(allocator, notes_root_abs, ident, inp),
-            .append_item => |inp| mutations.applyAppendItem(allocator, notes_root_abs, ident, inp),
-            .insert_item => |inp| mutations.applyInsertItem(allocator, notes_root_abs, ident, inp),
-            .transition => |inp| mutations.applyTransition(allocator, notes_root_abs, ident, inp),
-            .pause_stack => |p| mutations.applySetPaused(allocator, notes_root_abs, ident, p.stack, true),
-            .resume_stack => |p| mutations.applySetPaused(allocator, notes_root_abs, ident, p.stack, false),
-            .config_patch => |p| mutations.applyConfigPatch(allocator, notes_root_abs, ident, p.stack, p.patches),
-            .runtime_transition => |inp| mutations.applyRuntimeTransition(allocator, notes_root_abs, ident, inp),
-        } catch |e| break :blk mutationErrorToKind(e);
-
-        maybe_output = out;
-        break :blk null;
+    const out = kind.apply(allocator, notes_root_abs, ident) catch |e| {
+        return .{ .err = mutationErrorToKind(e) };
     };
-    if (op_err) |k| return .{ .err = k };
-    const out = maybe_output.?;
-
-    const skip_commit = blk: {
-        switch (kind) {
-            .runtime_transition => |inp| {
-                if (inp.to == .running) break :blk true;
-            },
-            else => {},
-        }
-        break :blk false;
-    };
+    const skip_commit = kind.skipsCommit();
 
     var result = StackResult{
         .output = out,
@@ -432,7 +462,7 @@ fn runMutation(
         std.mem.copyForwards(u8, &result.commit_short_sha, &commit_res.short_sha);
     }
 
-    if (!skip_commit or kind != .runtime_transition) {
+    if (!skip_commit) {
         if (audit_writer) |aw| {
             aw.append(.{
                 .identity = ident.identity,
@@ -464,26 +494,14 @@ fn computePreflightPaths(
         for (out.items) |p| allocator.free(p);
         out.deinit(allocator);
     }
-    switch (kind) {
-        .pause_stack => |p| {
-            try out.append(allocator, try std.fmt.allocPrint(allocator, "stacks/{s}/stack.toml", .{p.stack}));
-        },
-        .resume_stack => |p| {
-            try out.append(allocator, try std.fmt.allocPrint(allocator, "stacks/{s}/stack.toml", .{p.stack}));
-        },
-        .config_patch => |p| {
-            try out.append(allocator, try std.fmt.allocPrint(allocator, "stacks/{s}/stack.toml", .{p.stack}));
-        },
-        .insert_item => |inp| {
-            try out.append(allocator, try std.fmt.allocPrint(allocator, "stacks/{s}", .{inp.stack}));
-        },
-        .transition => |inp| {
-            try appendItemMetaPreflight(allocator, notes_root_abs, &out, inp.stack, inp.id);
-        },
-        .runtime_transition => |inp| {
-            try appendItemMetaPreflight(allocator, notes_root_abs, &out, inp.stack, inp.id);
-        },
-        else => {},
+    if (kind.stackConfigPreflight()) |stack_name| {
+        try out.append(allocator, try mutations.stackConfigRel(allocator, stack_name));
+    }
+    if (kind.stackDirPreflight()) |stack_name| {
+        try out.append(allocator, try mutations.stackDirRel(allocator, stack_name));
+    }
+    if (kind.itemMetaPreflight()) |target| {
+        try appendItemMetaPreflight(allocator, notes_root_abs, &out, target.stack, target.id);
     }
     return out.toOwnedSlice(allocator);
 }
@@ -504,7 +522,7 @@ fn appendItemMetaPreflight(
         if (entry.kind != .directory) continue;
         const dash = std.mem.indexOfScalar(u8, entry.name, '-') orelse continue;
         if (std.mem.eql(u8, entry.name[0..dash], id)) {
-            try out.append(allocator, try std.fmt.allocPrint(allocator, "stacks/{s}/{s}/meta.toml", .{ stack_name, entry.name }));
+            try out.append(allocator, try mutations.itemMetaRel(allocator, stack_name, entry.name));
             break;
         }
     }

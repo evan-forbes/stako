@@ -33,7 +33,17 @@
 
 const std = @import("std");
 const adapter = @import("adapter.zig");
+const adapter_json = @import("adapter_json.zig");
 const events = @import("events.zig");
+
+const stripEol = adapter_json.stripEol;
+const findStringValue = adapter_json.findStringValue;
+const findTopLevelStringValue = adapter_json.findTopLevelStringValue;
+const findObjectValue = adapter_json.findObjectValue;
+const findArrayValue = adapter_json.findArrayValue;
+const findMatchingBraceEnd = adapter_json.findMatchingBraceEnd;
+const jsonEscape = adapter_json.jsonEscape;
+const writeParsedJsonStringContent = adapter_json.writeParsedJsonStringContent;
 
 pub const State = struct {
     session_id: []u8 = "",
@@ -65,6 +75,52 @@ pub const State = struct {
             allocator.free(entry.value_ptr.*);
         }
         self.pending_bash.deinit(allocator);
+    }
+};
+
+const ClaudeEventType = enum {
+    system,
+    assistant,
+    user,
+    stream_event,
+    result,
+    unknown,
+
+    fn fromString(s: []const u8) ClaudeEventType {
+        if (std.mem.eql(u8, s, "system")) return .system;
+        if (std.mem.eql(u8, s, "assistant")) return .assistant;
+        if (std.mem.eql(u8, s, "user")) return .user;
+        if (std.mem.eql(u8, s, "stream_event")) return .stream_event;
+        if (std.mem.eql(u8, s, "result")) return .result;
+        return .unknown;
+    }
+};
+
+const ClaudeStreamEventType = enum {
+    message_start,
+    content_block_delta,
+    message_stop,
+    unknown,
+
+    fn fromString(s: []const u8) ClaudeStreamEventType {
+        if (std.mem.eql(u8, s, "message_start")) return .message_start;
+        if (std.mem.eql(u8, s, "content_block_delta")) return .content_block_delta;
+        if (std.mem.eql(u8, s, "message_stop")) return .message_stop;
+        return .unknown;
+    }
+};
+
+const ClaudeContentBlockType = enum {
+    text,
+    tool_use,
+    tool_result,
+    unknown,
+
+    fn fromString(s: []const u8) ClaudeContentBlockType {
+        if (std.mem.eql(u8, s, "text")) return .text;
+        if (std.mem.eql(u8, s, "tool_use")) return .tool_use;
+        if (std.mem.eql(u8, s, "tool_result")) return .tool_result;
+        return .unknown;
     }
 };
 
@@ -198,85 +254,92 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
         out.deinit(allocator);
     }
 
-    if (std.mem.eql(u8, type_str, "system")) {
-        // {"type":"system","subtype":"init","session_id":"...","model":"...","cwd":"..."}
-        const subtype = findStringValue(line, "\"subtype\":") orelse "";
-        if (std.mem.eql(u8, subtype, "init") and !st.seen_init) {
+    switch (ClaudeEventType.fromString(type_str)) {
+        .system => {
+            // {"type":"system","subtype":"init","session_id":"...","model":"...","cwd":"..."}
+            const subtype = findStringValue(line, "\"subtype\":") orelse "";
+            if (std.mem.eql(u8, subtype, "init") and !st.seen_init) {
+                if (findStringValue(line, "\"session_id\":")) |sid| {
+                    if (st.session_id.len > 0) allocator.free(st.session_id);
+                    st.session_id = try allocator.dupe(u8, sid);
+                }
+                if (findStringValue(line, "\"model\":")) |m| {
+                    if (st.model.len > 0) allocator.free(st.model);
+                    st.model = try allocator.dupe(u8, m);
+                }
+                if (findStringValue(line, "\"session_file\":")) |sf| {
+                    if (st.session_file.len > 0) allocator.free(st.session_file);
+                    st.session_file = try allocator.dupe(u8, sf);
+                }
+                st.seen_init = true;
+                const cwd_opt = findStringValue(line, "\"cwd\":");
+                try emitSessionStarted(allocator, &out, st, cwd_opt);
+            }
+            // Other system subtypes (e.g. "tool_result" wrappers) are not
+            // emitted as normalized events in v1.
+        },
+        .assistant => {
+            // Full assistant message landed. The `message.content` array may
+            // contain text blocks and/or tool_use blocks.
+            const msg = findObjectValue(line, "\"message\":") orelse {
+                return out.toOwnedSlice(allocator);
+            };
+            // Parse `content` array.
+            if (findArrayValue(msg, "\"content\":")) |arr| {
+                try emitAssistantContent(allocator, &out, st, arr);
+            }
+        },
+        .user => {
+            // user-from-cli message — typically carries `tool_result` blocks.
+            const msg = findObjectValue(line, "\"message\":") orelse {
+                return out.toOwnedSlice(allocator);
+            };
+            if (findArrayValue(msg, "\"content\":")) |arr| {
+                try emitToolResults(allocator, &out, st, arr);
+            }
+        },
+        .stream_event => {
+            // Partial-message stream-event passthrough. We only project the
+            // most useful kinds: `message_start`, `content_block_delta` (text),
+            // `message_stop`.
+            const inner = findObjectValue(line, "\"event\":") orelse {
+                return out.toOwnedSlice(allocator);
+            };
+            const ev_type = findStringValue(inner, "\"type\":") orelse "";
+            switch (ClaudeStreamEventType.fromString(ev_type)) {
+                .message_start => {
+                    try emitTurnStarted(allocator, &out, st);
+                    st.turn_index += 1;
+                },
+                .content_block_delta => {
+                    const delta = findObjectValue(inner, "\"delta\":") orelse "{}";
+                    const dtype = findStringValue(delta, "\"type\":") orelse "";
+                    if (std.mem.eql(u8, dtype, "text_delta")) {
+                        const t = findStringValue(delta, "\"text\":") orelse "";
+                        try emitMessageChunk(allocator, &out, t, "assistant");
+                    }
+                },
+                .message_stop => try emitTurnCompleted(allocator, &out, st),
+                .unknown => {},
+            }
+        },
+        .result => {
+            // Final wrapper. Emit a final `message` carrying `result` text if
+            // any, plus a turn_completed if we haven't seen one. Promote a
+            // session_id refresh and capture session_file if present.
             if (findStringValue(line, "\"session_id\":")) |sid| {
                 if (st.session_id.len > 0) allocator.free(st.session_id);
                 st.session_id = try allocator.dupe(u8, sid);
-            }
-            if (findStringValue(line, "\"model\":")) |m| {
-                if (st.model.len > 0) allocator.free(st.model);
-                st.model = try allocator.dupe(u8, m);
             }
             if (findStringValue(line, "\"session_file\":")) |sf| {
                 if (st.session_file.len > 0) allocator.free(st.session_file);
                 st.session_file = try allocator.dupe(u8, sf);
             }
-            st.seen_init = true;
-            const cwd_opt = findStringValue(line, "\"cwd\":");
-            try emitSessionStarted(allocator, &out, st, cwd_opt);
-        }
-        // Other system subtypes (e.g. "tool_result" wrappers) are not
-        // emitted as normalized events in v1.
-    } else if (std.mem.eql(u8, type_str, "assistant")) {
-        // Full assistant message landed. The `message.content` array may
-        // contain text blocks and/or tool_use blocks.
-        const msg = findObjectValue(line, "\"message\":") orelse {
-            return out.toOwnedSlice(allocator);
-        };
-        // Parse `content` array.
-        if (findArrayValue(msg, "\"content\":")) |arr| {
-            try emitAssistantContent(allocator, &out, st, arr);
-        }
-    } else if (std.mem.eql(u8, type_str, "user")) {
-        // user-from-cli message — typically carries `tool_result` blocks.
-        const msg = findObjectValue(line, "\"message\":") orelse {
-            return out.toOwnedSlice(allocator);
-        };
-        if (findArrayValue(msg, "\"content\":")) |arr| {
-            try emitToolResults(allocator, &out, st, arr);
-        }
-    } else if (std.mem.eql(u8, type_str, "stream_event")) {
-        // Partial-message stream-event passthrough. We only project the
-        // most useful kinds: `message_start`, `content_block_delta` (text),
-        // `message_stop`.
-        const inner = findObjectValue(line, "\"event\":") orelse {
-            return out.toOwnedSlice(allocator);
-        };
-        const ev_type = findStringValue(inner, "\"type\":") orelse "";
-        if (std.mem.eql(u8, ev_type, "message_start")) {
-            try emitTurnStarted(allocator, &out, st);
-            st.turn_index += 1;
-        } else if (std.mem.eql(u8, ev_type, "content_block_delta")) {
-            // delta.{type:text_delta, text:"..."}
-            const delta = findObjectValue(inner, "\"delta\":") orelse "{}";
-            const dtype = findStringValue(delta, "\"type\":") orelse "";
-            if (std.mem.eql(u8, dtype, "text_delta")) {
-                const t = findStringValue(delta, "\"text\":") orelse "";
-                try emitMessageChunk(allocator, &out, t, "assistant");
+            if (findStringValue(line, "\"result\":")) |text| {
+                try emitMessage(allocator, &out, text, "assistant");
             }
-        } else if (std.mem.eql(u8, ev_type, "message_stop")) {
-            try emitTurnCompleted(allocator, &out, st);
-        }
-    } else if (std.mem.eql(u8, type_str, "result")) {
-        // Final wrapper. Emit a final `message` carrying `result` text if
-        // any, plus a turn_completed if we haven't seen one. Promote a
-        // session_id refresh and capture session_file if present.
-        if (findStringValue(line, "\"session_id\":")) |sid| {
-            if (st.session_id.len > 0) allocator.free(st.session_id);
-            st.session_id = try allocator.dupe(u8, sid);
-        }
-        if (findStringValue(line, "\"session_file\":")) |sf| {
-            if (st.session_file.len > 0) allocator.free(st.session_file);
-            st.session_file = try allocator.dupe(u8, sf);
-        }
-        if (findStringValue(line, "\"result\":")) |text| {
-            try emitMessage(allocator, &out, text, "assistant");
-        }
-    } else {
-        try emitError(allocator, &out, "adapter_unknown_event");
+        },
+        .unknown => try emitError(allocator, &out, "adapter_unknown_event"),
     }
 
     return out.toOwnedSlice(allocator);
@@ -448,49 +511,43 @@ fn projectAssistantBlock(
     st: *State,
     block: []const u8,
 ) !void {
-    const btype = findStringValue(block, "\"type\":") orelse return;
-    if (std.mem.eql(u8, btype, "text")) {
-        const text = findStringValue(block, "\"text\":") orelse return;
-        try emitMessage(allocator, out, text, "assistant");
-    } else if (std.mem.eql(u8, btype, "tool_use")) {
-        const tool = findStringValue(block, "\"name\":") orelse return;
-        const call_id = findStringValue(block, "\"id\":") orelse "";
-        const inp_obj = findObjectValue(block, "\"input\":") orelse "{}";
-        // Always emit a tool_call.
-        try emitToolCall(allocator, out, tool, inp_obj, call_id);
-        // Project to file_changed / command_executed.
-        if (std.mem.eql(u8, tool, "Edit") or std.mem.eql(u8, tool, "Write") or std.mem.eql(u8, tool, "MultiEdit")) {
-            const path = findStringValue(inp_obj, "\"file_path\":") orelse "";
-            const op: []const u8 = if (std.mem.eql(u8, tool, "Write")) "create" else "modify";
-            try emitFileChanged(allocator, out, path, op);
-        } else if (std.mem.eql(u8, tool, "Bash")) {
-            // Defer `command_executed` until the matching `tool_result`
-            // arrives — only then do we know the real exit_code (via
-            // `is_error`). Stash the command keyed by tool_use id.
-            const cmd = findStringValue(inp_obj, "\"command\":") orelse "";
-            if (call_id.len > 0) {
-                const key = try allocator.dupe(u8, call_id);
-                errdefer allocator.free(key);
-                const val = try allocator.dupe(u8, cmd);
-                errdefer allocator.free(val);
-                const gop = try st.pending_bash.getOrPut(allocator, key);
-                if (gop.found_existing) {
-                    // Replace stale entry under the same id.
-                    allocator.free(key);
-                    allocator.free(gop.value_ptr.*);
-                    gop.value_ptr.* = val;
+    switch (ClaudeContentBlockType.fromString(findStringValue(block, "\"type\":") orelse "")) {
+        .text => {
+            const text = findStringValue(block, "\"text\":") orelse return;
+            try emitMessage(allocator, out, text, "assistant");
+        },
+        .tool_use => {
+            const tool = findStringValue(block, "\"name\":") orelse return;
+            const call_id = findStringValue(block, "\"id\":") orelse "";
+            const inp_obj = findObjectValue(block, "\"input\":") orelse "{}";
+            try emitToolCall(allocator, out, tool, inp_obj, call_id);
+            if (std.mem.eql(u8, tool, "Edit") or std.mem.eql(u8, tool, "Write") or std.mem.eql(u8, tool, "MultiEdit")) {
+                const path = findStringValue(inp_obj, "\"file_path\":") orelse "";
+                const op: []const u8 = if (std.mem.eql(u8, tool, "Write")) "create" else "modify";
+                try emitFileChanged(allocator, out, path, op);
+            } else if (std.mem.eql(u8, tool, "Bash")) {
+                const cmd = findStringValue(inp_obj, "\"command\":") orelse "";
+                if (call_id.len > 0) {
+                    const key = try allocator.dupe(u8, call_id);
+                    errdefer allocator.free(key);
+                    const val = try allocator.dupe(u8, cmd);
+                    errdefer allocator.free(val);
+                    const gop = try st.pending_bash.getOrPut(allocator, key);
+                    if (gop.found_existing) {
+                        allocator.free(key);
+                        allocator.free(gop.value_ptr.*);
+                        gop.value_ptr.* = val;
+                    } else {
+                        gop.key_ptr.* = key;
+                        gop.value_ptr.* = val;
+                    }
                 } else {
-                    gop.key_ptr.* = key;
-                    gop.value_ptr.* = val;
+                    try emitCommandExecuted(allocator, out, cmd, 0);
                 }
-            } else {
-                // No id to correlate the result with — emit immediately with
-                // exit:0 so the transcript still records the command.
-                try emitCommandExecuted(allocator, out, cmd, 0);
             }
-        }
+        },
+        .tool_result, .unknown => {},
     }
-    // tool_result handled in `user` message path.
 }
 
 fn emitToolCall(
@@ -592,8 +649,7 @@ fn emitToolResults(
         const obj_start = i;
         const obj_end = findMatchingBraceEnd(arr_with_brackets, obj_start) orelse break;
         const obj = arr_with_brackets[obj_start..obj_end];
-        const btype = findStringValue(obj, "\"type\":") orelse "";
-        if (std.mem.eql(u8, btype, "tool_result")) {
+        if (ClaudeContentBlockType.fromString(findStringValue(obj, "\"type\":") orelse "") == .tool_result) {
             const id = findStringValue(obj, "\"tool_use_id\":") orelse "";
             const content = findStringValue(obj, "\"content\":") orelse "";
             const is_error = isErrorBool(obj);
@@ -721,234 +777,6 @@ fn emitErrorList(allocator: std.mem.Allocator, slug: []const u8) ![]adapter.Owne
         .storage = storage,
     };
     return arr;
-}
-
-// ---------- shared JSON micro-parsers ----------
-
-fn stripEol(raw: []const u8) []const u8 {
-    var line = raw;
-    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-    return line;
-}
-
-/// Find the value of a top-level (depth==1) string key in a JSON object.
-///
-/// Walks the source tracking string/escape state and brace/bracket depth, so
-/// nested objects are skipped — `findStringValue(`{"a":{"k":"buried"},"k":"top"}`, "\"k\":")`
-/// returns `"top"`, not `"buried"`. This matters whenever a key shadows a
-/// vendor-nested key (e.g. `"message"` inside an error details object).
-fn findStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    var depth: usize = 0;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
-                var j = i + key_with_colon.len;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-                if (j >= src.len or src[j] != '"') return null;
-                j += 1;
-                const start = j;
-                while (j < src.len) : (j += 1) {
-                    if (src[j] == '\\') {
-                        j += 1;
-                        continue;
-                    }
-                    if (src[j] == '"') return src[start..j];
-                }
-                return null;
-            }
-            in_str = true;
-            continue;
-        }
-        if (c == '{' or c == '[') depth += 1;
-        if (c == '}' or c == ']') {
-            if (depth == 0) return null;
-            depth -= 1;
-        }
-    }
-    return null;
-}
-
-/// Alias retained for readability at call sites that historically distinguish
-/// "top-level only" from the older buggy first-match scanner. The two helpers
-/// now share identical depth-1 semantics.
-const findTopLevelStringValue = findStringValue;
-
-/// Top-level (depth==1) object-value lookup. Like `findStringValue` but
-/// returns the object's bytes including its outer braces. Skips nested
-/// objects so e.g. `{"a":{"k":{...}},"k":{"top":1}}` returns the top-level
-/// `"k"` object.
-fn findObjectValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    var depth: usize = 0;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
-                var j = i + key_with_colon.len;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-                if (j >= src.len or src[j] != '{') return null;
-                const end = findMatchingBraceEnd(src, j) orelse return null;
-                return src[j..end];
-            }
-            in_str = true;
-            continue;
-        }
-        if (c == '{' or c == '[') depth += 1;
-        if (c == '}' or c == ']') {
-            if (depth == 0) return null;
-            depth -= 1;
-        }
-    }
-    return null;
-}
-
-/// Top-level (depth==1) array-value lookup. Returns the array's bytes
-/// including its outer brackets, skipping nested objects/arrays.
-fn findArrayValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    var depth: usize = 0;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
-                var j = i + key_with_colon.len;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-                if (j >= src.len or src[j] != '[') return null;
-                const start = j;
-                var adepth: usize = 0;
-                var ain_str = false;
-                var aescape = false;
-                while (j < src.len) : (j += 1) {
-                    const ac = src[j];
-                    if (aescape) {
-                        aescape = false;
-                        continue;
-                    }
-                    if (ain_str) {
-                        if (ac == '\\') {
-                            aescape = true;
-                        } else if (ac == '"') {
-                            ain_str = false;
-                        }
-                        continue;
-                    }
-                    if (ac == '"') {
-                        ain_str = true;
-                        continue;
-                    }
-                    if (ac == '[') adepth += 1;
-                    if (ac == ']') {
-                        adepth -= 1;
-                        if (adepth == 0) return src[start .. j + 1];
-                    }
-                }
-                return null;
-            }
-            in_str = true;
-            continue;
-        }
-        if (c == '{' or c == '[') depth += 1;
-        if (c == '}' or c == ']') {
-            if (depth == 0) return null;
-            depth -= 1;
-        }
-    }
-    return null;
-}
-
-/// Given `src` and an index pointing to a `{`, find the index just past the
-/// matching `}`. Returns null if unbalanced.
-fn findMatchingBraceEnd(src: []const u8, start: usize) ?usize {
-    if (start >= src.len or src[start] != '{') return null;
-    var depth: usize = 0;
-    var i = start;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            in_str = true;
-            continue;
-        }
-        if (c == '{') depth += 1;
-        if (c == '}') {
-            depth -= 1;
-            if (depth == 0) return i + 1;
-        }
-    }
-    return null;
-}
-
-fn jsonEscape(w: anytype, s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => try w.writeByte(c),
-    };
-}
-
-fn writeParsedJsonStringContent(w: anytype, s: []const u8) !void {
-    try w.writeAll(s);
 }
 
 // ---------- tests ----------

@@ -17,7 +17,6 @@ const fake = @import("helpers/fake_harness.zig");
 const init_mod = stako.init;
 const audit_mod = stako.audit;
 const sse_mod = stako.sse;
-const mutation_queue = stako.mutation_queue;
 const runtime_mod = stako.runtime;
 const runtime_file = stako.runtime_file;
 const events = stako.events;
@@ -84,7 +83,8 @@ fn seedStack(
     defer a.free(cfg);
     var f = try std.fs.cwd().createFile(cfg, .{ .truncate = true });
     defer f.close();
-    const content = try std.fmt.allocPrint(a,
+    const content = try std.fmt.allocPrint(
+        a,
         "description = \"m7 stack\"\ncreated_at = 2026-05-10T14:00:00Z\npaused = {s}\ncontinuity = \"fresh\"\nmax_concurrent_per_stack = 1\nallowed_harnesses = {s}\n",
         .{ if (paused) "true" else "false", allowed_harnesses_toml },
     );

@@ -500,6 +500,46 @@ const Route = enum {
     index_html, // GET / (HTML-only landing page)
     static_css, // GET /static/style.css
     unknown,
+
+    fn isMutation(self: Route) bool {
+        return switch (self) {
+            .stacks_create,
+            .stack_config_post,
+            .items_append,
+            .item_insert,
+            .item_retry,
+            .item_cancel,
+            .item_supersede,
+            .stack_pause,
+            .stack_resume,
+            => true,
+            else => false,
+        };
+    }
+
+    fn policyAction(self: Route) ?policy.Action {
+        return switch (self) {
+            .stacks_create => .create_stack,
+            .stack_config_post => .update_stack_config,
+            .items_append => .append_item,
+            .item_insert => .insert_item,
+            .item_retry => .retry_item,
+            .item_cancel => .cancel_item,
+            .item_supersede => .supersede_item,
+            .stack_pause => .pause_stack,
+            .stack_resume => .resume_stack,
+            else => null,
+        };
+    }
+
+    fn promotePost(self: Route) Route {
+        return switch (self) {
+            .stacks_list => .stacks_create,
+            .stack_config_get => .stack_config_post,
+            .stack_items_list => .items_append,
+            else => self,
+        };
+    }
 };
 
 const RouteMatch = struct {
@@ -577,41 +617,6 @@ pub fn matchRoute(target: []const u8) RouteMatch {
     return .{ .route = .unknown };
 }
 
-/// Return true if this route requires an authenticated mutator (POST).
-fn isMutationRoute(r: Route) bool {
-    return switch (r) {
-        .stacks_create,
-        .stack_config_post,
-        .items_append,
-        .item_insert,
-        .item_retry,
-        .item_cancel,
-        .item_supersede,
-        .stack_pause,
-        .stack_resume,
-        => true,
-        else => false,
-    };
-}
-
-/// Map a mutation route to the `policy.Action` that gates it. Returns
-/// `null` for non-mutation routes (the caller short-circuits before the
-/// policy check anyway). Keep in lockstep with `isMutationRoute`.
-fn routeToPolicyAction(r: Route) ?policy.Action {
-    return switch (r) {
-        .stacks_create => .create_stack,
-        .stack_config_post => .update_stack_config,
-        .items_append => .append_item,
-        .item_insert => .insert_item,
-        .item_retry => .retry_item,
-        .item_cancel => .cancel_item,
-        .item_supersede => .supersede_item,
-        .stack_pause => .pause_stack,
-        .stack_resume => .resume_stack,
-        else => null,
-    };
-}
-
 /// New entry point introduced for SSE: same as `route` but threads through
 /// the connection-ownership flag so the SSE handler can detach.
 fn routeWithOwnership(self: *Daemon, req: *std.http.Server.Request, conn: std.net.Server.Connection, conn_owned: *bool) !void {
@@ -632,11 +637,11 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
     // Apply method-based promotion: a POST to a path that matched as a
     // GET-default route gets remapped to the matching mutation route.
     if (is_post) {
-        const promoted = promoteToMutation(m.route);
+        const promoted = m.route.promotePost();
         // POST onto a route that has no mutation form (e.g. /healthz,
         // /providers, /stacks/{name}, /stacks/{name}/items/{id}) is a
         // method mismatch, not a 404. `unknown` paths still 404 below.
-        if (promoted == m.route and !isMutationRoute(m.route) and m.route != .unknown) {
+        if (promoted == m.route and !m.route.isMutation() and m.route != .unknown) {
             try respondError(req, .method_not_allowed, "method not allowed", &.{});
             return;
         }
@@ -646,91 +651,18 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         return;
     }
     // GETs on mutation-only paths (e.g. /stacks/foo/items/0001/cancel) are 404.
-    if (is_get and isMutationRoute(m.route)) {
+    if (is_get and m.route.isMutation()) {
         try respondError(req, .not_found, "endpoint not found", &.{});
         return;
     }
 
-    // Auth check on mutation routes. Two paths:
-    //   1. `Authorization: Bearer <token>` header — used by programmatic
-    //      JSON callers and tests. This is the only path that lets the
-    //      downstream handler read the body itself.
-    //   2. `application/x-www-form-urlencoded` body with a `_token=...`
-    //      field — used by the browser mutation forms rendered on the HTML
-    //      pages (see `html.writeStackControls` and `writeItemControls`).
-    //      Plain `<form method="POST">` cannot set custom headers, so a
-    //      body-side credential is the only way to keep those flows JS-
-    //      free. When taken, the body is consumed here; the dispatch
-    //      below uses a form-aware handler that does not re-read it.
     var form_body: ?[]u8 = null;
     defer if (form_body) |b| self.allocator.free(b);
-    if (isMutationRoute(m.route)) {
-        if (!verifyAuth(self, req)) {
-            const form_attempt = verifyAuthFormBody(self, req) catch |e| {
-                if (e == error.BodyTooLarge) {
-                    try respondError(req, .validation_failed, "request body too large", &.{});
-                    return;
-                }
-                // Audit the denial: missing identity assertion.
-                auditDenied(self, "(anonymous)", policyActionToAudit(routeToPolicyAction(m.route) orelse .append_item), m.stack, m.item, "identity_required");
-                try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
-                return;
-            };
-            if (form_attempt) |fb| {
-                form_body = fb;
-            } else {
-                auditDenied(self, "(anonymous)", policyActionToAudit(routeToPolicyAction(m.route) orelse .append_item), m.stack, m.item, "identity_required");
-                try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
-                return;
-            }
-        }
-        // Capability policy. The token has verified — the local-bearer-token
-        // path resolves to identity "local". When `[identity.local]` is not
-        // declared, the policy grants `*` (backwards-compat with M3–M9).
-        const id = policy.resolveLocal(&self.config);
-        const action = routeToPolicyAction(m.route).?;
-        const target: policy.Target = switch (action) {
-            .create_stack => .{ .stack_create = m.stack },
-            else => .{ .stack = m.stack },
+    if (m.route.isMutation()) {
+        form_body = authorizeMutation(self, req, m) catch |e| switch (e) {
+            error.ResponseSent => return,
+            else => return e,
         };
-        const decision = policy.evaluate(id, action, target);
-        switch (decision) {
-            .allow => {},
-            .identity_required => unreachable, // already handled above
-            .capability_denied => {
-                auditDenied(self, id.name, policyActionToAudit(action), m.stack, m.item, "capability_denied");
-                // Compute the canonical slug here for the error body. The
-                // `policy.evaluate` decision intentionally doesn't return
-                // one (any natural composition would dangle when the
-                // function returns), so the caller renders it.
-                var cap_buf: [256]u8 = undefined;
-                const cap_slug: []const u8 = blk: {
-                    switch (action) {
-                        .create_stack => break :blk "stack.create",
-                        .append_item, .insert_item, .retry_item, .cancel_item, .supersede_item, .pause_stack, .resume_stack, .update_stack_config => {
-                            const verb: []const u8 = switch (action) {
-                                .append_item => "append",
-                                .insert_item => "insert",
-                                .retry_item => "retry",
-                                .cancel_item => "cancel",
-                                .supersede_item => "supersede",
-                                .pause_stack => "pause",
-                                .resume_stack => "resume",
-                                .update_stack_config => "config",
-                                else => unreachable,
-                            };
-                            break :blk std.fmt.bufPrint(&cap_buf, "stack.{s}.{s}", .{ m.stack, verb }) catch "stack.?.?";
-                        },
-                        .dispatch_harness => break :blk "provider.?",
-                    }
-                };
-                try respondError(req, .capability_denied, "identity lacks required capability", &.{
-                    .{ .key = "identity", .value = id.name },
-                    .{ .key = "capability", .value = cap_slug },
-                });
-                return;
-            },
-        }
     }
 
     // Content negotiation for the read endpoints that have an HTML view.
@@ -751,23 +683,11 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         .stack_config_post => try handleConfigPost(self, req, m.stack),
         .items_append => try handleAppendItem(self, req, m.stack),
         .item_insert => try handleInsertItem(self, req, m.stack, m.item),
-        .item_retry => if (form_body != null)
-            try handleTransitionFormPath(self, req, m.stack, m.item, .retry)
-        else
-            try handleTransition(self, req, m.stack, m.item, .retry),
-        .item_cancel => if (form_body != null)
-            try handleTransitionFormPath(self, req, m.stack, m.item, .cancel)
-        else
-            try handleTransition(self, req, m.stack, m.item, .cancel),
+        .item_retry => try handleTransitionRoute(self, req, m.stack, m.item, .retry, form_body != null),
+        .item_cancel => try handleTransitionRoute(self, req, m.stack, m.item, .cancel, form_body != null),
         .item_supersede => try handleTransition(self, req, m.stack, m.item, .supersede),
-        .stack_pause => if (form_body != null)
-            try handlePauseResumeFormPath(self, req, m.stack, true)
-        else
-            try handlePauseResume(self, req, m.stack, true),
-        .stack_resume => if (form_body != null)
-            try handlePauseResumeFormPath(self, req, m.stack, false)
-        else
-            try handlePauseResume(self, req, m.stack, false),
+        .stack_pause => try handlePauseResume(self, req, m.stack, true, form_body != null),
+        .stack_resume => try handlePauseResume(self, req, m.stack, false, form_body != null),
         .stack_events_sse => try respondError(req, .internal, "SSE must be routed via routeWithOwnership", &.{}),
         // Provider status (M8).
         .providers_list => try respondProvidersList(self, req),
@@ -791,12 +711,68 @@ fn acceptHeaderWantsHtml(req: *std.http.Server.Request) bool {
     return false;
 }
 
-fn promoteToMutation(r: Route) Route {
-    return switch (r) {
-        .stacks_list => .stacks_create,
-        .stack_config_get => .stack_config_post,
-        .stack_items_list => .items_append,
-        else => r,
+fn authorizeMutation(self: *Daemon, req: *std.http.Server.Request, m: RouteMatch) !?[]u8 {
+    const action = m.route.policyAction().?;
+    var form_body: ?[]u8 = null;
+    if (!verifyAuth(self, req)) {
+        const form_attempt = verifyAuthFormBody(self, req) catch |e| {
+            if (e == error.BodyTooLarge) {
+                try respondError(req, .validation_failed, "request body too large", &.{});
+                return error.ResponseSent;
+            }
+            auditDenied(self, "(anonymous)", policyActionToAudit(action), m.stack, m.item, "identity_required");
+            try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
+            return error.ResponseSent;
+        };
+        if (form_attempt) |fb| {
+            form_body = fb;
+        } else {
+            auditDenied(self, "(anonymous)", policyActionToAudit(action), m.stack, m.item, "identity_required");
+            try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
+            return error.ResponseSent;
+        }
+    }
+    errdefer if (form_body) |b| self.allocator.free(b);
+
+    const id = policy.resolveLocal(&self.config);
+    const target: policy.Target = switch (action) {
+        .create_stack => .{ .stack_create = m.stack },
+        else => .{ .stack = m.stack },
+    };
+    switch (policy.evaluate(id, action, target)) {
+        .allow => return form_body,
+        .identity_required => unreachable,
+        .capability_denied => {
+            auditDenied(self, id.name, policyActionToAudit(action), m.stack, m.item, "capability_denied");
+            var cap_buf: [256]u8 = undefined;
+            const cap_slug = capabilitySlug(action, m.stack, &cap_buf);
+            try respondError(req, .capability_denied, "identity lacks required capability", &.{
+                .{ .key = "identity", .value = id.name },
+                .{ .key = "capability", .value = cap_slug },
+            });
+            return error.ResponseSent;
+        },
+    }
+}
+
+fn capabilitySlug(action: policy.Action, stack: []const u8, buf: []u8) []const u8 {
+    return switch (action) {
+        .create_stack => "stack.create",
+        .append_item, .insert_item, .retry_item, .cancel_item, .supersede_item, .pause_stack, .resume_stack, .update_stack_config => blk: {
+            const verb: []const u8 = switch (action) {
+                .append_item => "append",
+                .insert_item => "insert",
+                .retry_item => "retry",
+                .cancel_item => "cancel",
+                .supersede_item => "supersede",
+                .pause_stack => "pause",
+                .resume_stack => "resume",
+                .update_stack_config => "config",
+                else => unreachable,
+            };
+            break :blk std.fmt.bufPrint(buf, "stack.{s}.{s}", .{ stack, verb }) catch "stack.?.?";
+        },
+        .dispatch_harness => "provider.?",
     };
 }
 
@@ -1574,6 +1550,101 @@ fn readRequestBody(self: *Daemon, req: *std.http.Server.Request) ![]u8 {
     };
 }
 
+const JsonBody = struct {
+    allocator: std.mem.Allocator,
+    body: []u8,
+    parsed: std.json.Parsed(std.json.Value),
+
+    fn deinit(self: *JsonBody) void {
+        self.parsed.deinit();
+        self.allocator.free(self.body);
+    }
+};
+
+fn readJsonValue(self: *Daemon, req: *std.http.Server.Request) !?JsonBody {
+    const body = readRequestBody(self, req) catch {
+        try respondError(req, .validation_failed, "failed to read request body", &.{});
+        return null;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+        self.allocator.free(body);
+        try respondError(req, .validation_failed, "invalid JSON body", &.{});
+        return null;
+    };
+    return .{
+        .allocator = self.allocator,
+        .body = body,
+        .parsed = parsed,
+    };
+}
+
+fn expectObject(req: *std.http.Server.Request, value: std.json.Value) !?std.json.ObjectMap {
+    if (value != .object) {
+        try respondError(req, .validation_failed, "invalid JSON body", &.{});
+        return null;
+    }
+    return value.object;
+}
+
+fn requiredString(req: *std.http.Server.Request, obj: anytype, comptime key: []const u8) !?[]const u8 {
+    const v = obj.get(key) orelse {
+        var msg: [64]u8 = undefined;
+        try respondError(req, .validation_failed, std.fmt.bufPrint(&msg, "missing field `{s}`", .{key}) catch "missing field", &.{});
+        return null;
+    };
+    if (v != .string) {
+        var msg: [80]u8 = undefined;
+        try respondError(req, .validation_failed, std.fmt.bufPrint(&msg, "field `{s}` must be a string", .{key}) catch "field must be a string", &.{});
+        return null;
+    }
+    return v.string;
+}
+
+fn optionalString(obj: anytype, key: []const u8) ?[]const u8 {
+    if (obj.get(key)) |v| if (v == .string) return v.string;
+    return null;
+}
+
+fn optionalBool(obj: anytype, key: []const u8) ?bool {
+    if (obj.get(key)) |v| if (v == .bool) return v.bool;
+    return null;
+}
+
+fn optionalInteger(obj: anytype, key: []const u8) ?i64 {
+    if (obj.get(key)) |v| if (v == .integer) return v.integer;
+    return null;
+}
+
+const ParsedItemBody = struct {
+    kind: []const u8,
+    slug: []const u8,
+    prompt_body: ?[]const u8 = null,
+    target_provider: ?[]const u8 = null,
+    target_model: ?[]const u8 = null,
+    target_match: ?item_mod.Match = null,
+    target_workdir: ?[]const u8 = null,
+    sleep_until: ?[]const u8 = null,
+};
+
+fn parseItemBody(req: *std.http.Server.Request, obj: anytype) !?ParsedItemBody {
+    const kind = (try requiredString(req, obj, "kind")) orelse return null;
+    const slug = (try requiredString(req, obj, "slug")) orelse return null;
+    var out: ParsedItemBody = .{
+        .kind = kind,
+        .slug = slug,
+        .prompt_body = optionalString(obj, "prompt"),
+        .sleep_until = optionalString(obj, "sleep_until"),
+    };
+    if (obj.get("target")) |t| if (t == .object) {
+        out.target_provider = optionalString(t.object, "provider");
+        out.target_model = optionalString(t.object, "model");
+        if (optionalString(t.object, "match")) |s| out.target_match = item_mod.Match.fromString(s);
+        out.target_workdir = optionalString(t.object, "workdir");
+    };
+    return out;
+}
+
 /// Map a mutation failure to an HTTP error code + message and respond.
 fn respondMutationError(
     req: *std.http.Server.Request,
@@ -1676,49 +1747,20 @@ fn respondMutationResult(
 
 /// Handle POST /stacks. Body: {"name":"...","config":{...}}.
 fn handleCreateStack(self: *Daemon, req: *std.http.Server.Request) !void {
-    const body = readRequestBody(self, req) catch {
-        try respondError(req, .validation_failed, "failed to read request body", &.{});
-        return;
-    };
-    defer self.allocator.free(body);
-
-    // Parse JSON.
-    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
-        try respondError(req, .validation_failed, "invalid JSON body", &.{});
-        return;
-    };
-    defer parsed.deinit();
-
-    const obj = parsed.value.object;
-    const name_val = obj.get("name") orelse {
-        try respondError(req, .validation_failed, "missing field `name`", &.{});
-        return;
-    };
-    if (name_val != .string) {
-        try respondError(req, .validation_failed, "field `name` must be a string", &.{});
-        return;
-    }
-    const name = name_val.string;
+    var json = (try readJsonValue(self, req)) orelse return;
+    defer json.deinit();
+    const obj = (try expectObject(req, json.parsed.value)) orelse return;
+    const name = (try requiredString(req, obj, "name")) orelse return;
 
     var input: mutations_mod.CreateStackInput = .{ .name = name };
     if (obj.get("config")) |cfg_v| {
         if (cfg_v == .object) {
             const cfg = cfg_v.object;
-            if (cfg.get("description")) |v| if (v == .string) {
-                input.description = v.string;
-            };
-            if (cfg.get("continuity")) |v| if (v == .string) {
-                input.continuity = stack_config.Continuity.fromString(v.string);
-            };
-            if (cfg.get("paused")) |v| if (v == .bool) {
-                input.paused = v.bool;
-            };
-            if (cfg.get("max_concurrent_per_stack")) |v| if (v == .integer) {
-                input.max_concurrent_per_stack = v.integer;
-            };
-            if (cfg.get("default_workdir")) |v| if (v == .string) {
-                input.default_workdir = v.string;
-            };
+            input.description = optionalString(cfg, "description");
+            if (optionalString(cfg, "continuity")) |s| input.continuity = stack_config.Continuity.fromString(s);
+            input.paused = optionalBool(cfg, "paused");
+            input.max_concurrent_per_stack = optionalInteger(cfg, "max_concurrent_per_stack");
+            input.default_workdir = optionalString(cfg, "default_workdir");
         }
     }
 
@@ -1727,60 +1769,21 @@ fn handleCreateStack(self: *Daemon, req: *std.http.Server.Request) !void {
 }
 
 fn handleAppendItem(self: *Daemon, req: *std.http.Server.Request, stack: []const u8) !void {
-    const body = readRequestBody(self, req) catch {
-        try respondError(req, .validation_failed, "failed to read request body", &.{});
-        return;
-    };
-    defer self.allocator.free(body);
+    var json = (try readJsonValue(self, req)) orelse return;
+    defer json.deinit();
+    const obj = (try expectObject(req, json.parsed.value)) orelse return;
+    const parsed = (try parseItemBody(req, obj)) orelse return;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
-        try respondError(req, .validation_failed, "invalid JSON body", &.{});
-        return;
-    };
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-
-    const kind_v = obj.get("kind") orelse {
-        try respondError(req, .validation_failed, "missing field `kind`", &.{});
-        return;
-    };
-    if (kind_v != .string) {
-        try respondError(req, .validation_failed, "field `kind` must be a string", &.{});
-        return;
-    }
-    const slug_v = obj.get("slug") orelse {
-        try respondError(req, .validation_failed, "missing field `slug`", &.{});
-        return;
-    };
-    if (slug_v != .string) {
-        try respondError(req, .validation_failed, "field `slug` must be a string", &.{});
-        return;
-    }
-
-    var input: mutations_mod.AppendItemInput = .{
+    const input: mutations_mod.AppendItemInput = .{
         .stack = stack,
-        .kind = kind_v.string,
-        .slug = slug_v.string,
-    };
-    if (obj.get("prompt")) |v| if (v == .string) {
-        input.prompt_body = v.string;
-    };
-    if (obj.get("target")) |t| if (t == .object) {
-        if (t.object.get("provider")) |v| if (v == .string) {
-            input.target_provider = v.string;
-        };
-        if (t.object.get("model")) |v| if (v == .string) {
-            input.target_model = v.string;
-        };
-        if (t.object.get("match")) |v| if (v == .string) {
-            input.target_match = item_mod.Match.fromString(v.string);
-        };
-        if (t.object.get("workdir")) |v| if (v == .string) {
-            input.target_workdir = v.string;
-        };
-    };
-    if (obj.get("sleep_until")) |v| if (v == .string) {
-        input.sleep_until = v.string;
+        .kind = parsed.kind,
+        .slug = parsed.slug,
+        .prompt_body = parsed.prompt_body,
+        .target_provider = parsed.target_provider,
+        .target_model = parsed.target_model,
+        .target_match = parsed.target_match,
+        .target_workdir = parsed.target_workdir,
+        .sleep_until = parsed.sleep_until,
     };
 
     const client = localClient(self, "POST /stacks/{name}/items");
@@ -1788,53 +1791,20 @@ fn handleAppendItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
 }
 
 fn handleInsertItem(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, ref: []const u8) !void {
-    const body = readRequestBody(self, req) catch {
-        try respondError(req, .validation_failed, "failed to read request body", &.{});
-        return;
-    };
-    defer self.allocator.free(body);
-    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
-        try respondError(req, .validation_failed, "invalid JSON body", &.{});
-        return;
-    };
-    defer parsed.deinit();
-    const obj = parsed.value.object;
-    const kind_v = obj.get("kind") orelse {
-        try respondError(req, .validation_failed, "missing field `kind`", &.{});
-        return;
-    };
-    if (kind_v != .string) {
-        try respondError(req, .validation_failed, "field `kind` must be a string", &.{});
-        return;
-    }
-    const slug_v = obj.get("slug") orelse {
-        try respondError(req, .validation_failed, "missing field `slug`", &.{});
-        return;
-    };
-    if (slug_v != .string) {
-        try respondError(req, .validation_failed, "field `slug` must be a string", &.{});
-        return;
-    }
+    var json = (try readJsonValue(self, req)) orelse return;
+    defer json.deinit();
+    const obj = (try expectObject(req, json.parsed.value)) orelse return;
+    const parsed = (try parseItemBody(req, obj)) orelse return;
 
-    var input: mutations_mod.InsertItemInput = .{
+    const input: mutations_mod.InsertItemInput = .{
         .stack = stack,
         .ref = ref,
-        .kind = kind_v.string,
-        .slug = slug_v.string,
-    };
-    if (obj.get("prompt")) |v| if (v == .string) {
-        input.prompt_body = v.string;
-    };
-    if (obj.get("target")) |t| if (t == .object) {
-        if (t.object.get("provider")) |v| if (v == .string) {
-            input.target_provider = v.string;
-        };
-        if (t.object.get("model")) |v| if (v == .string) {
-            input.target_model = v.string;
-        };
-        if (t.object.get("match")) |v| if (v == .string) {
-            input.target_match = item_mod.Match.fromString(v.string);
-        };
+        .kind = parsed.kind,
+        .slug = parsed.slug,
+        .prompt_body = parsed.prompt_body,
+        .target_provider = parsed.target_provider,
+        .target_model = parsed.target_model,
+        .target_match = parsed.target_match,
     };
 
     const client = localClient(self, "POST /stacks/{name}/items/{id}/insert");
@@ -1871,12 +1841,11 @@ fn handleTransition(
         };
         defer parsed.deinit();
         if (parsed.value == .object) {
-            if (parsed.value.object.get("replacement")) |v| if (v == .string) {
-                // Copy the string out of the parsed arena.
-                const dup = try self.allocator.dupe(u8, v.string);
+            if (optionalString(parsed.value.object, "replacement")) |replacement| {
+                const dup = try self.allocator.dupe(u8, replacement);
                 sup_id_buf = dup;
                 input.superseded_by = dup;
-            };
+            }
         }
     }
     if (t == .supersede and input.superseded_by == null) {
@@ -1893,24 +1862,30 @@ fn handleTransition(
     try respondMutationResult(req, self.allocator, client.transitionItem(stack, input), stack, id);
 }
 
-fn handlePauseResume(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, paused: bool) !void {
-    // Drain (and discard) the body to honor the HTTP spec.
-    const body = readRequestBody(self, req) catch "";
-    if (body.len > 0) self.allocator.free(body);
-
+fn handlePauseResume(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, paused: bool, body_already_consumed: bool) !void {
+    if (!body_already_consumed) {
+        // Drain (and discard) the body to honor the HTTP spec.
+        const body = readRequestBody(self, req) catch "";
+        if (body.len > 0) self.allocator.free(body);
+    }
     const api_path = if (paused) "POST /stacks/{name}/pause" else "POST /stacks/{name}/resume";
     const client = localClient(self, api_path);
     try respondMutationResult(req, self.allocator, client.setPaused(stack, paused), stack, "");
 }
 
-/// Pause/resume entry point invoked when the browser-form auth path
-/// already consumed the request body (see `verifyAuthFormBody`). The body
-/// only ever carries `_token`, so there's nothing to re-parse — we just
-/// submit the mutation.
-fn handlePauseResumeFormPath(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, paused: bool) !void {
-    const api_path = if (paused) "POST /stacks/{name}/pause" else "POST /stacks/{name}/resume";
-    const client = localClient(self, api_path);
-    try respondMutationResult(req, self.allocator, client.setPaused(stack, paused), stack, "");
+fn handleTransitionRoute(
+    self: *Daemon,
+    req: *std.http.Server.Request,
+    stack: []const u8,
+    id: []const u8,
+    t: mutations_mod.ApiTransition,
+    body_already_consumed: bool,
+) !void {
+    if (body_already_consumed) {
+        try handleTransitionFormPath(self, req, stack, id, t);
+    } else {
+        try handleTransition(self, req, stack, id, t);
+    }
 }
 
 /// Cancel/retry/supersede entry point for the browser-form auth path. The
@@ -1945,24 +1920,16 @@ fn handleTransitionFormPath(
 }
 
 fn handleConfigPost(self: *Daemon, req: *std.http.Server.Request, stack: []const u8) !void {
-    const body = readRequestBody(self, req) catch {
-        try respondError(req, .validation_failed, "failed to read request body", &.{});
-        return;
-    };
-    defer self.allocator.free(body);
-    var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
-        try respondError(req, .validation_failed, "invalid JSON body", &.{});
-        return;
-    };
-    defer parsed.deinit();
+    var json = (try readJsonValue(self, req)) orelse return;
+    defer json.deinit();
 
     var patches = std.ArrayList(mutations_mod.ConfigPatch){};
     defer patches.deinit(self.allocator);
 
     // Accept either `{"set":{"key":"value",...}}` or `{"key":"value",...}` shape.
-    var src = parsed.value;
-    if (parsed.value == .object) {
-        if (parsed.value.object.get("set")) |v| if (v == .object) {
+    var src = json.parsed.value;
+    if (json.parsed.value == .object) {
+        if (json.parsed.value.object.get("set")) |v| if (v == .object) {
             src = v;
         };
     }

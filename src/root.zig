@@ -22,7 +22,6 @@ pub const audit = @import("audit.zig");
 pub const vcs = @import("vcs.zig");
 pub const mutations = @import("mutations.zig");
 pub const stack = @import("stack.zig");
-pub const mutation_queue = @import("mutation_queue.zig");
 pub const events = @import("events.zig");
 pub const adapter = @import("adapter.zig");
 pub const fake_adapter = @import("fake_adapter.zig");

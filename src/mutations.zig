@@ -156,7 +156,7 @@ pub fn applyCreateStack(
     }
 
     // Write the file.
-    const file_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/stack.toml", .{input.name});
+    const file_rel = try stackConfigRel(allocator, input.name);
     defer allocator.free(file_rel);
     const file_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, file_rel });
     defer allocator.free(file_abs);
@@ -176,8 +176,7 @@ pub fn applyCreateStack(
 
     const subject = try std.fmt.allocPrint(allocator, "stack: create {s}", .{input.name});
     errdefer allocator.free(subject);
-    const body = try std.fmt.allocPrint(allocator,
-        "stack: {s}\nidentity: {s}\napi: {s}\n", .{ input.name, ident.identity, ident.api_path });
+    const body = try std.fmt.allocPrint(allocator, "stack: {s}\nidentity: {s}\napi: {s}\n", .{ input.name, ident.identity, ident.api_path });
     errdefer allocator.free(body);
     const target = try std.fmt.allocPrint(allocator, "stack/{s}", .{input.name});
     errdefer allocator.free(target);
@@ -440,7 +439,7 @@ pub fn applyTransition(
         .supersede => "supersede",
         .retry => "retry",
     };
-    const path_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/{s}/meta.toml", .{ input.stack, item_dir_name });
+    const path_rel = try itemMetaRel(allocator, input.stack, item_dir_name);
     var paths_list = std.ArrayList([]u8){};
     errdefer {
         for (paths_list.items) |p| allocator.free(p);
@@ -449,8 +448,7 @@ pub fn applyTransition(
     try paths_list.append(allocator, path_rel);
 
     const subject = try std.fmt.allocPrint(allocator, "item: {s} {s}", .{ verb, input.id });
-    const body = try std.fmt.allocPrint(allocator,
-        "stack: {s}\nitem: {s}\nidentity: {s}\napi: {s}\n", .{ input.stack, input.id, ident.identity, ident.api_path });
+    const body = try std.fmt.allocPrint(allocator, "stack: {s}\nitem: {s}\nidentity: {s}\napi: {s}\n", .{ input.stack, input.id, ident.identity, ident.api_path });
     const target = try std.fmt.allocPrint(allocator, "stack/{s}/item/{s}", .{ input.stack, input.id });
     const details = try allocator.alloc(audit.DetailKV, 0);
 
@@ -572,7 +570,7 @@ pub fn applyRuntimeTransition(
         try f.writeAll(out_buf.items);
     }
 
-    const path_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/{s}/meta.toml", .{ input.stack, item_dir_name });
+    const path_rel = try itemMetaRel(allocator, input.stack, item_dir_name);
     var paths_list = std.ArrayList([]u8){};
     errdefer {
         for (paths_list.items) |p| allocator.free(p);
@@ -619,7 +617,7 @@ pub fn applySetPaused(
     const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack });
     defer allocator.free(stack_abs);
     if (!dirExists(stack_abs)) return error.NotFound;
-    const cfg_path_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/stack.toml", .{stack});
+    const cfg_path_rel = try stackConfigRel(allocator, stack);
     errdefer allocator.free(cfg_path_rel);
     const cfg_path_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, cfg_path_rel });
     defer allocator.free(cfg_path_abs);
@@ -635,8 +633,7 @@ pub fn applySetPaused(
 
     const verb: []const u8 = if (paused) "pause" else "resume";
     const subject = try std.fmt.allocPrint(allocator, "stack: {s} {s}", .{ verb, stack });
-    const body = try std.fmt.allocPrint(allocator,
-        "stack: {s}\nidentity: {s}\napi: {s}\n", .{ stack, ident.identity, ident.api_path });
+    const body = try std.fmt.allocPrint(allocator, "stack: {s}\nidentity: {s}\napi: {s}\n", .{ stack, ident.identity, ident.api_path });
     const target = try std.fmt.allocPrint(allocator, "stack/{s}", .{stack});
     const details = try allocator.alloc(audit.DetailKV, 0);
 
@@ -671,7 +668,7 @@ pub fn applyConfigPatch(
     defer allocator.free(stack_abs);
     if (!dirExists(stack_abs)) return error.NotFound;
 
-    const cfg_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/stack.toml", .{stack});
+    const cfg_rel = try stackConfigRel(allocator, stack);
     errdefer allocator.free(cfg_rel);
     const cfg_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, cfg_rel });
     defer allocator.free(cfg_abs);
@@ -716,8 +713,7 @@ pub fn applyConfigPatch(
     try paths_list.append(allocator, cfg_rel);
 
     const subject = try std.fmt.allocPrint(allocator, "stack: configure {s}", .{stack});
-    const body = try std.fmt.allocPrint(allocator,
-        "stack: {s}\nidentity: {s}\napi: {s}\n", .{ stack, ident.identity, ident.api_path });
+    const body = try std.fmt.allocPrint(allocator, "stack: {s}\nidentity: {s}\napi: {s}\n", .{ stack, ident.identity, ident.api_path });
     const target = try std.fmt.allocPrint(allocator, "stack/{s}", .{stack});
     const details = try allocator.alloc(audit.DetailKV, 0);
 
@@ -734,6 +730,22 @@ pub fn applyConfigPatch(
 }
 
 // ---------- helpers ----------
+
+pub fn stackDirRel(allocator: std.mem.Allocator, stack: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "stacks/{s}", .{stack});
+}
+
+pub fn stackConfigRel(allocator: std.mem.Allocator, stack: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "stacks/{s}/stack.toml", .{stack});
+}
+
+pub fn itemDirName(allocator: std.mem.Allocator, id: []const u8, slug: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}-{s}", .{ id, slug });
+}
+
+pub fn itemMetaRel(allocator: std.mem.Allocator, stack: []const u8, dir_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "stacks/{s}/{s}/meta.toml", .{ stack, dir_name });
+}
 
 const WriteItemOpts = struct {
     prompt_body: ?[]const u8 = null,
@@ -780,7 +792,7 @@ fn writeItem(
     const now = opts.created_at_override orelse audit.nowRfc3339Millis(&ts_buf);
 
     // Item directory.
-    const dir_name = try std.fmt.allocPrint(aa, "{s}-{s}", .{ id, slug });
+    const dir_name = try itemDirName(aa, id, slug);
     const dir_abs = try std.fs.path.join(aa, &.{ notes_root_abs, "stacks", stack, dir_name });
     try std.fs.cwd().makePath(dir_abs);
 
@@ -851,7 +863,7 @@ fn writeItem(
     }
 
     // Build output.
-    const meta_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/{s}/meta.toml", .{ stack, dir_name });
+    const meta_rel = try itemMetaRel(allocator, stack, dir_name);
     var paths_list = std.ArrayList([]u8){};
     errdefer {
         for (paths_list.items) |p| allocator.free(p);
@@ -859,7 +871,7 @@ fn writeItem(
     }
     if (opts.commit_stack_dir) {
         allocator.free(meta_rel);
-        const stack_rel = try std.fmt.allocPrint(allocator, "stacks/{s}", .{stack});
+        const stack_rel = try stackDirRel(allocator, stack);
         try paths_list.append(allocator, stack_rel);
     } else {
         try paths_list.append(allocator, meta_rel);
@@ -870,8 +882,7 @@ fn writeItem(
 
     const verb = if (action == .insert_item) "insert" else "append";
     const subject = try std.fmt.allocPrint(allocator, "stack: {s} {s}-{s}", .{ verb, id, slug });
-    const body_str = try std.fmt.allocPrint(allocator,
-        "stack: {s}\nitem: {s}\nidentity: {s}\napi: {s}\n", .{ stack, id, ident.identity, ident.api_path });
+    const body_str = try std.fmt.allocPrint(allocator, "stack: {s}\nitem: {s}\nidentity: {s}\napi: {s}\n", .{ stack, id, ident.identity, ident.api_path });
     const target = try std.fmt.allocPrint(allocator, "stack/{s}/item/{s}", .{ stack, id });
 
     const details_buf = try allocator.alloc(u8, id.len);

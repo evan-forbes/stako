@@ -12,7 +12,6 @@ const init_mod = stako.init;
 const daemon_mod = stako.daemon;
 const audit_mod = stako.audit;
 const sse_mod = stako.sse;
-const mutation_queue = stako.mutation_queue;
 const session_manager = stako.session_manager;
 const runtime_file = stako.runtime_file;
 const runtime_mod = stako.runtime;
@@ -74,7 +73,8 @@ fn seedStack(a: std.mem.Allocator, root: []const u8, stack: []const u8, paused: 
     defer a.free(cfg);
     var f = try std.fs.cwd().createFile(cfg, .{ .truncate = true });
     defer f.close();
-    const content = try std.fmt.allocPrint(a,
+    const content = try std.fmt.allocPrint(
+        a,
         "description = \"runtime test stack\"\ncreated_at = 2026-05-10T14:00:00Z\npaused = {s}\ncontinuity = \"fresh\"\nmax_concurrent_per_stack = 1\n",
         .{if (paused) "true" else "false"},
     );

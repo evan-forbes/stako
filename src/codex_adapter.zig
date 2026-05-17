@@ -28,7 +28,18 @@
 
 const std = @import("std");
 const adapter = @import("adapter.zig");
+const adapter_json = @import("adapter_json.zig");
 const events = @import("events.zig");
+
+const stripEol = adapter_json.stripEol;
+const findStringValue = adapter_json.findStringValue;
+const findTopLevelStringValue = adapter_json.findTopLevelStringValue;
+const findIntValue = adapter_json.findIntValue;
+const findObjectValue = adapter_json.findObjectValue;
+const findArrayValue = adapter_json.findArrayValue;
+const findMatchingBraceEnd = adapter_json.findMatchingBraceEnd;
+const jsonEscape = adapter_json.jsonEscape;
+const writeParsedJsonStringContent = adapter_json.writeParsedJsonStringContent;
 
 pub const State = struct {
     session_id: []u8 = "",
@@ -41,6 +52,46 @@ pub const State = struct {
         if (self.session_id.len > 0) allocator.free(self.session_id);
         if (self.model.len > 0) allocator.free(self.model);
         if (self.session_file.len > 0) allocator.free(self.session_file);
+    }
+};
+
+const CodexEventType = enum {
+    thread_started,
+    turn_started,
+    turn_completed,
+    turn_failed,
+    @"error",
+    thread_error,
+    item_completed,
+    item_updated,
+    unknown,
+
+    fn fromString(s: []const u8) CodexEventType {
+        if (std.mem.eql(u8, s, "thread.started")) return .thread_started;
+        if (std.mem.eql(u8, s, "turn.started")) return .turn_started;
+        if (std.mem.eql(u8, s, "turn.completed")) return .turn_completed;
+        if (std.mem.eql(u8, s, "turn.failed")) return .turn_failed;
+        if (std.mem.eql(u8, s, "error")) return .@"error";
+        if (std.mem.eql(u8, s, "thread.error")) return .thread_error;
+        if (std.mem.eql(u8, s, "item.completed")) return .item_completed;
+        if (std.mem.eql(u8, s, "item.updated")) return .item_updated;
+        return .unknown;
+    }
+};
+
+const CodexItemType = enum {
+    agent_message,
+    reasoning,
+    command_execution,
+    file_change,
+    unknown,
+
+    fn fromString(s: []const u8) CodexItemType {
+        if (std.mem.eql(u8, s, "agent_message")) return .agent_message;
+        if (std.mem.eql(u8, s, "reasoning")) return .reasoning;
+        if (std.mem.eql(u8, s, "command_execution")) return .command_execution;
+        if (std.mem.eql(u8, s, "file_change")) return .file_change;
+        return .unknown;
     }
 };
 
@@ -160,72 +211,77 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
         out.deinit(allocator);
     }
 
-    if (std.mem.eql(u8, type_str, "thread.started")) {
-        if (findStringValue(line, "\"thread_id\":")) |tid| {
-            if (st.session_id.len > 0) allocator.free(st.session_id);
-            st.session_id = try allocator.dupe(u8, tid);
-        }
-        if (findStringValue(line, "\"model\":")) |m| {
-            if (st.model.len > 0) allocator.free(st.model);
-            st.model = try allocator.dupe(u8, m);
-        }
-        if (findStringValue(line, "\"session_file\":")) |sf| {
-            if (st.session_file.len > 0) allocator.free(st.session_file);
-            st.session_file = try allocator.dupe(u8, sf);
-        }
-        if (!st.seen_thread_started) {
-            st.seen_thread_started = true;
-            try emitSessionStarted(allocator, &out, st);
-        }
-    } else if (std.mem.eql(u8, type_str, "turn.started")) {
-        try emitTurnStarted(allocator, &out, st);
-        st.turn_index += 1;
-    } else if (std.mem.eql(u8, type_str, "turn.completed")) {
-        try emitTurnCompleted(allocator, &out, st);
-    } else if (std.mem.eql(u8, type_str, "turn.failed")) {
-        const msg = findStringValue(findObjectValue(line, "\"error\":") orelse "{}", "\"message\":") orelse "turn_failed";
-        try emitError(allocator, &out, msg, false);
-    } else if (std.mem.eql(u8, type_str, "error") or std.mem.eql(u8, type_str, "thread.error")) {
-        const msg = findStringValue(line, "\"message\":") orelse "error";
-        try emitError(allocator, &out, msg, true);
-    } else if (std.mem.eql(u8, type_str, "item.completed") or std.mem.eql(u8, type_str, "item.updated")) {
-        const item = findObjectValue(line, "\"item\":") orelse {
-            return out.toOwnedSlice(allocator);
-        };
-        const item_type = findStringValue(item, "\"item_type\":") orelse "";
-        if (std.mem.eql(u8, item_type, "agent_message")) {
-            const text = findStringValue(item, "\"text\":") orelse "";
-            try emitMessage(allocator, &out, text, "assistant");
-        } else if (std.mem.eql(u8, item_type, "reasoning")) {
-            const text = findStringValue(item, "\"text\":") orelse "";
-            try emitMessage(allocator, &out, text, "reasoning");
-        } else if (std.mem.eql(u8, item_type, "command_execution")) {
-            const cmd = findStringValue(item, "\"command\":") orelse "";
-            const exit_code = findIntValue(item, "\"exit_code\":") orelse 0;
-            const call_id = findStringValue(item, "\"id\":") orelse "";
-            // Build args object: {"command":"..."}.
-            var argbuf = std.ArrayList(u8){};
-            defer argbuf.deinit(allocator);
-            try argbuf.writer(allocator).writeAll("{\"command\":\"");
-            try writeParsedJsonStringContent(argbuf.writer(allocator), cmd);
-            try argbuf.writer(allocator).writeAll("\"}");
-            try emitToolCall(allocator, &out, "command_execution", argbuf.items, call_id);
-            try emitCommandExecuted(allocator, &out, cmd, @intCast(exit_code));
-        } else if (std.mem.eql(u8, item_type, "file_change")) {
-            const call_id = findStringValue(item, "\"id\":") orelse "";
-            // Emit a single tool_call summary + per-change file_changed.
-            try emitToolCall(allocator, &out, "file_change", "{}", call_id);
-            if (findArrayValue(item, "\"changes\":")) |arr| {
-                try emitFileChangesFromArray(allocator, &out, arr);
-            } else if (findStringValue(item, "\"path\":")) |p| {
-                const kind = findStringValue(item, "\"kind\":") orelse "modify";
-                try emitFileChanged(allocator, &out, p, mapCodexFileKind(kind));
+    switch (CodexEventType.fromString(type_str)) {
+        .thread_started => {
+            if (findStringValue(line, "\"thread_id\":")) |tid| {
+                if (st.session_id.len > 0) allocator.free(st.session_id);
+                st.session_id = try allocator.dupe(u8, tid);
             }
-        }
-        // Other item_types (mcp_tool_call, web_search, plan_update) are not
-        // projected to normalized kinds in v1.
-    } else {
-        try emitError(allocator, &out, "adapter_unknown_event", true);
+            if (findStringValue(line, "\"model\":")) |m| {
+                if (st.model.len > 0) allocator.free(st.model);
+                st.model = try allocator.dupe(u8, m);
+            }
+            if (findStringValue(line, "\"session_file\":")) |sf| {
+                if (st.session_file.len > 0) allocator.free(st.session_file);
+                st.session_file = try allocator.dupe(u8, sf);
+            }
+            if (!st.seen_thread_started) {
+                st.seen_thread_started = true;
+                try emitSessionStarted(allocator, &out, st);
+            }
+        },
+        .turn_started => {
+            try emitTurnStarted(allocator, &out, st);
+            st.turn_index += 1;
+        },
+        .turn_completed => try emitTurnCompleted(allocator, &out, st),
+        .turn_failed => {
+            const msg = findStringValue(findObjectValue(line, "\"error\":") orelse "{}", "\"message\":") orelse "turn_failed";
+            try emitError(allocator, &out, msg, false);
+        },
+        .@"error", .thread_error => {
+            const msg = findStringValue(line, "\"message\":") orelse "error";
+            try emitError(allocator, &out, msg, true);
+        },
+        .item_completed, .item_updated => {
+            const item = findObjectValue(line, "\"item\":") orelse {
+                return out.toOwnedSlice(allocator);
+            };
+            switch (CodexItemType.fromString(findStringValue(item, "\"item_type\":") orelse "")) {
+                .agent_message => {
+                    const text = findStringValue(item, "\"text\":") orelse "";
+                    try emitMessage(allocator, &out, text, "assistant");
+                },
+                .reasoning => {
+                    const text = findStringValue(item, "\"text\":") orelse "";
+                    try emitMessage(allocator, &out, text, "reasoning");
+                },
+                .command_execution => {
+                    const cmd = findStringValue(item, "\"command\":") orelse "";
+                    const exit_code = findIntValue(item, "\"exit_code\":") orelse 0;
+                    const call_id = findStringValue(item, "\"id\":") orelse "";
+                    var argbuf = std.ArrayList(u8){};
+                    defer argbuf.deinit(allocator);
+                    try argbuf.writer(allocator).writeAll("{\"command\":\"");
+                    try writeParsedJsonStringContent(argbuf.writer(allocator), cmd);
+                    try argbuf.writer(allocator).writeAll("\"}");
+                    try emitToolCall(allocator, &out, "command_execution", argbuf.items, call_id);
+                    try emitCommandExecuted(allocator, &out, cmd, @intCast(exit_code));
+                },
+                .file_change => {
+                    const call_id = findStringValue(item, "\"id\":") orelse "";
+                    try emitToolCall(allocator, &out, "file_change", "{}", call_id);
+                    if (findArrayValue(item, "\"changes\":")) |arr| {
+                        try emitFileChangesFromArray(allocator, &out, arr);
+                    } else if (findStringValue(item, "\"path\":")) |p| {
+                        const kind = findStringValue(item, "\"kind\":") orelse "modify";
+                        try emitFileChanged(allocator, &out, p, mapCodexFileKind(kind));
+                    }
+                },
+                .unknown => {},
+            }
+        },
+        .unknown => try emitError(allocator, &out, "adapter_unknown_event", true),
     }
 
     return out.toOwnedSlice(allocator);
@@ -478,271 +534,6 @@ fn emitErrorList(allocator: std.mem.Allocator, slug: []const u8, recoverable: bo
         .storage = storage,
     };
     return arr;
-}
-
-// ---------- shared JSON micro-parsers (duplicated from claude_adapter to
-// keep each adapter self-contained; the helpers are small enough that
-// dragging them through a shared module isn't worth the indirection in v1) ----------
-
-fn stripEol(raw: []const u8) []const u8 {
-    var line = raw;
-    if (line.len > 0 and line[line.len - 1] == '\n') line = line[0 .. line.len - 1];
-    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-    return line;
-}
-
-/// Find the value of a top-level (depth==1) string key in a JSON object.
-/// Walks the source tracking string/escape state and brace/bracket depth, so
-/// nested objects are skipped — `findStringValue(`{"a":{"k":"buried"},"k":"top"}`, "\"k\":")`
-/// returns `"top"`, not `"buried"`. This matters whenever a key shadows a
-/// vendor-nested key (e.g. `"message"` inside an error details object).
-fn findStringValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    var depth: usize = 0;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
-                var j = i + key_with_colon.len;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-                if (j >= src.len or src[j] != '"') return null;
-                j += 1;
-                const start = j;
-                while (j < src.len) : (j += 1) {
-                    if (src[j] == '\\') {
-                        j += 1;
-                        continue;
-                    }
-                    if (src[j] == '"') return src[start..j];
-                }
-                return null;
-            }
-            in_str = true;
-            continue;
-        }
-        if (c == '{' or c == '[') depth += 1;
-        if (c == '}' or c == ']') {
-            if (depth == 0) return null;
-            depth -= 1;
-        }
-    }
-    return null;
-}
-
-/// Alias retained for readability at call sites that historically distinguish
-/// "top-level only" from the older buggy first-match scanner. The two helpers
-/// now share identical depth-1 semantics.
-const findTopLevelStringValue = findStringValue;
-
-/// Top-level (depth==1) integer-value lookup.
-fn findIntValue(src: []const u8, key_with_colon: []const u8) ?i64 {
-    var i: usize = 0;
-    var depth: usize = 0;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
-                var j = i + key_with_colon.len;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-                const start = j;
-                while (j < src.len and (std.ascii.isDigit(src[j]) or src[j] == '-')) j += 1;
-                return std.fmt.parseInt(i64, src[start..j], 10) catch null;
-            }
-            in_str = true;
-            continue;
-        }
-        if (c == '{' or c == '[') depth += 1;
-        if (c == '}' or c == ']') {
-            if (depth == 0) return null;
-            depth -= 1;
-        }
-    }
-    return null;
-}
-
-/// Top-level (depth==1) object-value lookup. Returns the object's bytes
-/// including its outer braces. Skips nested objects.
-fn findObjectValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    var depth: usize = 0;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
-                var j = i + key_with_colon.len;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-                if (j >= src.len or src[j] != '{') return null;
-                const end = findMatchingBraceEnd(src, j) orelse return null;
-                return src[j..end];
-            }
-            in_str = true;
-            continue;
-        }
-        if (c == '{' or c == '[') depth += 1;
-        if (c == '}' or c == ']') {
-            if (depth == 0) return null;
-            depth -= 1;
-        }
-    }
-    return null;
-}
-
-/// Top-level (depth==1) array-value lookup. Returns the array's bytes
-/// including its outer brackets, skipping nested objects/arrays.
-fn findArrayValue(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    var depth: usize = 0;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            if (depth == 1 and std.mem.startsWith(u8, src[i..], key_with_colon)) {
-                var j = i + key_with_colon.len;
-                while (j < src.len and (src[j] == ' ' or src[j] == '\t')) j += 1;
-                if (j >= src.len or src[j] != '[') return null;
-                const start = j;
-                var adepth: usize = 0;
-                var ain_str = false;
-                var aescape = false;
-                while (j < src.len) : (j += 1) {
-                    const ac = src[j];
-                    if (aescape) {
-                        aescape = false;
-                        continue;
-                    }
-                    if (ain_str) {
-                        if (ac == '\\') {
-                            aescape = true;
-                        } else if (ac == '"') {
-                            ain_str = false;
-                        }
-                        continue;
-                    }
-                    if (ac == '"') {
-                        ain_str = true;
-                        continue;
-                    }
-                    if (ac == '[') adepth += 1;
-                    if (ac == ']') {
-                        adepth -= 1;
-                        if (adepth == 0) return src[start .. j + 1];
-                    }
-                }
-                return null;
-            }
-            in_str = true;
-            continue;
-        }
-        if (c == '{' or c == '[') depth += 1;
-        if (c == '}' or c == ']') {
-            if (depth == 0) return null;
-            depth -= 1;
-        }
-    }
-    return null;
-}
-
-fn findMatchingBraceEnd(src: []const u8, start: usize) ?usize {
-    if (start >= src.len or src[start] != '{') return null;
-    var depth: usize = 0;
-    var i = start;
-    var in_str = false;
-    var escape = false;
-    while (i < src.len) : (i += 1) {
-        const c = src[i];
-        if (escape) {
-            escape = false;
-            continue;
-        }
-        if (in_str) {
-            if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                in_str = false;
-            }
-            continue;
-        }
-        if (c == '"') {
-            in_str = true;
-            continue;
-        }
-        if (c == '{') depth += 1;
-        if (c == '}') {
-            depth -= 1;
-            if (depth == 0) return i + 1;
-        }
-    }
-    return null;
-}
-
-fn jsonEscape(w: anytype, s: []const u8) !void {
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        '\n' => try w.writeAll("\\n"),
-        '\r' => try w.writeAll("\\r"),
-        '\t' => try w.writeAll("\\t"),
-        else => try w.writeByte(c),
-    };
-}
-
-fn writeParsedJsonStringContent(w: anytype, s: []const u8) !void {
-    try w.writeAll(s);
 }
 
 // ---------- tests ----------

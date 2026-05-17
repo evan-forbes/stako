@@ -1,9 +1,9 @@
 //! Integration tests for the milestone-5 mutation surface.
 //!
 //! Each test boots an ephemeral daemon against a temp notes root that has a
-//! real git repo (created via `vcs.ensureRealRepo`). The mutation queue
-//! worker is started, so POST endpoints exercise the full path:
-//! HTTP → queue → mutations → vcs commit → audit log.
+//! real git repo (created via `vcs.ensureRealRepo`). POST endpoints exercise
+//! the full stack-client path:
+//! HTTP → StackClient → mutations → vcs commit → audit log.
 
 const std = @import("std");
 const stako = @import("stako");
@@ -12,7 +12,6 @@ const daemon_mod = stako.daemon;
 const vcs = stako.vcs;
 const audit_mod = stako.audit;
 const mutations_mod = stako.mutations;
-const mutation_queue = stako.mutation_queue;
 
 // ---------- harness ----------
 
@@ -175,21 +174,15 @@ fn buildAuthHeader(allocator: std.mem.Allocator, token: []const u8) ![]u8 {
 
 /// Compose `POST <path> HTTP/1.1\r\n...` with the bearer token and given JSON body.
 fn buildPostRequest(allocator: std.mem.Allocator, path: []const u8, token: []const u8, body: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ path, token, body.len, body });
+    return std.fmt.allocPrint(allocator, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ path, token, body.len, body });
 }
 
 fn buildPostNoToken(allocator: std.mem.Allocator, path: []const u8, body: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ path, body.len, body });
+    return std.fmt.allocPrint(allocator, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ path, body.len, body });
 }
 
 fn buildGetRequest(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-        .{path});
+    return std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{path});
 }
 
 /// Count lines in audit.log under <root>/.stako/audit.log; returns 0 if absent.
@@ -429,7 +422,8 @@ test "mutation: two concurrent requests serialize and both succeed" {
         result_status: u16 = 0,
 
         fn run(self: *@This()) void {
-            const req = std.fmt.allocPrint(self.a,
+            const req = std.fmt.allocPrint(
+                self.a,
                 "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
                 .{ self.token, self.body.len, self.body },
             ) catch return;
