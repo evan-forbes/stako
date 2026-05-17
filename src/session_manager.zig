@@ -28,6 +28,8 @@ const events = @import("events.zig");
 const transcript_mod = @import("transcript.zig");
 const sse_mod = @import("sse.zig");
 const audit = @import("audit.zig");
+const item_mod = @import("item.zig");
+const output_packet = @import("output_packet.zig");
 const runtime_file = @import("runtime_file.zig");
 const stack_mod = @import("stack.zig");
 
@@ -59,6 +61,10 @@ pub const Session = struct {
     outcome: *RunOutcome,
     session_id: []u8 = "",
     session_id_mutex: std.Thread.Mutex = .{},
+    thread_name: ?[]u8 = null,
+    thread_mode: item_mod.ThreadMode = .fresh,
+    resume_session_id: ?[]u8 = null,
+    workdir_before: ?output_packet.WorkdirSnapshot = null,
 
     stdout_thread: ?std.Thread = null,
     stderr_thread: ?std.Thread = null,
@@ -77,6 +83,9 @@ pub const Session = struct {
         self.allocator.free(self.item_dir_abs);
         self.allocator.free(self.harness_name);
         if (self.session_id.len > 0) self.allocator.free(self.session_id);
+        if (self.thread_name) |s| self.allocator.free(s);
+        if (self.resume_session_id) |s| self.allocator.free(s);
+        if (self.workdir_before) |*snap| snap.deinit();
         if (self.started_at.len > 0) self.allocator.free(self.started_at);
         self.allocator.destroy(self.outcome);
     }
@@ -177,6 +186,9 @@ pub const Manager = struct {
         argv: []const []const u8,
         cwd: ?[]const u8 = null,
         adapter: adapter_mod.Adapter,
+        thread_name: ?[]const u8 = null,
+        thread_mode: item_mod.ThreadMode = .fresh,
+        resume_session_id: ?[]const u8 = null,
     };
 
     pub fn spawn(self: *Manager, input: SpawnInput) Error!*Session {
@@ -224,6 +236,9 @@ pub const Manager = struct {
             try spawn_argv_slices.append(self.allocator, dup);
             argv_owned[i] = dup;
         }
+
+        var workdir_before = output_packet.snapshotWorkdir(self.allocator, input.cwd) catch null;
+        errdefer if (workdir_before) |*snap| snap.deinit();
 
         var child = std.process.Child.init(argv_owned, self.allocator);
         if (input.cwd) |c| child.cwd = c;
@@ -276,7 +291,12 @@ pub const Manager = struct {
             .transcript = t,
             .started_at = start_ts_owned,
             .outcome = outcome,
+            .thread_name = if (input.thread_name) |s| try self.allocator.dupe(u8, s) else null,
+            .thread_mode = input.thread_mode,
+            .resume_session_id = if (input.resume_session_id) |s| try self.allocator.dupe(u8, s) else null,
+            .workdir_before = workdir_before,
         };
+        workdir_before = null;
         // Resources are now owned by `sess` — let `sess.deinit()` handle
         // them and prevent the local errdefers from double-freeing.
         transcript_in_local = false;
@@ -467,26 +487,125 @@ fn applyTransition(registry: *stack_mod.StackRegistry, input: stack_mod.RuntimeT
     }
 }
 
+/// Cap on a single line's buffered length. A vendor CLI emitting a
+/// multi-megabyte run-on line without a newline would otherwise grow the
+/// pump's per-stream `ArrayList(u8)` unboundedly — once a payload exceeds
+/// this we drop the partial line and emit one `error` event so the UI
+/// records the loss instead of silently swallowing it. 1 MiB comfortably
+/// fits every legitimate adapter line we've measured.
+pub const LINE_BUF_CAP: usize = 1 * 1024 * 1024;
+
+/// Bounded line accumulator for the stdout/stderr pumps. Reuses
+/// `std.ArrayList(u8)` for storage; the cap is enforced at every `push`
+/// call. When the buffered partial line (everything after the last `\n`)
+/// would exceed `cap`, the partial line is dropped wholesale and
+/// `drop_bytes` accumulates the dropped count; `overflow_pending` is set
+/// so the pump can emit exactly one `error` event per drop and then
+/// reset.
+pub const LineBuffer = struct {
+    allocator: std.mem.Allocator,
+    cap: usize,
+    buf: std.ArrayList(u8) = .{},
+    drop_bytes: u64 = 0,
+    overflow_pending: bool = false,
+
+    pub fn deinit(self: *LineBuffer) void {
+        self.buf.deinit(self.allocator);
+    }
+
+    /// Append `chunk`, then enforce the cap. Complete lines already
+    /// present before the cap was hit remain in the buffer and can be
+    /// drained by `drainLines`; only the trailing partial line is
+    /// dropped on overflow.
+    pub fn push(self: *LineBuffer, chunk: []const u8) !void {
+        try self.buf.appendSlice(self.allocator, chunk);
+        if (self.buf.items.len <= self.cap) return;
+        const partial_start: usize = blk: {
+            if (std.mem.lastIndexOfScalar(u8, self.buf.items, '\n')) |last_nl| {
+                break :blk last_nl + 1;
+            } else {
+                break :blk 0;
+            }
+        };
+        const partial_len = self.buf.items.len - partial_start;
+        if (partial_len <= self.cap) return;
+        self.drop_bytes += @as(u64, partial_len);
+        self.buf.shrinkRetainingCapacity(partial_start);
+        self.overflow_pending = true;
+    }
+
+    /// Pop and return the next complete line (including the trailing
+    /// `\n`) as a slice borrowed from the internal buffer. The returned
+    /// slice is valid only until the next mutating call on this
+    /// LineBuffer; copy if you need it to outlive `drainLine`.
+    pub fn drainLine(self: *LineBuffer) ?[]const u8 {
+        const nl = std.mem.indexOfScalar(u8, self.buf.items, '\n') orelse return null;
+        return self.buf.items[0 .. nl + 1];
+    }
+
+    /// Advance past the most recently returned line. Call exactly once
+    /// after each `drainLine` whose return value the caller has finished
+    /// consuming.
+    pub fn consumeDrainedLine(self: *LineBuffer) void {
+        const nl = std.mem.indexOfScalar(u8, self.buf.items, '\n') orelse return;
+        const remaining = self.buf.items[nl + 1 ..];
+        std.mem.copyForwards(u8, self.buf.items, remaining);
+        self.buf.shrinkRetainingCapacity(remaining.len);
+    }
+
+    /// Read-and-clear the overflow flag.
+    pub fn takeOverflow(self: *LineBuffer) bool {
+        const v = self.overflow_pending;
+        self.overflow_pending = false;
+        return v;
+    }
+};
+
 fn stdoutPump(s: *Session) void {
     defer s.outcome.finished.store(true, .seq_cst);
-    if (s.child.stdout) |stdout| {
-        var read_buf: [4096]u8 = undefined;
-        var line_buf = std.ArrayList(u8){};
-        defer line_buf.deinit(s.allocator);
-        while (true) {
-            const n = stdout.read(&read_buf) catch break;
-            if (n == 0) break;
-            line_buf.appendSlice(s.allocator, read_buf[0..n]) catch break;
-            while (true) {
-                const nl = std.mem.indexOfScalar(u8, line_buf.items, '\n') orelse break;
-                const line = line_buf.items[0 .. nl + 1];
-                processStdoutLine(s, line);
-                const remaining = line_buf.items[nl + 1 ..];
-                std.mem.copyForwards(u8, line_buf.items, remaining);
-                line_buf.shrinkRetainingCapacity(remaining.len);
-            }
+    if (s.child.stdout) |stdout| pumpStream(s, stdout, .stdout, processStdoutLine);
+}
+
+const StreamLabel = enum { stdout, stderr };
+
+fn pumpStream(
+    s: *Session,
+    file: std.fs.File,
+    stream: StreamLabel,
+    line_cb: *const fn (*Session, []const u8) void,
+) void {
+    var read_buf: [4096]u8 = undefined;
+    var lb = LineBuffer{ .allocator = s.allocator, .cap = LINE_BUF_CAP };
+    defer lb.deinit();
+    while (true) {
+        const n = file.read(&read_buf) catch break;
+        if (n == 0) break;
+        lb.push(read_buf[0..n]) catch break;
+        while (lb.drainLine()) |line| {
+            line_cb(s, line);
+            lb.consumeDrainedLine();
         }
+        if (lb.takeOverflow()) emitLineBufOverflow(s, stream, lb.drop_bytes);
     }
+}
+
+fn emitLineBufOverflow(s: *Session, stream: StreamLabel, dropped_total: u64) void {
+    var data_buf = std.ArrayList(u8){};
+    defer data_buf.deinit(s.allocator);
+    data_buf.writer(s.allocator).print(
+        "{{\"message\":\"line_buf_overflow\",\"stream\":\"{s}\",\"dropped_bytes_total\":{d},\"cap_bytes\":{d},\"recoverable\":true}}",
+        .{ @tagName(stream), dropped_total, LINE_BUF_CAP },
+    ) catch return;
+    const data_owned = data_buf.toOwnedSlice(s.allocator) catch return;
+    defer s.allocator.free(data_owned);
+    const ev: events.Event = .{
+        .stack = s.stack,
+        .item = s.item_id,
+        .kind = .@"error",
+        .data_json = data_owned,
+    };
+    s.transcript.append(ev) catch {};
+    if (s.manager.hub) |h| h.publish(ev) catch {};
 }
 
 fn waitForExit(s: *Session) void {
@@ -535,24 +654,7 @@ fn processStdoutLine(s: *Session, line: []const u8) void {
 }
 
 fn stderrPump(s: *Session) void {
-    if (s.child.stderr) |stderr| {
-        var read_buf: [4096]u8 = undefined;
-        var line_buf = std.ArrayList(u8){};
-        defer line_buf.deinit(s.allocator);
-        while (true) {
-            const n = stderr.read(&read_buf) catch break;
-            if (n == 0) break;
-            line_buf.appendSlice(s.allocator, read_buf[0..n]) catch break;
-            while (true) {
-                const nl = std.mem.indexOfScalar(u8, line_buf.items, '\n') orelse break;
-                const line = line_buf.items[0 .. nl + 1];
-                processStderrLine(s, line);
-                const remaining = line_buf.items[nl + 1 ..];
-                std.mem.copyForwards(u8, line_buf.items, remaining);
-                line_buf.shrinkRetainingCapacity(remaining.len);
-            }
-        }
-    }
+    if (s.child.stderr) |stderr| pumpStream(s, stderr, .stderr, processStderrLine);
 }
 
 fn processStderrLine(s: *Session, line: []const u8) void {
@@ -653,9 +755,50 @@ fn onExitMain(s: *Session, term_opt: ?std.process.Child.Term) void {
         .result_model = if (result_model_owned) |x| x else null,
         .result_session_id = sid_for_result,
         .result_session_file = if (result_sf_owned) |x| x else null,
-        .result_transcript_path = s.transcript.path,
+        .result_transcript_path = "../transcript.jsonl",
         .result_exit_code = @as(i64, exit_code),
         .result_completed_at = completed_at,
+    };
+    const summary_owned: ?[]u8 = output_packet.summaryFromTranscript(s.allocator, s.transcript.path) catch null;
+    defer if (summary_owned) |x| s.allocator.free(x);
+    var workdir_after = output_packet.snapshotWorkdir(s.allocator, null) catch null;
+    if (s.workdir_before) |before| {
+        if (before.root) |root| {
+            if (workdir_after) |*snap| snap.deinit();
+            workdir_after = output_packet.snapshotWorkdir(s.allocator, root) catch null;
+        }
+    }
+    defer if (workdir_after) |*snap| snap.deinit();
+    const changed_paths = output_packet.changedPathsFromSnapshots(
+        s.allocator,
+        if (s.workdir_before) |*snap| snap else null,
+        if (workdir_after) |*snap| snap else null,
+    ) catch &.{};
+    defer {
+        for (changed_paths) |p| s.allocator.free(p);
+        if (changed_paths.len > 0) s.allocator.free(changed_paths);
+    }
+    input.output_packet = .{
+        .stack = s.stack,
+        .item_id = s.item_id,
+        .status = tag.toStatus().toString(),
+        .completed_at = completed_at,
+        .result = .{
+            .harness = s.harness_name,
+            .model = if (result_model_owned) |x| x else null,
+            .session_id = sid_for_result,
+            .session_file = if (result_sf_owned) |x| x else null,
+            .transcript_path = "../transcript.jsonl",
+            .exit_code = @as(i64, exit_code),
+            .completed_at = completed_at,
+        },
+        .thread_name = if (s.thread_name) |x| x else null,
+        .thread_mode = if (s.thread_name != null) s.thread_mode else null,
+        .resume_session_id = if (s.resume_session_id) |x| x else null,
+        .summary = if (summary_owned) |x| x else null,
+        .changed_paths = changed_paths,
+        .workdir_before = if (s.workdir_before) |*snap| snap else null,
+        .workdir_after = if (workdir_after) |*snap| snap else null,
     };
     if (tag == .failed) input.failed_reason = "subprocess_nonzero_exit";
     if (tag == .canceled) input.canceled_by = "system";
@@ -720,4 +863,143 @@ fn isAlive(pid: std.posix.pid_t) bool {
         else => return true,
     };
     return true;
+}
+
+// ---------- F2 (follow-up): LineBuffer unit tests ----------
+
+fn drainAllForTest(allocator: std.mem.Allocator, lb: *LineBuffer, out: *std.ArrayList([]u8)) !void {
+    while (lb.drainLine()) |line| {
+        const dup = try allocator.dupe(u8, line);
+        try out.append(allocator, dup);
+        lb.consumeDrainedLine();
+    }
+}
+
+fn freeDrainedForTest(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8)) void {
+    for (lines.items) |s| allocator.free(s);
+    lines.deinit(allocator);
+}
+
+test "LineBuffer: chunk without newline accumulates without producing a line" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 1024 };
+    defer lb.deinit();
+    try lb.push("partial");
+    try std.testing.expect(lb.drainLine() == null);
+    try std.testing.expectEqual(@as(u64, 0), lb.drop_bytes);
+    try std.testing.expect(!lb.overflow_pending);
+}
+
+test "LineBuffer: a single complete line drains exactly once" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 1024 };
+    defer lb.deinit();
+    try lb.push("hello\n");
+    var out = std.ArrayList([]u8){};
+    defer freeDrainedForTest(a, &out);
+    try drainAllForTest(a, &lb, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("hello\n", out.items[0]);
+    try std.testing.expect(lb.drainLine() == null);
+}
+
+test "LineBuffer: multiple newlines in one chunk drain in order" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 1024 };
+    defer lb.deinit();
+    try lb.push("one\ntwo\nthree\n");
+    var out = std.ArrayList([]u8){};
+    defer freeDrainedForTest(a, &out);
+    try drainAllForTest(a, &lb, &out);
+    try std.testing.expectEqual(@as(usize, 3), out.items.len);
+    try std.testing.expectEqualStrings("one\n", out.items[0]);
+    try std.testing.expectEqualStrings("two\n", out.items[1]);
+    try std.testing.expectEqualStrings("three\n", out.items[2]);
+}
+
+test "LineBuffer: partial line accumulates across pushes then drains on newline" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 1024 };
+    defer lb.deinit();
+    try lb.push("hel");
+    try lb.push("lo wor");
+    try std.testing.expect(lb.drainLine() == null);
+    try lb.push("ld\n");
+    var out = std.ArrayList([]u8){};
+    defer freeDrainedForTest(a, &out);
+    try drainAllForTest(a, &lb, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("hello world\n", out.items[0]);
+}
+
+test "LineBuffer: oversized partial line is dropped, drop_bytes advances, overflow flag set" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 16 };
+    defer lb.deinit();
+    try lb.push("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    try std.testing.expectEqual(@as(u64, 32), lb.drop_bytes);
+    try std.testing.expect(lb.takeOverflow());
+    try std.testing.expect(!lb.takeOverflow());
+    try lb.push("ok\n");
+    var out = std.ArrayList([]u8){};
+    defer freeDrainedForTest(a, &out);
+    try drainAllForTest(a, &lb, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("ok\n", out.items[0]);
+}
+
+test "LineBuffer: complete lines before an oversized partial are preserved" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 16 };
+    defer lb.deinit();
+    try lb.push("good\n");
+    try lb.push("yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy");
+    try std.testing.expectEqual(@as(u64, 64), lb.drop_bytes);
+    try std.testing.expect(lb.takeOverflow());
+    var out = std.ArrayList([]u8){};
+    defer freeDrainedForTest(a, &out);
+    try drainAllForTest(a, &lb, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualStrings("good\n", out.items[0]);
+}
+
+test "LineBuffer: UTF-8 byte split across pushes is preserved byte-for-byte" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 1024 };
+    defer lb.deinit();
+    try lb.push(&.{ 0x63, 0x61, 0x66, 0xC3 });
+    try lb.push(&.{ 0xA9, 0x0A });
+    var out = std.ArrayList([]u8){};
+    defer freeDrainedForTest(a, &out);
+    try drainAllForTest(a, &lb, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x63, 0x61, 0x66, 0xC3, 0xA9, 0x0A }, out.items[0]);
+}
+
+test "LineBuffer: drop_bytes is cumulative across multiple overflows" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 8 };
+    defer lb.deinit();
+    try lb.push("aaaaaaaaaaaaaaaa");
+    _ = lb.takeOverflow();
+    try lb.push("ok\n");
+    var first = std.ArrayList([]u8){};
+    defer freeDrainedForTest(a, &first);
+    try drainAllForTest(a, &lb, &first);
+    try lb.push("bbbbbbbbbbbbbbbbbbbbbbbb");
+    try std.testing.expectEqual(@as(u64, 40), lb.drop_bytes);
+    try std.testing.expect(lb.takeOverflow());
+}
+
+test "LineBuffer: chunk exactly at cap with a terminating newline does not drop" {
+    const a = std.testing.allocator;
+    var lb = LineBuffer{ .allocator = a, .cap = 16 };
+    defer lb.deinit();
+    try lb.push("xxxxxxxxxxxxxxx\n");
+    try std.testing.expectEqual(@as(u64, 0), lb.drop_bytes);
+    try std.testing.expect(!lb.overflow_pending);
+    var out = std.ArrayList([]u8){};
+    defer freeDrainedForTest(a, &out);
+    try drainAllForTest(a, &lb, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
 }

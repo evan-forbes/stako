@@ -33,7 +33,10 @@ const stack_config = @import("stack_config.zig");
 const audit = @import("audit.zig");
 const vcs = @import("vcs.zig");
 const mutations_mod = @import("mutations.zig");
+const output_packet = @import("output_packet.zig");
+const routine_mod = @import("routine.zig");
 const stack_mod = @import("stack.zig");
+const stack_thread = @import("stack_thread.zig");
 const sse_mod = @import("sse.zig");
 const runtime_mod = @import("runtime.zig");
 const provider_status = @import("provider_status.zig");
@@ -481,6 +484,12 @@ const Route = enum {
     stack_config_get,
     stack_items_list,
     stack_item_get,
+    stack_item_output_get,
+    stack_item_output_summary_get,
+    stack_threads_list,
+    stack_thread_get,
+    routines_list,
+    routine_get,
     // Mutation routes (milestone 5).
     stacks_create, // POST /stacks
     stack_config_post, // POST /stacks/{name}/config
@@ -491,6 +500,10 @@ const Route = enum {
     item_supersede, // POST /stacks/{name}/items/{id}/supersede
     stack_pause, // POST /stacks/{name}/pause
     stack_resume, // POST /stacks/{name}/resume
+    stack_threads_create, // POST /stacks/{name}/threads
+    stack_thread_patch, // POST /stacks/{name}/threads/{thread}
+    stack_thread_archive, // POST /stacks/{name}/threads/{thread}/archive
+    stack_routine_append, // POST /stacks/{name}/routines/{routine}
     // SSE (milestone 6).
     stack_events_sse, // GET /stacks/{name}/events
     // Provider status (milestone 8).
@@ -512,6 +525,10 @@ const Route = enum {
             .item_supersede,
             .stack_pause,
             .stack_resume,
+            .stack_threads_create,
+            .stack_thread_patch,
+            .stack_thread_archive,
+            .stack_routine_append,
             => true,
             else => false,
         };
@@ -528,6 +545,8 @@ const Route = enum {
             .item_supersede => .supersede_item,
             .stack_pause => .pause_stack,
             .stack_resume => .resume_stack,
+            .stack_threads_create, .stack_thread_patch, .stack_thread_archive => .update_stack_config,
+            .stack_routine_append => .append_item,
             else => null,
         };
     }
@@ -537,6 +556,8 @@ const Route = enum {
             .stacks_list => .stacks_create,
             .stack_config_get => .stack_config_post,
             .stack_items_list => .items_append,
+            .stack_threads_list => .stack_threads_create,
+            .stack_thread_get => .stack_thread_patch,
             else => self,
         };
     }
@@ -546,6 +567,8 @@ const RouteMatch = struct {
     route: Route,
     stack: []const u8 = "",
     item: []const u8 = "",
+    thread: []const u8 = "",
+    routine: []const u8 = "",
     /// Filled in for `provider_get`.
     provider: []const u8 = "",
 };
@@ -572,6 +595,15 @@ pub fn matchRoute(target: []const u8) RouteMatch {
         }
     }
 
+    if (std.mem.eql(u8, path, "/routines") or std.mem.eql(u8, path, "/routines/"))
+        return .{ .route = .routines_list };
+    if (std.mem.startsWith(u8, path, "/routines/")) {
+        const name = path["/routines/".len..];
+        if (name.len > 0 and std.mem.indexOfScalar(u8, name, '/') == null) {
+            return .{ .route = .routine_get, .routine = name };
+        }
+    }
+
     // /stacks/<name>...
     if (std.mem.startsWith(u8, path, "/stacks/")) {
         const rest = path["/stacks/".len..];
@@ -594,6 +626,27 @@ pub fn matchRoute(target: []const u8) RouteMatch {
             return .{ .route = .stack_resume, .stack = name };
         if (std.mem.eql(u8, after, "events"))
             return .{ .route = .stack_events_sse, .stack = name };
+        if (std.mem.eql(u8, after, "threads") or std.mem.eql(u8, after, "threads/"))
+            return .{ .route = .stack_threads_list, .stack = name };
+        if (std.mem.startsWith(u8, after, "threads/")) {
+            const thread_rest = after["threads/".len..];
+            const next_slash = std.mem.indexOfScalar(u8, thread_rest, '/') orelse thread_rest.len;
+            const thread_name = thread_rest[0..next_slash];
+            if (thread_name.len == 0) return .{ .route = .unknown };
+            if (next_slash == thread_rest.len) {
+                return .{ .route = .stack_thread_get, .stack = name, .thread = thread_name };
+            }
+            const tail = thread_rest[next_slash + 1 ..];
+            if (std.mem.eql(u8, tail, "archive"))
+                return .{ .route = .stack_thread_archive, .stack = name, .thread = thread_name };
+            return .{ .route = .unknown };
+        }
+        if (std.mem.startsWith(u8, after, "routines/")) {
+            const routine_name = after["routines/".len..];
+            if (routine_name.len > 0 and std.mem.indexOfScalar(u8, routine_name, '/') == null) {
+                return .{ .route = .stack_routine_append, .stack = name, .routine = routine_name };
+            }
+        }
         if (std.mem.startsWith(u8, after, "items/")) {
             const item_rest = after["items/".len..];
             // Could be `<id>`, `<id>/insert`, `<id>/retry`, etc.
@@ -603,6 +656,10 @@ pub fn matchRoute(target: []const u8) RouteMatch {
                 return .{ .route = .stack_item_get, .stack = name, .item = id };
             }
             const tail = item_rest[next_slash + 1 ..];
+            if (std.mem.eql(u8, tail, "output"))
+                return .{ .route = .stack_item_output_get, .stack = name, .item = id };
+            if (std.mem.eql(u8, tail, "output/summary"))
+                return .{ .route = .stack_item_output_summary_get, .stack = name, .item = id };
             if (std.mem.eql(u8, tail, "insert"))
                 return .{ .route = .item_insert, .stack = name, .item = id };
             if (std.mem.eql(u8, tail, "retry"))
@@ -663,6 +720,11 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
             error.ResponseSent => return,
             else => return e,
         };
+    } else if (is_get and routeNeedsReadPolicy(m.route)) {
+        authorizeRead(self, req, m) catch |e| switch (e) {
+            error.ResponseSent => return,
+            else => return e,
+        };
     }
 
     // Content negotiation for the read endpoints that have an HTML view.
@@ -675,6 +737,12 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         .stack_config_get => try respondStackConfigGet(self, req, m.stack),
         .stack_items_list => try respondStackItemsList(self, req, m.stack),
         .stack_item_get => if (wants_html) try respondItemHtml(self, req, m.stack, m.item) else try respondStackItemGet(self, req, m.stack, m.item),
+        .stack_item_output_get => try respondItemOutputGet(self, req, m.stack, m.item),
+        .stack_item_output_summary_get => try respondItemOutputSummaryGet(self, req, m.stack, m.item),
+        .stack_threads_list => try respondThreadsList(self, req, m.stack),
+        .stack_thread_get => if (wants_html) try respondThreadHtml(self, req, m.stack, m.thread) else try respondThreadGet(self, req, m.stack, m.thread),
+        .routines_list => try respondRoutinesList(self, req),
+        .routine_get => try respondRoutineGet(self, req, m.routine),
         // Mutations. When `form_body` is set, the auth path consumed a
         // form-encoded body for us; the small subset of mutation routes
         // surfaced as browser controls dispatches to no-body shims that
@@ -688,6 +756,10 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         .item_supersede => try handleTransition(self, req, m.stack, m.item, .supersede),
         .stack_pause => try handlePauseResume(self, req, m.stack, true, form_body != null),
         .stack_resume => try handlePauseResume(self, req, m.stack, false, form_body != null),
+        .stack_threads_create => try handleCreateThread(self, req, m.stack),
+        .stack_thread_patch => try handlePatchThread(self, req, m.stack, m.thread),
+        .stack_thread_archive => try handleArchiveThread(self, req, m.stack, m.thread, form_body != null),
+        .stack_routine_append => try handleAppendRoutine(self, req, m.stack, m.routine),
         .stack_events_sse => try respondError(req, .internal, "SSE must be routed via routeWithOwnership", &.{}),
         // Provider status (M8).
         .providers_list => try respondProvidersList(self, req),
@@ -755,11 +827,48 @@ fn authorizeMutation(self: *Daemon, req: *std.http.Server.Request, m: RouteMatch
     }
 }
 
+fn routeNeedsReadPolicy(route_match: Route) bool {
+    return switch (route_match) {
+        .stack_item_output_get,
+        .stack_item_output_summary_get,
+        .stack_threads_list,
+        .stack_thread_get,
+        .routines_list,
+        .routine_get,
+        => true,
+        else => false,
+    };
+}
+
+fn authorizeRead(self: *Daemon, req: *std.http.Server.Request, m: RouteMatch) !void {
+    const id = policy.resolveLocal(&self.config);
+    if (!verifyAuth(self, req)) {
+        if (!id.explicitly_declared) return;
+        try respondError(req, .identity_required, "missing or invalid Authorization bearer token", &.{});
+        return error.ResponseSent;
+    }
+    const target_stack = if (m.stack.len > 0) m.stack else "*";
+    switch (policy.evaluate(id, .read_stack, .{ .stack = target_stack })) {
+        .allow => return,
+        .identity_required => unreachable,
+        .capability_denied => {
+            var cap_buf: [256]u8 = undefined;
+            const cap_slug = capabilitySlug(.read_stack, target_stack, &cap_buf);
+            try respondError(req, .capability_denied, "identity lacks required capability", &.{
+                .{ .key = "identity", .value = id.name },
+                .{ .key = "capability", .value = cap_slug },
+            });
+            return error.ResponseSent;
+        },
+    }
+}
+
 fn capabilitySlug(action: policy.Action, stack: []const u8, buf: []u8) []const u8 {
     return switch (action) {
         .create_stack => "stack.create",
-        .append_item, .insert_item, .retry_item, .cancel_item, .supersede_item, .pause_stack, .resume_stack, .update_stack_config => blk: {
+        .read_stack, .append_item, .insert_item, .retry_item, .cancel_item, .supersede_item, .pause_stack, .resume_stack, .update_stack_config => blk: {
             const verb: []const u8 = switch (action) {
+                .read_stack => "read",
                 .append_item => "append",
                 .insert_item => "insert",
                 .retry_item => "retry",
@@ -908,6 +1017,7 @@ fn runtimePolicyCheck(ctx: ?*anyopaque, provider_slug: []const u8, stack_name: [
 fn policyActionToAudit(a: policy.Action) audit.Action {
     return switch (a) {
         .create_stack => .create_stack,
+        .read_stack => .update_stack_config,
         .append_item => .append_item,
         .insert_item => .insert_item,
         .retry_item => .retry_item,
@@ -1187,6 +1297,183 @@ fn respondStackItemGet(
     try respondJson(req, buf.items);
 }
 
+fn respondItemOutputGet(
+    self: *Daemon,
+    req: *std.http.Server.Request,
+    name: []const u8,
+    id: []const u8,
+) !void {
+    if (!storage.isValidStackName(name) or !item_mod.isValidId(id)) {
+        try respondError(req, .validation_failed, "invalid stack name or item id", &.{});
+        return;
+    }
+    const client = localClient(self, "GET /stacks/{name}/items/{id}/output");
+    const summary = client.readItemOutputSummary(name, id) catch |e| switch (e) {
+        error.FileNotFound, error.NotFound => {
+            try respondError(req, .not_found, "output not found", &.{
+                .{ .key = "stack", .value = name },
+                .{ .key = "id", .value = id },
+            });
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer self.allocator.free(summary);
+    var manifest = client.readItemOutputManifest(name, id) catch |e| switch (e) {
+        error.FileNotFound, error.NotFound => {
+            try respondError(req, .not_found, "output not found", &.{
+                .{ .key = "stack", .value = name },
+                .{ .key = "id", .value = id },
+            });
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer manifest.deinit();
+
+    var item = client.readItem(name, id) catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
+    defer item.deinit();
+    const item_dir = try std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ item.id, item.slug });
+    defer self.allocator.free(item_dir);
+    const output_dir = try std.fs.path.join(self.allocator, &.{ self.notes_root_abs, "stacks", name, item_dir, "output" });
+    defer self.allocator.free(output_dir);
+    const changed_raw = readSmallFile(self.allocator, output_dir, "changed_paths.txt") catch null;
+    defer if (changed_raw) |b| self.allocator.free(b);
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    const w = buf.writer(self.allocator);
+    try w.writeAll("{\"summary\":\"");
+    try errors.writeJsonString(w, summary);
+    try w.writeAll("\",\"manifest\":");
+    try writeOutputManifestJson(w, &manifest);
+    try w.writeAll(",\"changed_paths\":");
+    try writeChangedPathsJson(w, changed_raw orelse "");
+    try w.writeAll("}");
+    try respondJson(req, buf.items);
+}
+
+fn respondItemOutputSummaryGet(
+    self: *Daemon,
+    req: *std.http.Server.Request,
+    name: []const u8,
+    id: []const u8,
+) !void {
+    if (!storage.isValidStackName(name) or !item_mod.isValidId(id)) {
+        try respondError(req, .validation_failed, "invalid stack name or item id", &.{});
+        return;
+    }
+    const client = localClient(self, "GET /stacks/{name}/items/{id}/output/summary");
+    const summary = client.readItemOutputSummary(name, id) catch |e| switch (e) {
+        error.FileNotFound, error.NotFound => {
+            try respondError(req, .not_found, "output summary not found", &.{
+                .{ .key = "stack", .value = name },
+                .{ .key = "id", .value = id },
+            });
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer self.allocator.free(summary);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    const w = buf.writer(self.allocator);
+    try w.writeAll("{\"summary\":\"");
+    try errors.writeJsonString(w, summary);
+    try w.writeAll("\"}");
+    try respondJson(req, buf.items);
+}
+
+fn respondThreadsList(self: *Daemon, req: *std.http.Server.Request, name: []const u8) !void {
+    if (!storage.isValidStackName(name)) {
+        try respondError(req, .validation_failed, "invalid stack name", &.{.{ .key = "name", .value = name }});
+        return;
+    }
+    const client = localClient(self, "GET /stacks/{name}/threads");
+    const threads = client.listThreads(name) catch |e| switch (e) {
+        error.NotFound => {
+            try respondError(req, .not_found, "stack not found", &.{.{ .key = "stack", .value = name }});
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer client.freeThreadList(threads);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    try writeThreadSummaryListJson(buf.writer(self.allocator), threads);
+    try respondJson(req, buf.items);
+}
+
+fn respondThreadGet(self: *Daemon, req: *std.http.Server.Request, stack_name: []const u8, thread_name: []const u8) !void {
+    const client = localClient(self, "GET /stacks/{name}/threads/{thread}");
+    var thread = client.readThread(stack_name, thread_name) catch |e| switch (e) {
+        error.NotFound => {
+            try respondError(req, .not_found, "thread not found", &.{.{ .key = "thread", .value = thread_name }});
+            return;
+        },
+        error.BadThreadName => {
+            try respondError(req, .validation_failed, "invalid thread name", &.{.{ .key = "thread", .value = thread_name }});
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer thread.deinit();
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    try writeThreadJson(buf.writer(self.allocator), &thread);
+    try respondJson(req, buf.items);
+}
+
+fn respondRoutinesList(self: *Daemon, req: *std.http.Server.Request) !void {
+    const client = localClient(self, "GET /routines");
+    const routines = client.listRoutines() catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
+    defer client.freeRoutineList(routines);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    try writeRoutineSummaryListJson(buf.writer(self.allocator), routines);
+    try respondJson(req, buf.items);
+}
+
+fn respondRoutineGet(self: *Daemon, req: *std.http.Server.Request, name: []const u8) !void {
+    const client = localClient(self, "GET /routines/{name}");
+    var routine = client.readRoutine(name) catch |e| switch (e) {
+        error.NotFound => {
+            try respondError(req, .not_found, "routine not found", &.{.{ .key = "routine", .value = name }});
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer routine.deinit();
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    try writeRoutineJson(buf.writer(self.allocator), &routine);
+    try respondJson(req, buf.items);
+}
+
 // ---------- provider status (milestone 8) ----------
 
 fn respondProvidersList(self: *Daemon, req: *std.http.Server.Request) !void {
@@ -1281,6 +1568,14 @@ fn respondStackHtml(self: *Daemon, req: *std.http.Server.Request, name: []const 
         return;
     };
     defer client.freeItemList(items);
+    const threads = client.listThreads(name) catch |e| switch (e) {
+        error.NotFound => try self.allocator.alloc(storage.ThreadSummary, 0),
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer client.freeThreadList(threads);
 
     // Count items currently in `running` status as a cheap snapshot.
     var running_count: usize = 0;
@@ -1294,6 +1589,7 @@ fn respondStackHtml(self: *Daemon, req: *std.http.Server.Request, name: []const 
         .name = name,
         .config = &cfg,
         .items = items,
+        .threads = threads,
         .running_count = running_count,
         // Daemon is loopback-only (see `isLoopbackHost`), so embedding the
         // mutation token in HTML served to the browser stays local.
@@ -1367,6 +1663,27 @@ fn respondItemHtml(
     };
     defer if (transcript_jsonl) |b| self.allocator.free(b);
 
+    const output_dir = try std.fs.path.join(self.allocator, &.{ item_dir, "output" });
+    defer self.allocator.free(output_dir);
+    const output_summary = readSmallFile(self.allocator, output_dir, "summary.md") catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer if (output_summary) |b| self.allocator.free(b);
+    const changed_paths = readSmallFile(self.allocator, output_dir, "changed_paths.txt") catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer if (changed_paths) |b| self.allocator.free(b);
+    const rendered_prompt = readSmallFile(self.allocator, item_dir, "rendered_prompt.md") catch null;
+    defer if (rendered_prompt) |b| self.allocator.free(b);
+
     // SSE is wired only when the runtime hub is live; otherwise the page is
     // static (snapshots / tests). Item status `running` is the trigger for
     // making the inline JS subscribe — terminal items don't need updates.
@@ -1379,6 +1696,10 @@ fn respondItemHtml(
         .item = &it,
         .prompt_body = prompt_body,
         .transcript_jsonl = transcript_jsonl,
+        .output_summary = output_summary,
+        .changed_paths = changed_paths,
+        .rendered_prompt_href = if (rendered_prompt != null) "#rendered-prompt" else null,
+        .rendered_prompt_body = rendered_prompt,
         .enable_sse = enable_sse,
         // Loopback-only daemon: safe to embed the local mutation token in
         // the rendered page (cancel/retry forms include it as a hidden
@@ -1386,6 +1707,32 @@ fn respondItemHtml(
         .local_token = self.token.bytes,
     }) catch {
         try respondError(req, .internal, "failed to render item", &.{});
+        return;
+    };
+    try respondHtml(req, buf.items);
+}
+
+fn respondThreadHtml(self: *Daemon, req: *std.http.Server.Request, stack_name: []const u8, thread_name: []const u8) !void {
+    const client = localClient(self, "GET /stacks/{name}/threads/{thread}");
+    var thread = client.readThread(stack_name, thread_name) catch |e| switch (e) {
+        error.NotFound => {
+            try respondError(req, .not_found, "thread not found", &.{.{ .key = "thread", .value = thread_name }});
+            return;
+        },
+        error.BadThreadName => {
+            try respondError(req, .validation_failed, "invalid thread name", &.{.{ .key = "thread", .value = thread_name }});
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer thread.deinit();
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    html.renderThread(self.allocator, &buf, .{ .stack = stack_name, .thread = &thread }) catch {
+        try respondError(req, .internal, "failed to render thread", &.{});
         return;
     };
     try respondHtml(req, buf.items);
@@ -1542,6 +1889,231 @@ fn writeItemJson(w: anytype, it: *const item_mod.Item) !void {
     try w.writeAll("}");
 }
 
+fn writeJsonArrayField(w: anytype, key: []const u8, arr: []const []const u8, first: *bool) !void {
+    if (!first.*) try w.writeAll(",");
+    first.* = false;
+    try w.writeAll("\"");
+    try errors.writeJsonString(w, key);
+    try w.writeAll("\":[");
+    for (arr, 0..) |s, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("\"");
+        try errors.writeJsonString(w, s);
+        try w.writeAll("\"");
+    }
+    try w.writeAll("]");
+}
+
+fn writeChangedPathsJson(w: anytype, raw: []const u8) !void {
+    try w.writeAll("[");
+    var first = true;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.writeAll("\"");
+        try errors.writeJsonString(w, line);
+        try w.writeAll("\"");
+    }
+    try w.writeAll("]");
+}
+
+fn writeOutputManifestJson(w: anytype, manifest: *const output_packet.Manifest) !void {
+    try w.writeAll("{");
+    try w.print("\"version\":{d}", .{manifest.version});
+    if (manifest.stack) |s| {
+        try w.writeAll(",\"stack\":\"");
+        try errors.writeJsonString(w, s);
+        try w.writeAll("\"");
+    }
+    if (manifest.item) |s| {
+        try w.writeAll(",\"item\":\"");
+        try errors.writeJsonString(w, s);
+        try w.writeAll("\"");
+    }
+    if (manifest.status) |s| {
+        try w.writeAll(",\"status\":\"");
+        try errors.writeJsonString(w, s);
+        try w.writeAll("\"");
+    }
+    if (manifest.completed_at) |s| {
+        try w.writeAll(",\"completed_at\":\"");
+        try errors.writeJsonString(w, s);
+        try w.writeAll("\"");
+    }
+    try w.writeAll(",\"result\":{");
+    var result_first = true;
+    if (manifest.result.harness) |s| try writeOptionalStringMember(w, "harness", s, &result_first);
+    if (manifest.result.model) |s| try writeOptionalStringMember(w, "model", s, &result_first);
+    if (manifest.result.session_id) |s| try writeOptionalStringMember(w, "session_id", s, &result_first);
+    if (manifest.result.session_file) |s| try writeOptionalStringMember(w, "session_file", s, &result_first);
+    if (manifest.result.transcript_path) |s| try writeOptionalStringMember(w, "transcript_path", s, &result_first);
+    if (manifest.result.exit_code) |n| {
+        if (!result_first) try w.writeAll(",");
+        result_first = false;
+        try w.print("\"exit_code\":{d}", .{n});
+    }
+    if (manifest.result.completed_at) |s| try writeOptionalStringMember(w, "completed_at", s, &result_first);
+    try w.writeAll("}");
+    if (manifest.thread_name != null or manifest.thread_mode != null or manifest.resume_session_id != null) {
+        try w.writeAll(",\"thread\":{");
+        var first = true;
+        if (manifest.thread_name) |s| try writeOptionalStringMember(w, "name", s, &first);
+        if (manifest.thread_mode) |m| try writeOptionalStringMember(w, "mode", m.toString(), &first);
+        if (manifest.resume_session_id) |s| try writeOptionalStringMember(w, "resume_session_id", s, &first);
+        try w.writeAll("}");
+    }
+    if (manifest.workdir_kind != null or manifest.workdir_root != null) {
+        try w.writeAll(",\"workdir\":{");
+        var first = true;
+        if (manifest.workdir_kind) |k| try writeOptionalStringMember(w, "kind", k.toString(), &first);
+        if (manifest.workdir_root) |s| try writeOptionalStringMember(w, "root", s, &first);
+        if (manifest.workdir_head_before) |s| try writeOptionalStringMember(w, "head_before", s, &first);
+        if (manifest.workdir_head_after) |s| try writeOptionalStringMember(w, "head_after", s, &first);
+        if (manifest.workdir_dirty_before) |b| try writeBoolMember(w, "dirty_before", b, &first);
+        if (manifest.workdir_dirty_after) |b| try writeBoolMember(w, "dirty_after", b, &first);
+        try w.writeAll("}");
+    }
+    try w.writeAll("}");
+}
+
+fn writeOptionalStringMember(w: anytype, key: []const u8, value: []const u8, first: *bool) !void {
+    if (!first.*) try w.writeAll(",");
+    first.* = false;
+    try w.writeAll("\"");
+    try errors.writeJsonString(w, key);
+    try w.writeAll("\":\"");
+    try errors.writeJsonString(w, value);
+    try w.writeAll("\"");
+}
+
+fn writeBoolMember(w: anytype, key: []const u8, value: bool, first: *bool) !void {
+    if (!first.*) try w.writeAll(",");
+    first.* = false;
+    try w.writeAll("\"");
+    try errors.writeJsonString(w, key);
+    try w.print("\":{s}", .{if (value) "true" else "false"});
+}
+
+fn writeThreadSummaryListJson(w: anytype, threads: []const storage.ThreadSummary) !void {
+    try w.writeAll("{\"threads\":[");
+    for (threads, 0..) |th, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("{\"name\":\"");
+        try errors.writeJsonString(w, th.name);
+        try w.writeAll("\",\"status\":\"");
+        try errors.writeJsonString(w, th.status);
+        try w.writeAll("\",\"updated_at\":\"");
+        try errors.writeJsonString(w, th.updated_at);
+        try w.writeAll("\"}");
+    }
+    try w.writeAll("]}");
+}
+
+fn writeThreadJson(w: anytype, th: *const stack_thread.Thread) !void {
+    try w.writeAll("{\"name\":\"");
+    try errors.writeJsonString(w, th.name);
+    try w.writeAll("\",\"status\":\"");
+    try errors.writeJsonString(w, th.status.toString());
+    try w.writeAll("\",\"created_at\":\"");
+    try errors.writeJsonString(w, th.created_at);
+    try w.writeAll("\",\"updated_at\":\"");
+    try errors.writeJsonString(w, th.updated_at);
+    try w.writeAll("\"");
+    if (th.target) |t| {
+        try w.writeAll(",\"target\":{");
+        var first = true;
+        if (t.provider) |s| try writeOptionalStringMember(w, "provider", s, &first);
+        if (t.model) |s| try writeOptionalStringMember(w, "model", s, &first);
+        if (t.match) |m| try writeOptionalStringMember(w, "match", m.toString(), &first);
+        try w.writeAll("}");
+    }
+    if (th.state) |s| {
+        try w.writeAll(",\"state\":{");
+        var first = true;
+        if (s.last_item_id) |v| try writeOptionalStringMember(w, "last_item_id", v, &first);
+        if (s.last_harness) |v| try writeOptionalStringMember(w, "last_harness", v, &first);
+        if (s.last_session_id) |v| try writeOptionalStringMember(w, "last_session_id", v, &first);
+        if (s.last_session_file) |v| try writeOptionalStringMember(w, "last_session_file", v, &first);
+        if (s.last_transcript_path) |v| try writeOptionalStringMember(w, "last_transcript_path", v, &first);
+        try w.writeAll("}");
+    }
+    try w.writeAll("}");
+}
+
+fn writeRoutineSummaryListJson(w: anytype, routines: []const storage.RoutineSummary) !void {
+    try w.writeAll("{\"routines\":[");
+    for (routines, 0..) |r, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("{\"name\":\"");
+        try errors.writeJsonString(w, r.name);
+        try w.writeAll("\"");
+        if (r.description) |d| {
+            try w.writeAll(",\"description\":\"");
+            try errors.writeJsonString(w, d);
+            try w.writeAll("\"");
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+}
+
+fn writeRoutineJson(w: anytype, routine: *const routine_mod.Routine) !void {
+    try w.writeAll("{\"name\":\"");
+    try errors.writeJsonString(w, routine.name);
+    try w.writeAll("\",\"version\":");
+    try w.print("{d}", .{routine.version});
+    if (routine.description) |d| {
+        try w.writeAll(",\"description\":\"");
+        try errors.writeJsonString(w, d);
+        try w.writeAll("\"");
+    }
+    try w.writeAll(",\"steps\":[");
+    for (routine.steps, 0..) |step, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("{\"name\":\"");
+        try errors.writeJsonString(w, step.name);
+        try w.writeAll("\",\"slug\":\"");
+        try errors.writeJsonString(w, step.slug);
+        try w.writeAll("\",\"kind\":\"");
+        try errors.writeJsonString(w, step.kind.toString());
+        try w.writeAll("\"");
+        if (step.prompt) |p| try writeOptionalStringMemberInline(w, "prompt", p);
+        if (step.prompt_file) |p| try writeOptionalStringMemberInline(w, "prompt_file", p);
+        if (step.after.len > 0) {
+            var first = false;
+            try writeJsonArrayField(w, "after", step.after, &first);
+        }
+        if (step.inputs_from.len > 0) {
+            var first = false;
+            try writeJsonArrayField(w, "inputs_from", step.inputs_from, &first);
+        }
+        if (step.thread) |s| try writeOptionalStringMemberInline(w, "thread", s);
+        if (step.thread_mode) |m| try writeOptionalStringMemberInline(w, "thread_mode", m.toString());
+        if (step.target.provider != null or step.target.model != null or step.target.match != null or step.target.workdir != null) {
+            try w.writeAll(",\"target\":{");
+            var first = true;
+            if (step.target.provider) |s| try writeOptionalStringMember(w, "provider", s, &first);
+            if (step.target.model) |s| try writeOptionalStringMember(w, "model", s, &first);
+            if (step.target.match) |m| try writeOptionalStringMember(w, "match", m.toString(), &first);
+            if (step.target.workdir) |s| try writeOptionalStringMember(w, "workdir", s, &first);
+            try w.writeAll("}");
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+}
+
+fn writeOptionalStringMemberInline(w: anytype, key: []const u8, value: []const u8) !void {
+    try w.writeAll(",\"");
+    try errors.writeJsonString(w, key);
+    try w.writeAll("\":\"");
+    try errors.writeJsonString(w, value);
+    try w.writeAll("\"");
+}
+
 // ---------- mutation handlers (milestone 5) ----------
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
@@ -1624,6 +2196,28 @@ fn optionalInteger(obj: anytype, key: []const u8) ?i64 {
     return null;
 }
 
+fn optionalStringArray(allocator: std.mem.Allocator, req: *std.http.Server.Request, obj: anytype, key: []const u8) !?[]const []const u8 {
+    const v = obj.get(key) orelse return null;
+    if (v != .array) {
+        var msg: [96]u8 = undefined;
+        try respondError(req, .validation_failed, std.fmt.bufPrint(&msg, "field `{s}` must be an array of strings", .{key}) catch "field must be an array of strings", &.{});
+        return null;
+    }
+    const vals = v.array.items;
+    const out = try allocator.alloc([]const u8, vals.len);
+    errdefer allocator.free(out);
+    for (vals, 0..) |entry, i| {
+        if (entry != .string) {
+            allocator.free(out);
+            var msg: [96]u8 = undefined;
+            try respondError(req, .validation_failed, std.fmt.bufPrint(&msg, "field `{s}` must be an array of strings", .{key}) catch "field must be an array of strings", &.{});
+            return null;
+        }
+        out[i] = entry.string;
+    }
+    return out;
+}
+
 const ParsedItemBody = struct {
     kind: []const u8,
     slug: []const u8,
@@ -1632,10 +2226,22 @@ const ParsedItemBody = struct {
     target_model: ?[]const u8 = null,
     target_match: ?item_mod.Match = null,
     target_workdir: ?[]const u8 = null,
+    input_items: ?[]const []const u8 = null,
+    input_files: ?[]const []const u8 = null,
+    input_commits: ?[]const []const u8 = null,
+    input_mode: ?item_mod.InputMode = null,
+    thread_name: ?[]const u8 = null,
+    thread_mode: ?item_mod.ThreadMode = null,
     sleep_until: ?[]const u8 = null,
+
+    fn deinit(self: *ParsedItemBody, allocator: std.mem.Allocator) void {
+        if (self.input_items) |v| allocator.free(v);
+        if (self.input_files) |v| allocator.free(v);
+        if (self.input_commits) |v| allocator.free(v);
+    }
 };
 
-fn parseItemBody(req: *std.http.Server.Request, obj: anytype) !?ParsedItemBody {
+fn parseItemBody(allocator: std.mem.Allocator, req: *std.http.Server.Request, obj: anytype) !?ParsedItemBody {
     const kind = (try requiredString(req, obj, "kind")) orelse return null;
     const slug = (try requiredString(req, obj, "slug")) orelse return null;
     var out: ParsedItemBody = .{
@@ -1644,12 +2250,111 @@ fn parseItemBody(req: *std.http.Server.Request, obj: anytype) !?ParsedItemBody {
         .prompt_body = optionalString(obj, "prompt"),
         .sleep_until = optionalString(obj, "sleep_until"),
     };
+    errdefer out.deinit(allocator);
     if (obj.get("target")) |t| if (t == .object) {
         out.target_provider = optionalString(t.object, "provider");
         out.target_model = optionalString(t.object, "model");
         if (optionalString(t.object, "match")) |s| out.target_match = item_mod.Match.fromString(s);
         out.target_workdir = optionalString(t.object, "workdir");
     };
+    out.input_items = try optionalStringArray(allocator, req, obj, "input_items");
+    if (obj.get("input_items") != null and out.input_items == null) {
+        out.deinit(allocator);
+        return null;
+    }
+    out.input_files = try optionalStringArray(allocator, req, obj, "input_files");
+    if (obj.get("input_files") != null and out.input_files == null) {
+        out.deinit(allocator);
+        return null;
+    }
+    out.input_commits = try optionalStringArray(allocator, req, obj, "input_commits");
+    if (obj.get("input_commits") != null and out.input_commits == null) {
+        out.deinit(allocator);
+        return null;
+    }
+    if (obj.get("input_mode")) |mode_v| {
+        if (mode_v != .string) {
+            try respondError(req, .validation_failed, "field `input_mode` must be a string", &.{});
+            out.deinit(allocator);
+            return null;
+        }
+        const s = mode_v.string;
+        out.input_mode = item_mod.InputMode.fromString(s) orelse {
+            try respondError(req, .validation_failed, "input_mode must be append or prepend", &.{});
+            out.deinit(allocator);
+            return null;
+        };
+    }
+    if (obj.get("inputs")) |inputs_v| {
+        if (inputs_v != .object) {
+            try respondError(req, .validation_failed, "field `inputs` must be an object", &.{});
+            out.deinit(allocator);
+            return null;
+        }
+        if (out.input_items == null) out.input_items = try optionalStringArray(allocator, req, inputs_v.object, "items");
+        if (inputs_v.object.get("items") != null and out.input_items == null) {
+            out.deinit(allocator);
+            return null;
+        }
+        if (out.input_files == null) out.input_files = try optionalStringArray(allocator, req, inputs_v.object, "files");
+        if (inputs_v.object.get("files") != null and out.input_files == null) {
+            out.deinit(allocator);
+            return null;
+        }
+        if (out.input_commits == null) out.input_commits = try optionalStringArray(allocator, req, inputs_v.object, "commits");
+        if (inputs_v.object.get("commits") != null and out.input_commits == null) {
+            out.deinit(allocator);
+            return null;
+        }
+        if (out.input_mode == null) {
+            if (inputs_v.object.get("mode")) |mode_v| {
+                if (mode_v != .string) {
+                    try respondError(req, .validation_failed, "field `inputs.mode` must be a string", &.{});
+                    out.deinit(allocator);
+                    return null;
+                }
+                out.input_mode = item_mod.InputMode.fromString(mode_v.string) orelse {
+                    try respondError(req, .validation_failed, "inputs.mode must be append or prepend", &.{});
+                    out.deinit(allocator);
+                    return null;
+                };
+            }
+        }
+    }
+    if (obj.get("thread")) |thread_v| {
+        if (thread_v == .string) {
+            out.thread_name = thread_v.string;
+        } else if (thread_v == .object) {
+            out.thread_name = optionalString(thread_v.object, "name") orelse {
+                try respondError(req, .validation_failed, "field `thread.name` must be a string", &.{});
+                out.deinit(allocator);
+                return null;
+            };
+            if (optionalString(thread_v.object, "mode")) |s| {
+                out.thread_mode = item_mod.ThreadMode.fromString(s) orelse {
+                    try respondError(req, .validation_failed, "thread.mode must be fresh, resume, continue, or fork", &.{});
+                    out.deinit(allocator);
+                    return null;
+                };
+            }
+        } else {
+            try respondError(req, .validation_failed, "field `thread` must be a string or object", &.{});
+            out.deinit(allocator);
+            return null;
+        }
+    }
+    if (obj.get("thread_mode")) |mode_v| {
+        if (mode_v != .string) {
+            try respondError(req, .validation_failed, "field `thread_mode` must be a string", &.{});
+            out.deinit(allocator);
+            return null;
+        }
+        out.thread_mode = item_mod.ThreadMode.fromString(mode_v.string) orelse {
+            try respondError(req, .validation_failed, "thread_mode must be fresh, resume, continue, or fork", &.{});
+            out.deinit(allocator);
+            return null;
+        };
+    }
     return out;
 }
 
@@ -1678,7 +2383,7 @@ fn respondMutationError(
         .not_found => .not_found,
         .state_conflict => .invalid_status_transition,
         .internal_state_only => .invalid_status_transition,
-        .validation_failed, .bad_config_key, .bad_config_value => .validation_failed,
+        .validation_failed, .bad_config_key, .bad_config_value, .bad_thread_key, .bad_thread_value => .validation_failed,
         .vcs_conflict, .vcs_dirty => .vcs_conflict,
         .git_not_found, .git_failed => .internal,
         .internal => .internal,
@@ -1693,6 +2398,8 @@ fn respondMutationError(
         .validation_failed => "validation failed",
         .bad_config_key => "unknown stack config key",
         .bad_config_value => "invalid stack config value",
+        .bad_thread_key => "unknown thread patch key",
+        .bad_thread_value => "invalid thread patch value",
         .vcs_conflict => "notes repo has merge conflicts on targeted files",
         .vcs_dirty => "targeted stack files have uncommitted user edits",
         .git_not_found => "git binary not found",
@@ -1780,7 +2487,8 @@ fn handleAppendItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
     var json = (try readJsonValue(self, req)) orelse return;
     defer json.deinit();
     const obj = (try expectObject(req, json.parsed.value)) orelse return;
-    const parsed = (try parseItemBody(req, obj)) orelse return;
+    var parsed = (try parseItemBody(self.allocator, req, obj)) orelse return;
+    defer parsed.deinit(self.allocator);
 
     const input: mutations_mod.AppendItemInput = .{
         .stack = stack,
@@ -1791,6 +2499,12 @@ fn handleAppendItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
         .target_model = parsed.target_model,
         .target_match = parsed.target_match,
         .target_workdir = parsed.target_workdir,
+        .input_items = parsed.input_items,
+        .input_files = parsed.input_files,
+        .input_commits = parsed.input_commits,
+        .input_mode = parsed.input_mode,
+        .thread_name = parsed.thread_name,
+        .thread_mode = parsed.thread_mode,
         .sleep_until = parsed.sleep_until,
     };
 
@@ -1802,7 +2516,8 @@ fn handleInsertItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
     var json = (try readJsonValue(self, req)) orelse return;
     defer json.deinit();
     const obj = (try expectObject(req, json.parsed.value)) orelse return;
-    const parsed = (try parseItemBody(req, obj)) orelse return;
+    var parsed = (try parseItemBody(self.allocator, req, obj)) orelse return;
+    defer parsed.deinit(self.allocator);
 
     const input: mutations_mod.InsertItemInput = .{
         .stack = stack,
@@ -1813,6 +2528,14 @@ fn handleInsertItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
         .target_provider = parsed.target_provider,
         .target_model = parsed.target_model,
         .target_match = parsed.target_match,
+        .target_workdir = parsed.target_workdir,
+        .input_items = parsed.input_items,
+        .input_files = parsed.input_files,
+        .input_commits = parsed.input_commits,
+        .input_mode = parsed.input_mode,
+        .thread_name = parsed.thread_name,
+        .thread_mode = parsed.thread_mode,
+        .sleep_until = parsed.sleep_until,
     };
 
     const client = localClient(self, "POST /stacks/{name}/items/{id}/insert");
@@ -1879,6 +2602,185 @@ fn handlePauseResume(self: *Daemon, req: *std.http.Server.Request, stack: []cons
     const api_path = if (paused) "POST /stacks/{name}/pause" else "POST /stacks/{name}/resume";
     const client = localClient(self, api_path);
     try respondMutationResult(req, self.allocator, client.setPaused(stack, paused), stack, "");
+}
+
+fn handleCreateThread(self: *Daemon, req: *std.http.Server.Request, stack: []const u8) !void {
+    var json = (try readJsonValue(self, req)) orelse return;
+    defer json.deinit();
+    const obj = (try expectObject(req, json.parsed.value)) orelse return;
+    const name = (try requiredString(req, obj, "name")) orelse return;
+    var input: mutations_mod.CreateThreadInput = .{
+        .stack = stack,
+        .name = name,
+    };
+    if (obj.get("target")) |target_v| {
+        if (target_v != .object) {
+            try respondError(req, .validation_failed, "field `target` must be an object", &.{});
+            return;
+        }
+        input.target_provider = optionalString(target_v.object, "provider");
+        input.target_model = optionalString(target_v.object, "model");
+        if (optionalString(target_v.object, "match")) |s| {
+            input.target_match = stack_thread.Match.fromString(s) orelse {
+                try respondError(req, .validation_failed, "target.match must be exact, compatible, or any", &.{});
+                return;
+            };
+        }
+    } else {
+        input.target_provider = optionalString(obj, "provider");
+        input.target_model = optionalString(obj, "model");
+        if (optionalString(obj, "match")) |s| {
+            input.target_match = stack_thread.Match.fromString(s) orelse {
+                try respondError(req, .validation_failed, "match must be exact, compatible, or any", &.{});
+                return;
+            };
+        }
+    }
+    const client = localClient(self, "POST /stacks/{name}/threads");
+    try respondMutationResult(req, self.allocator, client.createThread(stack, input), stack, "");
+}
+
+fn handlePatchThread(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, thread_name: []const u8) !void {
+    var json = (try readJsonValue(self, req)) orelse return;
+    defer json.deinit();
+    var src = json.parsed.value;
+    if (json.parsed.value == .object) {
+        if (json.parsed.value.object.get("set")) |v| {
+            if (v == .object) src = v;
+        }
+    }
+    if (src != .object) {
+        try respondError(req, .validation_failed, "thread patch body must be a JSON object", &.{});
+        return;
+    }
+    var patches = std.ArrayList(mutations_mod.ThreadPatch){};
+    defer {
+        for (patches.items) |p| self.allocator.free(p.key);
+        patches.deinit(self.allocator);
+    }
+    try collectThreadPatches(self, req, src.object, "", &patches);
+    if (patches.items.len == 0) {
+        try respondError(req, .validation_failed, "no thread keys supplied", &.{});
+        return;
+    }
+    const client = localClient(self, "POST /stacks/{name}/threads/{thread}");
+    try respondMutationResult(req, self.allocator, client.patchThread(stack, thread_name, patches.items), stack, "");
+}
+
+fn handleArchiveThread(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, thread_name: []const u8, body_already_consumed: bool) !void {
+    if (!body_already_consumed) {
+        const body = readRequestBody(self, req) catch "";
+        if (body.len > 0) self.allocator.free(body);
+    }
+    const client = localClient(self, "POST /stacks/{name}/threads/{thread}/archive");
+    try respondMutationResult(req, self.allocator, client.archiveThread(stack, thread_name), stack, "");
+}
+
+fn handleAppendRoutine(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, routine_name: []const u8) !void {
+    var json_body: ?JsonBody = null;
+    defer if (json_body) |*j| j.deinit();
+    var input_items: ?[]const []const u8 = null;
+    var input_files: ?[]const []const u8 = null;
+    var input_commits: ?[]const []const u8 = null;
+    var input_mode: ?item_mod.InputMode = null;
+    defer {
+        if (input_items) |v| self.allocator.free(v);
+        if (input_files) |v| self.allocator.free(v);
+        if (input_commits) |v| self.allocator.free(v);
+    }
+
+    const body = readRequestBody(self, req) catch {
+        try respondError(req, .validation_failed, "failed to read request body", &.{});
+        return;
+    };
+    if (body.len == 0) {
+        self.allocator.free(body);
+    } else {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch {
+            self.allocator.free(body);
+            try respondError(req, .validation_failed, "invalid JSON body", &.{});
+            return;
+        };
+        json_body = .{ .allocator = self.allocator, .body = body, .parsed = parsed };
+        const obj = (try expectObject(req, json_body.?.parsed.value)) orelse return;
+        const src = if (obj.get("inputs")) |v| blk: {
+            if (v != .object) {
+                try respondError(req, .validation_failed, "field `inputs` must be an object", &.{});
+                return;
+            }
+            break :blk v.object;
+        } else obj;
+        input_items = try optionalStringArray(self.allocator, req, src, "items");
+        input_files = try optionalStringArray(self.allocator, req, src, "files");
+        input_commits = try optionalStringArray(self.allocator, req, src, "commits");
+        if (src.get("mode")) |mode_v| {
+            if (mode_v != .string) {
+                try respondError(req, .validation_failed, "field `mode` must be a string", &.{});
+                return;
+            }
+            input_mode = item_mod.InputMode.fromString(mode_v.string) orelse {
+                try respondError(req, .validation_failed, "mode must be append or prepend", &.{});
+                return;
+            };
+        }
+    }
+
+    const read_client = localClient(self, "GET /routines/{name}");
+    var routine = read_client.readRoutine(routine_name) catch |e| switch (e) {
+        error.NotFound => {
+            try respondError(req, .not_found, "routine not found", &.{.{ .key = "routine", .value = routine_name }});
+            return;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return;
+        },
+    };
+    defer routine.deinit();
+    const client = localClient(self, "POST /stacks/{name}/routines/{routine}");
+    try respondMutationResult(req, self.allocator, client.appendRoutine(stack, .{
+        .stack = stack,
+        .routine = &routine,
+        .input_items = input_items,
+        .input_files = input_files,
+        .input_commits = input_commits,
+        .input_mode = input_mode,
+    }), stack, "");
+}
+
+fn collectThreadPatches(
+    self: *Daemon,
+    req: *std.http.Server.Request,
+    obj: std.json.ObjectMap,
+    prefix: []const u8,
+    patches: *std.ArrayList(mutations_mod.ThreadPatch),
+) !void {
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        const k = entry.key_ptr.*;
+        if (std.mem.eql(u8, k, "set")) continue;
+        const v = entry.value_ptr.*;
+        if (v == .object and (std.mem.eql(u8, k, "target") or std.mem.eql(u8, k, "state"))) {
+            var nested_prefix_buf: [32]u8 = undefined;
+            const nested_prefix = std.fmt.bufPrint(&nested_prefix_buf, "{s}{s}.", .{ prefix, k }) catch "";
+            try collectThreadPatches(self, req, v.object, nested_prefix, patches);
+            continue;
+        }
+        var key_buf: [64]u8 = undefined;
+        const full_key = std.fmt.bufPrint(&key_buf, "{s}{s}", .{ prefix, k }) catch {
+            try respondError(req, .validation_failed, "thread patch key too long", &.{});
+            return;
+        };
+        const value: ?[]const u8 = switch (v) {
+            .string => |s| s,
+            .null => null,
+            else => {
+                try respondError(req, .validation_failed, "thread patch values must be strings or null", &.{});
+                return;
+            },
+        };
+        try patches.append(self.allocator, .{ .key = try self.allocator.dupe(u8, full_key), .value = value });
+    }
 }
 
 fn handleTransitionRoute(
@@ -2266,6 +3168,38 @@ test "matchRoute: providers (M8)" {
     try std.testing.expectEqualStrings("anthropic", m.provider);
     // Nested paths under /providers/<name>/... aren't supported in v1.
     try std.testing.expectEqual(Route.unknown, matchRoute("/providers/anthropic/x").route);
+}
+
+test "matchRoute: output threads and routines" {
+    const out = matchRoute("/stacks/demo/items/0001/output");
+    try std.testing.expectEqual(Route.stack_item_output_get, out.route);
+    try std.testing.expectEqualStrings("demo", out.stack);
+    try std.testing.expectEqualStrings("0001", out.item);
+
+    const summary = matchRoute("/stacks/demo/items/0001/output/summary");
+    try std.testing.expectEqual(Route.stack_item_output_summary_get, summary.route);
+
+    const threads = matchRoute("/stacks/demo/threads");
+    try std.testing.expectEqual(Route.stack_threads_list, threads.route);
+    try std.testing.expectEqualStrings("demo", threads.stack);
+
+    const thread = matchRoute("/stacks/demo/threads/admin");
+    try std.testing.expectEqual(Route.stack_thread_get, thread.route);
+    try std.testing.expectEqualStrings("admin", thread.thread);
+
+    const archive = matchRoute("/stacks/demo/threads/admin/archive");
+    try std.testing.expectEqual(Route.stack_thread_archive, archive.route);
+
+    const routines = matchRoute("/routines");
+    try std.testing.expectEqual(Route.routines_list, routines.route);
+
+    const routine = matchRoute("/routines/review");
+    try std.testing.expectEqual(Route.routine_get, routine.route);
+    try std.testing.expectEqualStrings("review", routine.routine);
+
+    const append = matchRoute("/stacks/demo/routines/review");
+    try std.testing.expectEqual(Route.stack_routine_append, append.route);
+    try std.testing.expectEqualStrings("review", append.routine);
 }
 
 test "start: rejects non-loopback host" {

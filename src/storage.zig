@@ -12,15 +12,18 @@
 
 const std = @import("std");
 const item_mod = @import("item.zig");
+const routine_mod = @import("routine.zig");
 const stack_config = @import("stack_config.zig");
+const stack_thread = @import("stack_thread.zig");
 
 pub const Error = error{
     NotFound,
     BadItemId,
+    BadThreadName,
     Toml,
     BadType,
     OutOfMemory,
-} || item_mod.ParseError || stack_config.ParseError || std.fs.File.OpenError || std.fs.File.ReadError || std.fs.File.StatError;
+} || item_mod.ParseError || stack_config.ParseError || stack_thread.ParseError || routine_mod.Error || std.fs.File.OpenError || std.fs.File.ReadError || std.fs.File.StatError;
 
 /// A lightweight reference to a stack on disk. Names come from the directory
 /// listing under `<notes-root>/stacks/`.
@@ -36,6 +39,14 @@ pub const ItemSummary = struct {
     kind: []const u8,
     status: []const u8,
 };
+
+pub const ThreadSummary = struct {
+    name: []const u8,
+    status: []const u8,
+    updated_at: []const u8,
+};
+
+pub const RoutineSummary = routine_mod.Summary;
 
 /// Reader bound to a notes root.
 pub const Reader = struct {
@@ -59,6 +70,12 @@ pub const Reader = struct {
 
     fn openStacksDir(self: *const Reader) !std.fs.Dir {
         const path = try std.fs.path.join(self.allocator, &.{ self.notes_root_abs, "stacks" });
+        defer self.allocator.free(path);
+        return std.fs.openDirAbsolute(path, .{ .iterate = true });
+    }
+
+    fn openRoutinesDir(self: *const Reader) !std.fs.Dir {
+        const path = try std.fs.path.join(self.allocator, &.{ self.notes_root_abs, "routines" });
         defer self.allocator.free(path);
         return std.fs.openDirAbsolute(path, .{ .iterate = true });
     }
@@ -178,6 +195,103 @@ pub const Reader = struct {
         return error.NotFound;
     }
 
+    pub fn listThreads(self: *const Reader, stack: []const u8) ![]ThreadSummary {
+        var stack_dir = try self.openStackDir(stack);
+        defer stack_dir.close();
+
+        var threads_dir = stack_dir.openDir("threads", .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => return self.allocator.alloc(ThreadSummary, 0),
+            else => return e,
+        };
+        defer threads_dir.close();
+
+        var out = std.ArrayList(ThreadSummary){};
+        errdefer freeOwnedThreadSummaries(self.allocator, out.items);
+        errdefer out.deinit(self.allocator);
+
+        var it = threads_dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".toml")) continue;
+            const name = entry.name[0 .. entry.name.len - ".toml".len];
+            if (!stack_thread.isValidName(name)) continue;
+            if (try self.readThreadSummary(&threads_dir, entry.name)) |summary| {
+                try out.append(self.allocator, summary);
+            }
+        }
+
+        std.mem.sort(ThreadSummary, out.items, {}, lessThanThread);
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    pub fn freeThreadList(self: *const Reader, list: []ThreadSummary) void {
+        freeOwnedThreadSummaries(self.allocator, list);
+        self.allocator.free(list);
+    }
+
+    pub fn listRoutines(self: *const Reader) ![]RoutineSummary {
+        var routines_dir = self.openRoutinesDir() catch |e| switch (e) {
+            error.FileNotFound, error.NotDir => return self.allocator.alloc(RoutineSummary, 0),
+            else => return e,
+        };
+        defer routines_dir.close();
+
+        var out = std.ArrayList(RoutineSummary){};
+        errdefer freeOwnedRoutineSummaries(self.allocator, out.items);
+        errdefer out.deinit(self.allocator);
+
+        var it = routines_dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".toml")) continue;
+            const name = entry.name[0 .. entry.name.len - ".toml".len];
+            if (!isValidRoutineFileName(name)) continue;
+            if (try self.readRoutineSummary(&routines_dir, entry.name)) |summary| {
+                try out.append(self.allocator, summary);
+            }
+        }
+
+        std.mem.sort(RoutineSummary, out.items, {}, lessThanRoutine);
+        return out.toOwnedSlice(self.allocator);
+    }
+
+    pub fn freeRoutineList(self: *const Reader, list: []RoutineSummary) void {
+        freeOwnedRoutineSummaries(self.allocator, list);
+        self.allocator.free(list);
+    }
+
+    pub fn readRoutine(self: *const Reader, name: []const u8) !routine_mod.Routine {
+        if (!isValidRoutineFileName(name)) return error.NotFound;
+        const file_name = try std.fmt.allocPrint(self.allocator, "{s}.toml", .{name});
+        defer self.allocator.free(file_name);
+        const path = try std.fs.path.join(self.allocator, &.{ self.notes_root_abs, "routines", file_name });
+        defer self.allocator.free(path);
+        var diag: routine_mod.Diagnostic = .{};
+        return routine_mod.parseFile(self.allocator, path, &diag) catch |e| switch (e) {
+            error.MissingPromptFile => return error.NotFound,
+            else => return e,
+        };
+    }
+
+    pub fn readThread(self: *const Reader, stack: []const u8, name: []const u8) !stack_thread.Thread {
+        if (!stack_thread.isValidName(name)) return error.BadThreadName;
+        var d = try self.openStackDir(stack);
+        defer d.close();
+        const rel = try std.fmt.allocPrint(self.allocator, "threads/{s}.toml", .{name});
+        defer self.allocator.free(rel);
+        var f = d.openFile(rel, .{}) catch |e| switch (e) {
+            error.FileNotFound, error.IsDir => return error.NotFound,
+            else => return e,
+        };
+        defer f.close();
+        const stat = try f.stat();
+        const src = try self.allocator.alloc(u8, stat.size);
+        defer self.allocator.free(src);
+        const n = try f.readAll(src);
+        var diag: stack_thread.ParseDiagnostic = .{};
+        return try stack_thread.parseSlice(self.allocator, src[0..n], &diag);
+    }
+
     /// Return null for incomplete or malformed item directories. Operational
     /// read errors still propagate so real items do not disappear silently.
     fn readItemSummary(self: *const Reader, stack_dir: *std.fs.Dir, dir_name: []const u8) !?ItemSummary {
@@ -205,6 +319,49 @@ pub const Reader = struct {
             .status = try self.allocator.dupe(u8, parsed.status.toString()),
         };
     }
+
+    fn readThreadSummary(self: *const Reader, threads_dir: *std.fs.Dir, file_name: []const u8) !?ThreadSummary {
+        var f = threads_dir.openFile(file_name, .{}) catch |e| switch (e) {
+            error.FileNotFound, error.IsDir => return null,
+            else => return e,
+        };
+        defer f.close();
+        const stat = try f.stat();
+        const src = try self.allocator.alloc(u8, stat.size);
+        defer self.allocator.free(src);
+        const n = try f.readAll(src);
+
+        var diag: stack_thread.ParseDiagnostic = .{};
+        var parsed = stack_thread.parseSlice(self.allocator, src[0..n], &diag) catch return null;
+        defer parsed.deinit();
+
+        return .{
+            .name = try self.allocator.dupe(u8, parsed.name),
+            .status = try self.allocator.dupe(u8, parsed.status.toString()),
+            .updated_at = try self.allocator.dupe(u8, parsed.updated_at),
+        };
+    }
+
+    fn readRoutineSummary(self: *const Reader, routines_dir: *std.fs.Dir, file_name: []const u8) !?RoutineSummary {
+        var f = routines_dir.openFile(file_name, .{}) catch |e| switch (e) {
+            error.FileNotFound, error.IsDir => return null,
+            else => return e,
+        };
+        defer f.close();
+        const stat = try f.stat();
+        const src = try self.allocator.alloc(u8, stat.size);
+        defer self.allocator.free(src);
+        const n = try f.readAll(src);
+
+        var diag: routine_mod.Diagnostic = .{};
+        var parsed = routine_mod.parseSlice(self.allocator, src[0..n], &diag) catch return null;
+        defer parsed.deinit();
+
+        return .{
+            .name = try self.allocator.dupe(u8, parsed.name),
+            .description = if (parsed.description) |d| try self.allocator.dupe(u8, d) else null,
+        };
+    }
 };
 
 fn freeOwnedSummaries(a: std.mem.Allocator, items: []const ItemSummary) void {
@@ -213,6 +370,21 @@ fn freeOwnedSummaries(a: std.mem.Allocator, items: []const ItemSummary) void {
         a.free(s.slug);
         a.free(s.kind);
         a.free(s.status);
+    }
+}
+
+fn freeOwnedThreadSummaries(a: std.mem.Allocator, items: []const ThreadSummary) void {
+    for (items) |s| {
+        a.free(s.name);
+        a.free(s.status);
+        a.free(s.updated_at);
+    }
+}
+
+fn freeOwnedRoutineSummaries(a: std.mem.Allocator, items: []const RoutineSummary) void {
+    for (items) |s| {
+        a.free(s.name);
+        if (s.description) |d| a.free(d);
     }
 }
 
@@ -239,6 +411,18 @@ fn lessThanString(_: void, a: []const u8, b: []const u8) bool {
 
 fn lessThanItem(_: void, a: ItemSummary, b: ItemSummary) bool {
     return std.mem.lessThan(u8, a.id, b.id);
+}
+
+fn lessThanThread(_: void, a: ThreadSummary, b: ThreadSummary) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+fn lessThanRoutine(_: void, a: RoutineSummary, b: RoutineSummary) bool {
+    return std.mem.lessThan(u8, a.name, b.name);
+}
+
+fn isValidRoutineFileName(s: []const u8) bool {
+    return isValidStackName(s);
 }
 
 // ---------- unit tests ----------
@@ -366,4 +550,55 @@ test "Reader: malformed item id rejected with BadItemId" {
     var r = try Reader.init(a, abs);
     defer r.deinit();
     try std.testing.expectError(error.BadItemId, r.readItem("demo", "abc"));
+}
+
+test "Reader: listThreads empty when threads directory absent" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("stacks/demo");
+    var cfg = try tmp.dir.createFile("stacks/demo/stack.toml", .{ .truncate = true });
+    defer cfg.close();
+    try cfg.writeAll("created_at = 2026-05-10T14:00:00Z\n");
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    var r = try Reader.init(a, abs);
+    defer r.deinit();
+    const threads = try r.listThreads("demo");
+    defer r.freeThreadList(threads);
+    try std.testing.expectEqual(@as(usize, 0), threads.len);
+}
+
+test "Reader: listThreads and readThread" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("stacks/demo/threads");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/threads/admin.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "active"
+            \\
+        );
+    }
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    var r = try Reader.init(a, abs);
+    defer r.deinit();
+    const threads = try r.listThreads("demo");
+    defer r.freeThreadList(threads);
+    try std.testing.expectEqual(@as(usize, 1), threads.len);
+    try std.testing.expectEqualStrings("admin", threads[0].name);
+    try std.testing.expectEqualStrings("active", threads[0].status);
+
+    var thread = try r.readThread("demo", "admin");
+    defer thread.deinit();
+    try std.testing.expectEqualStrings("admin", thread.name);
 }

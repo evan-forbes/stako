@@ -140,9 +140,11 @@ fn buildScriptedArgv(
     harness: []const u8,
     item: *const stako.item.Item,
     item_dir_abs: []const u8,
+    ctx: runtime_mod.ExecutionContext,
 ) anyerror![][]u8 {
     _ = item;
     _ = item_dir_abs;
+    _ = ctx;
     const sh = GLOBAL_SCRIPTED orelse return error.NoScriptedHarness;
     const fixture = if (std.mem.eql(u8, harness, "codex")) sh.fixture_codex_abs else sh.fixture_claude_abs;
     return fake.buildCatArgv(allocator, sh.script_abs, fixture);

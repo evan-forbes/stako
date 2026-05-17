@@ -18,6 +18,8 @@ const fake_adapter = @import("fake_adapter.zig");
 const harness_dispatch = @import("harness_dispatch.zig");
 const runtime_file = @import("runtime_file.zig");
 const provider_status = @import("provider_status.zig");
+const prompt_materializer = @import("prompt_materializer.zig");
+const stack_thread = @import("stack_thread.zig");
 
 pub const AdapterFactory = *const fn (allocator: std.mem.Allocator, harness: []const u8) anyerror!?adapter_mod.Adapter;
 
@@ -29,10 +31,17 @@ pub const Dispatch = struct {
     factory: AdapterFactory,
     /// Build argv for a harness invocation. Caller-allocated; returned
     /// slices are owned and freed by the runtime after spawn.
-    build_argv: *const fn (allocator: std.mem.Allocator, harness: []const u8, item: *const item_mod.Item, item_dir_abs: []const u8) anyerror![][]u8,
+    build_argv: *const fn (allocator: std.mem.Allocator, harness: []const u8, item: *const item_mod.Item, item_dir_abs: []const u8, ctx: ExecutionContext) anyerror![][]u8,
     /// Optional workdir resolver. When null, falls back to default_workdir
     /// from stack config, then to the notes root.
     resolve_workdir: ?*const fn (allocator: std.mem.Allocator, item: *const item_mod.Item, stack: *const stack_config.StackConfig, notes_root_abs: []const u8) anyerror!?[]u8 = null,
+};
+
+pub const ExecutionContext = struct {
+    rendered_prompt_path: ?[]const u8 = null,
+    thread_name: ?[]const u8 = null,
+    thread_mode: item_mod.ThreadMode = .fresh,
+    resume_session_id: ?[]const u8 = null,
 };
 
 pub const Options = struct {
@@ -283,13 +292,21 @@ pub const Supervisor = struct {
         harness: []const u8,
         cwd: ?[]const u8 = null,
         cwd_owned: bool = false,
+        exec: ExecutionContext = .{},
+        thread_name_owned: ?[]u8 = null,
+        resume_session_id_owned: ?[]u8 = null,
 
         fn deinit(self: *ProceedInfo, allocator: std.mem.Allocator) void {
             if (self.cwd_owned) {
                 if (self.cwd) |cwd| allocator.free(cwd);
             }
+            if (self.thread_name_owned) |s| allocator.free(s);
+            if (self.resume_session_id_owned) |s| allocator.free(s);
             self.cwd = null;
             self.cwd_owned = false;
+            self.thread_name_owned = null;
+            self.resume_session_id_owned = null;
+            self.exec = .{};
         }
     };
 
@@ -311,25 +328,25 @@ pub const Supervisor = struct {
             if (list.len == 0) return .{ .blocked = "harness_denied" };
             harness_name = list[0];
         }
-        // Item-level provider preference.
-        if (item.target) |t| {
-            if (t.provider) |p| {
-                if (harness_dispatch.providerToHarness(p)) |mapped| {
-                    if (cfg.allowed_harnesses) |list| {
-                        var ok = false;
-                        for (list) |h| if (std.mem.eql(u8, h, mapped)) {
-                            ok = true;
-                            break;
-                        };
-                        if (ok) harness_name = mapped else {
-                            // Item asked for a specific provider but the
-                            // stack denies it. Block, don't silently fall
-                            // back to a different harness.
-                            return .{ .blocked = "harness_denied" };
-                        }
-                    } else {
-                        harness_name = mapped;
+        var thread_exec = try self.resolveThreadExecution(stack_name, item);
+        defer thread_exec.deinit();
+
+        // Item-level provider preference. Thread target fills missing fields.
+        if (itemTargetProvider(item, thread_exec.thread)) |p| {
+            if (harness_dispatch.providerToHarness(p)) |mapped| {
+                if (cfg.allowed_harnesses) |list| {
+                    var ok = false;
+                    for (list) |h| if (std.mem.eql(u8, h, mapped)) {
+                        ok = true;
+                        break;
+                    };
+                    if (ok) harness_name = mapped else {
+                        // Item/thread asked for a specific provider but the
+                        // stack denies it. Block, don't silently fall back.
+                        return .{ .blocked = "harness_denied" };
                     }
+                } else {
+                    harness_name = mapped;
                 }
             }
         }
@@ -344,14 +361,42 @@ pub const Supervisor = struct {
             if (!ok) return .{ .blocked = "harness_denied" };
         }
 
+        if (thread_exec.blocked_reason) |reason| return .{ .blocked = reason };
+        if (thread_exec.mode == .@"resume") {
+            if (thread_exec.thread) |th| {
+                if (th.state) |st| {
+                    if (st.last_harness) |last_harness| {
+                        if (!std.mem.eql(u8, last_harness, harness_name)) return .{ .blocked = "thread_mode_unsupported" };
+                    }
+                }
+            }
+        }
+
         var workdir = try self.resolveWorkdir(cfg, item);
-        errdefer workdir.deinit(self.allocator);
+        defer workdir.deinit(self.allocator);
         if (workdir.path) |wd| {
             if (self.opts.workdir_allowlist.len > 0) {
                 if (!try workdirAllowed(self.allocator, wd, self.opts.workdir_allowlist)) {
                     return .{ .blocked = "workdir_denied" };
                 }
             }
+        }
+
+        if (prompt_materializer.hasRegisteredInputs(item)) {
+            const dir_name = try std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ item.id, item.slug });
+            defer self.allocator.free(dir_name);
+            const item_dir_abs = try std.fs.path.join(self.allocator, &.{ self.opts.notes_root_abs, "stacks", stack_name, dir_name });
+            defer self.allocator.free(item_dir_abs);
+            const rendered = prompt_materializer.resolvePrompt(self.allocator, self.opts.notes_root_abs, stack_name, item, item_dir_abs) catch |e| switch (e) {
+                error.InputMissing => {
+                    return .{ .blocked = "input_missing" };
+                },
+                error.InputTooLarge => {
+                    return .{ .blocked = "input_too_large" };
+                },
+                else => return e,
+            };
+            self.allocator.free(rendered);
         }
 
         // Harness availability (the adapter factory must accept it).
@@ -362,6 +407,7 @@ pub const Supervisor = struct {
             if (requiredCapability(item.kind)) |cap| {
                 if (!p.supports(cap)) return .{ .blocked = "harness_unsupported_capability" };
             }
+            if (thread_exec.mode == .@"resume" and !p.supports(.@"resume")) return .{ .blocked = "thread_mode_unsupported" };
         }
 
         // Per-provider preflight: binary-presence + auth-state checks.
@@ -405,11 +451,74 @@ pub const Supervisor = struct {
             }
         }
 
+        if (prompt_materializer.hasRegisteredInputs(item)) {
+            const dir_name = try std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ item.id, item.slug });
+            defer self.allocator.free(dir_name);
+            const item_dir_abs = try std.fs.path.join(self.allocator, &.{ self.opts.notes_root_abs, "stacks", stack_name, dir_name });
+            defer self.allocator.free(item_dir_abs);
+            prompt_materializer.materializePrompt(self.allocator, self.opts.notes_root_abs, stack_name, item, item_dir_abs) catch |e| switch (e) {
+                error.InputMissing => {
+                    return .{ .blocked = "input_missing" };
+                },
+                error.InputTooLarge => {
+                    return .{ .blocked = "input_too_large" };
+                },
+                else => return e,
+            };
+        }
+
         const cwd = workdir.path;
         const cwd_owned = workdir.owned;
         workdir.path = null;
         workdir.owned = false;
-        return .{ .proceed = .{ .harness = harness_name, .cwd = cwd, .cwd_owned = cwd_owned } };
+        var proceed: ProceedInfo = .{ .harness = harness_name, .cwd = cwd, .cwd_owned = cwd_owned };
+        if (thread_exec.thread_name) |name| {
+            proceed.thread_name_owned = try self.allocator.dupe(u8, name);
+            proceed.exec.thread_name = proceed.thread_name_owned.?;
+            proceed.exec.thread_mode = thread_exec.mode;
+        }
+        if (thread_exec.resume_session_id) |sid| {
+            proceed.resume_session_id_owned = try self.allocator.dupe(u8, sid);
+            proceed.exec.resume_session_id = proceed.resume_session_id_owned.?;
+        }
+        return .{ .proceed = proceed };
+    }
+
+    const ThreadExecution = struct {
+        thread: ?stack_thread.Thread = null,
+        thread_name: ?[]const u8 = null,
+        mode: item_mod.ThreadMode = .fresh,
+        resume_session_id: ?[]const u8 = null,
+        blocked_reason: ?[]const u8 = null,
+
+        fn deinit(self: *ThreadExecution) void {
+            if (self.thread) |*th| th.deinit();
+            self.thread = null;
+        }
+    };
+
+    fn resolveThreadExecution(self: *Supervisor, stack_name: []const u8, item: *const item_mod.Item) !ThreadExecution {
+        const ref = item.thread orelse return .{};
+        switch (ref.mode) {
+            .fresh, .@"resume" => {},
+            .@"continue", .fork => return .{ .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_mode_unsupported" },
+        }
+        const rel = try std.fmt.allocPrint(self.allocator, "stacks/{s}/threads/{s}.toml", .{ stack_name, ref.name });
+        defer self.allocator.free(rel);
+        const abs = try std.fs.path.join(self.allocator, &.{ self.opts.notes_root_abs, rel });
+        defer self.allocator.free(abs);
+        var thread = readThreadFile(self.allocator, abs) catch |e| switch (e) {
+            error.FileNotFound => return .{ .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_not_found" },
+            else => return e,
+        };
+        errdefer thread.deinit();
+        if (thread.status == .archived) return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_archived" };
+        if (ref.mode == .@"resume") {
+            const st = thread.state orelse return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_no_session" };
+            const sid = st.last_session_id orelse return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_no_session" };
+            return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode, .resume_session_id = sid };
+        }
+        return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode };
     }
 
     const ResolvedWorkdir = struct {
@@ -457,7 +566,7 @@ pub const Supervisor = struct {
         defer self.allocator.free(item_dir_abs);
 
         // Build argv.
-        const argv_owned = try self.opts.dispatch.build_argv(self.allocator, proceed.harness, item, item_dir_abs);
+        const argv_owned = try self.opts.dispatch.build_argv(self.allocator, proceed.harness, item, item_dir_abs, proceed.exec);
         defer {
             for (argv_owned) |a| self.allocator.free(a);
             self.allocator.free(argv_owned);
@@ -472,6 +581,9 @@ pub const Supervisor = struct {
             .argv = argv_const,
             .cwd = proceed.cwd,
             .adapter = adapter,
+            .thread_name = proceed.exec.thread_name,
+            .thread_mode = proceed.exec.thread_mode,
+            .resume_session_id = proceed.exec.resume_session_id,
         }) catch |e| {
             // Spawn failed → record as failed.
             const client = self.systemClient("runtime/spawn");
@@ -489,6 +601,23 @@ pub const Supervisor = struct {
         return self.opts.stack_registry.localClient("system", api_path);
     }
 };
+
+fn readThreadFile(allocator: std.mem.Allocator, abs: []const u8) !stack_thread.Thread {
+    var f = try std.fs.cwd().openFile(abs, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const src = try allocator.alloc(u8, stat.size);
+    defer allocator.free(src);
+    const n = try f.readAll(src);
+    var diag: stack_thread.ParseDiagnostic = .{};
+    return stack_thread.parseSlice(allocator, src[0..n], &diag);
+}
+
+fn itemTargetProvider(item: *const item_mod.Item, thread: ?stack_thread.Thread) ?[]const u8 {
+    if (item.target) |t| if (t.provider) |p| return p;
+    if (thread) |th| if (th.target) |t| if (t.provider) |p| return p;
+    return null;
+}
 
 fn deinitMutationIfOk(result: stack_mod.MutationResult) void {
     switch (result) {
@@ -622,10 +751,23 @@ fn fakeFactory(allocator: std.mem.Allocator, harness: []const u8) anyerror!?adap
     return try fake_adapter.create(allocator);
 }
 
-fn fakeBuildArgv(allocator: std.mem.Allocator, harness: []const u8, item: *const item_mod.Item, item_dir_abs: []const u8) anyerror![][]u8 {
+fn fakeBuildArgv(allocator: std.mem.Allocator, harness: []const u8, item: *const item_mod.Item, item_dir_abs: []const u8, ctx: ExecutionContext) anyerror![][]u8 {
     _ = harness;
     _ = item;
     _ = item_dir_abs;
+    if (ctx.thread_mode == .@"resume") {
+        const sid = ctx.resume_session_id orelse "missing";
+        const line = try std.fmt.allocPrint(allocator, "{{\"kind\":\"session_started\",\"data\":{{\"harness\":\"fake\",\"model\":\"fake-resume\",\"session\":\"{s}\"}}}}\n", .{sid});
+        errdefer allocator.free(line);
+        var out = try allocator.alloc([]u8, 3);
+        errdefer allocator.free(out);
+        out[0] = try allocator.dupe(u8, "/usr/bin/printf");
+        errdefer allocator.free(out[0]);
+        out[1] = try allocator.dupe(u8, "%s");
+        errdefer allocator.free(out[1]);
+        out[2] = line;
+        return out;
+    }
     // Default: a no-op argv. Tests override.
     var out = try allocator.alloc([]u8, 1);
     out[0] = try allocator.dupe(u8, "/usr/bin/true");

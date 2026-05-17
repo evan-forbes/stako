@@ -47,6 +47,12 @@ pub fn run(
         .supersede => return try runSupersede(allocator, &client, args, stdout, stderr),
         .pause => return try runPauseResume(allocator, &client, args, true, stdout, stderr),
         .@"resume" => return try runPauseResume(allocator, &client, args, false, stdout, stderr),
+        .output => return try runOutput(allocator, &client, args, stdout, stderr),
+        .threads => return try runThreads(allocator, &client, args, stdout, stderr),
+        .thread_show => return try runThreadShow(allocator, &client, args, stdout, stderr),
+        .thread_create => return try runThreadCreate(allocator, &client, args, stdout, stderr),
+        .thread_archive => return try runThreadArchive(allocator, &client, args, stdout, stderr),
+        .run_routine => return try runRoutineAppend(allocator, &client, args, stdout, stderr),
     }
 }
 
@@ -355,6 +361,34 @@ const Entry = struct {
     status: []const u8,
 };
 
+fn renderThreadList(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        try stderr.writeAll("stako: malformed daemon response\n");
+        return;
+    };
+    defer parsed.deinit();
+    const threads = if (parsed.value == .object) parsed.value.object.get("threads") else null;
+    if (threads == null or threads.? != .array or threads.?.array.items.len == 0) {
+        try stdout.writeAll("(no threads)\n");
+        return;
+    }
+    try stdout.writeAll("NAME STATUS UPDATED\n");
+    for (threads.?.array.items) |entry| {
+        if (entry != .object) continue;
+        const name = entry.object.get("name") orelse continue;
+        const status = entry.object.get("status") orelse continue;
+        const updated = entry.object.get("updated_at") orelse continue;
+        if (name == .string and status == .string and updated == .string) {
+            try stdout.print("{s} {s} {s}\n", .{ name.string, status.string, updated.string });
+        }
+    }
+}
+
 /// Find a non-string JSON value (boolean, number, null) following `key`.
 /// Returns the value text up to the next `,` or `}`.
 fn findJsonRawField(body: []const u8, key: []const u8) ?[]const u8 {
@@ -480,8 +514,151 @@ fn buildItemBody(allocator: std.mem.Allocator, args: cli.StackArgs, stderr: anyt
         try writeJsonStr(w, p);
         try w.writeAll("\"");
     }
+    if (args.thread_name.len > 0) {
+        try w.writeAll(",\"thread\":\"");
+        try writeJsonStr(w, args.thread_name);
+        try w.writeAll("\"");
+    }
+    if (args.thread_mode.len > 0) {
+        try w.writeAll(",\"thread_mode\":\"");
+        try writeJsonStr(w, args.thread_mode);
+        try w.writeAll("\"");
+    }
+    if (args.input_item_count > 0) {
+        try w.writeAll(",\"inputs\":{\"items\":[");
+        var j: usize = 0;
+        while (j < args.input_item_count) : (j += 1) {
+            if (j != 0) try w.writeAll(",");
+            try w.writeAll("\"");
+            try writeJsonStr(w, args.input_items[j]);
+            try w.writeAll("\"");
+        }
+        try w.writeAll("]}");
+    }
     try w.writeAll("}");
     return try body.toOwnedSlice(allocator);
+}
+
+fn runOutput(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/output/summary", .{ args.name, args.item_id });
+    defer allocator.free(path);
+    var resp = http_client.get(client, path) catch |e| return reportClientError(e, client, path, stderr);
+    defer resp.deinit();
+    if (resp.status != 200) return reportApiError(resp.status, resp.body, path, args.flags.verbose, stderr);
+    if (args.flags.json) {
+        try stdout.writeAll(resp.body);
+        try stdout.writeAll("\n");
+        return 0;
+    }
+    if (findJsonStringField(resp.body, "\"summary\":\"")) |s| {
+        try stdout.writeAll(s);
+        if (s.len == 0 or s[s.len - 1] != '\n') try stdout.writeAll("\n");
+    }
+    return 0;
+}
+
+fn runThreads(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/threads", .{args.name});
+    defer allocator.free(path);
+    var resp = http_client.get(client, path) catch |e| return reportClientError(e, client, path, stderr);
+    defer resp.deinit();
+    if (resp.status != 200) return reportApiError(resp.status, resp.body, path, args.flags.verbose, stderr);
+    if (args.flags.json) {
+        try stdout.writeAll(resp.body);
+        try stdout.writeAll("\n");
+        return 0;
+    }
+    try renderThreadList(allocator, resp.body, stdout, stderr);
+    return 0;
+}
+
+fn runThreadShow(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/threads/{s}", .{ args.name, args.thread_name });
+    defer allocator.free(path);
+    var resp = http_client.get(client, path) catch |e| return reportClientError(e, client, path, stderr);
+    defer resp.deinit();
+    if (resp.status != 200) return reportApiError(resp.status, resp.body, path, args.flags.verbose, stderr);
+    try stdout.writeAll(resp.body);
+    try stdout.writeAll("\n");
+    return 0;
+}
+
+fn runThreadCreate(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/threads", .{args.name});
+    defer allocator.free(path);
+    var body = std.ArrayList(u8){};
+    defer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{\"name\":\"");
+    try writeJsonStr(w, args.thread_name);
+    try w.writeAll("\"");
+    if (args.target.len > 0 or args.replacement.len > 0) {
+        try w.writeAll(",\"target\":{");
+        var first = true;
+        if (args.target.len > 0) {
+            try w.writeAll("\"provider\":\"");
+            try writeJsonStr(w, args.target);
+            try w.writeAll("\"");
+            first = false;
+        }
+        if (args.replacement.len > 0) {
+            if (!first) try w.writeAll(",");
+            try w.writeAll("\"model\":\"");
+            try writeJsonStr(w, args.replacement);
+            try w.writeAll("\"");
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("}");
+    return try postAndReport(client, path, body.items, args.flags, stdout, stderr);
+}
+
+fn runThreadArchive(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/threads/{s}/archive", .{ args.name, args.thread_name });
+    defer allocator.free(path);
+    return try postAndReport(client, path, "{}", args.flags, stdout, stderr);
+}
+
+fn runRoutineAppend(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/routines/{s}", .{ args.name, args.routine_name });
+    defer allocator.free(path);
+    return try postAndReport(client, path, "{}", args.flags, stdout, stderr);
 }
 
 fn runTransition(

@@ -16,9 +16,10 @@
 //!   claude -p <prompt> --output-format stream-json --verbose --include-partial-messages
 //!   codex exec --json <prompt>
 //!
-//! Prompt source: the item directory's `prompt.md`. If missing or empty, the
-//! prompt defaults to the item's slug. Real provider tests will rely on the
-//! prompt.md path; mock tests bypass this entirely by passing a custom
+//! Prompt source: the item directory's `rendered_prompt.md` when present,
+//! otherwise `prompt.md`. If missing or empty, the prompt defaults to the
+//! item's slug. Real provider tests will rely on the prompt path; mock tests
+//! bypass this entirely by passing a custom
 //! `build_argv` that runs the fake-harness `cat_jsonl.sh` script.
 
 const std = @import("std");
@@ -91,14 +92,15 @@ pub fn buildArgv(
     harness: []const u8,
     item: *const item_mod.Item,
     item_dir_abs: []const u8,
+    ctx: runtime_mod.ExecutionContext,
 ) anyerror![][]u8 {
     const prompt = try resolvePrompt(allocator, item, item_dir_abs);
     errdefer allocator.free(prompt);
 
     if (std.mem.eql(u8, harness, Names.claude)) {
-        return buildClaudeArgv(allocator, prompt);
+        return buildClaudeArgv(allocator, prompt, ctx);
     } else if (std.mem.eql(u8, harness, Names.codex)) {
-        return buildCodexArgv(allocator, prompt);
+        return buildCodexArgv(allocator, prompt, ctx);
     } else {
         return error.UnsupportedHarness;
     }
@@ -109,10 +111,19 @@ fn resolvePrompt(
     item: *const item_mod.Item,
     item_dir_abs: []const u8,
 ) ![]u8 {
+    const rendered_path = try std.fs.path.join(allocator, &.{ item_dir_abs, "rendered_prompt.md" });
+    defer allocator.free(rendered_path);
+    if (try readPromptFile(allocator, rendered_path, false)) |prompt| return prompt;
+
     const path = try std.fs.path.join(allocator, &.{ item_dir_abs, "prompt.md" });
     defer allocator.free(path);
+    if (try readPromptFile(allocator, path, true)) |prompt| return prompt;
+    return allocator.dupe(u8, item.slug);
+}
+
+fn readPromptFile(allocator: std.mem.Allocator, path: []const u8, trim_trailing_newline: bool) !?[]u8 {
     var f = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
-        error.FileNotFound => return allocator.dupe(u8, item.slug),
+        error.FileNotFound => return null,
         else => return e,
     };
     defer f.close();
@@ -120,21 +131,22 @@ fn resolvePrompt(
     const buf = try allocator.alloc(u8, stat.size);
     errdefer allocator.free(buf);
     const n = try f.readAll(buf);
+    if (!trim_trailing_newline) return try allocator.realloc(buf, n);
     if (n == 0) {
         allocator.free(buf);
-        return allocator.dupe(u8, item.slug);
+        return null;
     }
     // Trim trailing newline for tidier argv.
     var end = n;
     while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == '\r')) end -= 1;
     if (end == 0) {
         allocator.free(buf);
-        return allocator.dupe(u8, item.slug);
+        return null;
     }
     return try allocator.realloc(buf, end);
 }
 
-fn buildClaudeArgv(allocator: std.mem.Allocator, prompt_owned: []u8) ![][]u8 {
+fn buildClaudeArgv(allocator: std.mem.Allocator, prompt_owned: []u8, ctx: runtime_mod.ExecutionContext) ![][]u8 {
     // We will hand the prompt as a single argv slot.
     var out = std.ArrayList([]u8){};
     errdefer {
@@ -145,6 +157,10 @@ fn buildClaudeArgv(allocator: std.mem.Allocator, prompt_owned: []u8) ![][]u8 {
     try out.append(allocator, try allocator.dupe(u8, "claude"));
     try out.append(allocator, try allocator.dupe(u8, "-p"));
     try out.append(allocator, prompt_owned);
+    if (ctx.thread_mode == .@"resume") {
+        try out.append(allocator, try allocator.dupe(u8, "--resume"));
+        try out.append(allocator, try allocator.dupe(u8, ctx.resume_session_id orelse return error.MissingResumeSession));
+    }
     try out.append(allocator, try allocator.dupe(u8, "--output-format"));
     try out.append(allocator, try allocator.dupe(u8, "stream-json"));
     try out.append(allocator, try allocator.dupe(u8, "--verbose"));
@@ -152,7 +168,7 @@ fn buildClaudeArgv(allocator: std.mem.Allocator, prompt_owned: []u8) ![][]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn buildCodexArgv(allocator: std.mem.Allocator, prompt_owned: []u8) ![][]u8 {
+fn buildCodexArgv(allocator: std.mem.Allocator, prompt_owned: []u8, ctx: runtime_mod.ExecutionContext) ![][]u8 {
     var out = std.ArrayList([]u8){};
     errdefer {
         for (out.items) |s| allocator.free(s);
@@ -161,6 +177,13 @@ fn buildCodexArgv(allocator: std.mem.Allocator, prompt_owned: []u8) ![][]u8 {
     }
     try out.append(allocator, try allocator.dupe(u8, "codex"));
     try out.append(allocator, try allocator.dupe(u8, "exec"));
+    if (ctx.thread_mode == .@"resume") {
+        try out.append(allocator, try allocator.dupe(u8, "resume"));
+        try out.append(allocator, try allocator.dupe(u8, "--json"));
+        try out.append(allocator, try allocator.dupe(u8, ctx.resume_session_id orelse return error.MissingResumeSession));
+        try out.append(allocator, prompt_owned);
+        return out.toOwnedSlice(allocator);
+    }
     try out.append(allocator, try allocator.dupe(u8, "--json"));
     try out.append(allocator, prompt_owned);
     return out.toOwnedSlice(allocator);
@@ -238,7 +261,7 @@ test "buildArgv: claude shape" {
     };
     defer it.deinit();
     // No prompt.md on disk → falls back to slug.
-    const argv = try buildArgv(a, "claude", &it, "/nonexistent-dir-9001");
+    const argv = try buildArgv(a, "claude", &it, "/nonexistent-dir-9001", .{});
     defer {
         for (argv) |s| a.free(s);
         a.free(argv);
@@ -264,7 +287,7 @@ test "buildArgv: codex shape" {
         .updated_at = "2026-05-10T14:00:00Z",
     };
     defer it.deinit();
-    const argv = try buildArgv(a, "codex", &it, "/nonexistent-dir-9002");
+    const argv = try buildArgv(a, "codex", &it, "/nonexistent-dir-9002", .{});
     defer {
         for (argv) |s| a.free(s);
         a.free(argv);
@@ -273,6 +296,64 @@ test "buildArgv: codex shape" {
     try std.testing.expectEqualStrings("exec", argv[1]);
     try std.testing.expectEqualStrings("--json", argv[2]);
     try std.testing.expectEqualStrings("say-hi", argv[3]);
+}
+
+test "buildArgv: claude resume shape" {
+    const a = std.testing.allocator;
+    var it = item_mod.Item{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0001",
+        .slug = "say-hi",
+        .kind = .prompt,
+        .status = .queued,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer it.deinit();
+    const argv = try buildArgv(a, "claude", &it, "/nonexistent-dir-9004", .{
+        .thread_name = "admin",
+        .thread_mode = .@"resume",
+        .resume_session_id = "sess-1",
+    });
+    defer {
+        for (argv) |s| a.free(s);
+        a.free(argv);
+    }
+    try std.testing.expectEqualStrings("claude", argv[0]);
+    try std.testing.expectEqualStrings("-p", argv[1]);
+    try std.testing.expectEqualStrings("say-hi", argv[2]);
+    try std.testing.expectEqualStrings("--resume", argv[3]);
+    try std.testing.expectEqualStrings("sess-1", argv[4]);
+    try std.testing.expectEqualStrings("--output-format", argv[5]);
+}
+
+test "buildArgv: codex resume shape" {
+    const a = std.testing.allocator;
+    var it = item_mod.Item{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0001",
+        .slug = "say-hi",
+        .kind = .prompt,
+        .status = .queued,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer it.deinit();
+    const argv = try buildArgv(a, "codex", &it, "/nonexistent-dir-9005", .{
+        .thread_name = "admin",
+        .thread_mode = .@"resume",
+        .resume_session_id = "sess-1",
+    });
+    defer {
+        for (argv) |s| a.free(s);
+        a.free(argv);
+    }
+    try std.testing.expectEqualStrings("codex", argv[0]);
+    try std.testing.expectEqualStrings("exec", argv[1]);
+    try std.testing.expectEqualStrings("resume", argv[2]);
+    try std.testing.expectEqualStrings("--json", argv[3]);
+    try std.testing.expectEqualStrings("sess-1", argv[4]);
+    try std.testing.expectEqualStrings("say-hi", argv[5]);
 }
 
 test "buildArgv: unknown harness fails instead of running a no-op" {
@@ -287,7 +368,7 @@ test "buildArgv: unknown harness fails instead of running a no-op" {
         .updated_at = "2026-05-10T14:00:00Z",
     };
     defer it.deinit();
-    try std.testing.expectError(error.UnsupportedHarness, buildArgv(a, "unknown", &it, "/nonexistent-dir-9003"));
+    try std.testing.expectError(error.UnsupportedHarness, buildArgv(a, "unknown", &it, "/nonexistent-dir-9003", .{}));
 }
 
 test "buildArgv: pathological prompt.md contents pass through as one argv slot" {
@@ -323,7 +404,7 @@ test "buildArgv: pathological prompt.md contents pass through as one argv slot" 
     };
     defer it.deinit();
     {
-        const argv = try buildArgv(a, "claude", &it, dir);
+        const argv = try buildArgv(a, "claude", &it, dir, .{});
         defer {
             for (argv) |s| a.free(s);
             a.free(argv);
@@ -331,11 +412,45 @@ test "buildArgv: pathological prompt.md contents pass through as one argv slot" 
         try std.testing.expectEqualStrings(pathological, argv[2]);
     }
     {
-        const argv = try buildArgv(a, "codex", &it, dir);
+        const argv = try buildArgv(a, "codex", &it, dir, .{});
         defer {
             for (argv) |s| a.free(s);
             a.free(argv);
         }
         try std.testing.expectEqualStrings(pathological, argv[3]);
     }
+}
+
+test "buildArgv: rendered_prompt.md wins over prompt.md when present" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buf);
+    {
+        var f = try tmp.dir.createFile("prompt.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("base prompt\n");
+    }
+    {
+        var f = try tmp.dir.createFile("rendered_prompt.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("rendered prompt\n");
+    }
+    var it = item_mod.Item{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0001",
+        .slug = "say-hi",
+        .kind = .prompt,
+        .status = .queued,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer it.deinit();
+    const argv = try buildArgv(a, "codex", &it, dir, .{});
+    defer {
+        for (argv) |s| a.free(s);
+        a.free(argv);
+    }
+    try std.testing.expectEqualStrings("rendered prompt\n", argv[3]);
 }

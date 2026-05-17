@@ -22,6 +22,7 @@
 const std = @import("std");
 const item_mod = @import("item.zig");
 const stack_config = @import("stack_config.zig");
+const stack_thread = @import("stack_thread.zig");
 const storage = @import("storage.zig");
 
 /// Escape one byte sequence for safe inclusion in HTML text or attribute
@@ -148,6 +149,7 @@ pub const StackPageInput = struct {
     name: []const u8,
     config: *const stack_config.StackConfig,
     items: []const storage.ItemSummary,
+    threads: []const storage.ThreadSummary = &.{},
     running_count: usize = 0,
     /// When non-null, render the pause/resume mutation form embedding this
     /// local mutation token as a hidden `_token` field. The token MUST only
@@ -235,6 +237,23 @@ pub fn renderStack(
         }
         try w.writeAll("</tbody></table>");
     }
+    if (input.threads.len > 0) {
+        try w.writeAll("<h2>Threads</h2><table><thead><tr><th>name</th><th>status</th><th>updated</th></tr></thead><tbody>");
+        for (input.threads) |th| {
+            try w.writeAll("<tr><td><a href=\"/stacks/");
+            try escape(w, input.name);
+            try w.writeAll("/threads/");
+            try escape(w, th.name);
+            try w.writeAll("\">");
+            try escape(w, th.name);
+            try w.writeAll("</a></td><td>");
+            try escape(w, th.status);
+            try w.writeAll("</td><td>");
+            try escape(w, th.updated_at);
+            try w.writeAll("</td></tr>");
+        }
+        try w.writeAll("</tbody></table>");
+    }
     try writeFooter(w);
 }
 
@@ -309,6 +328,10 @@ pub const ItemPageInput = struct {
     /// Raw transcript.jsonl bytes; the renderer parses line-by-line. Null
     /// when no transcript exists yet.
     transcript_jsonl: ?[]const u8 = null,
+    output_summary: ?[]const u8 = null,
+    changed_paths: ?[]const u8 = null,
+    rendered_prompt_href: ?[]const u8 = null,
+    rendered_prompt_body: ?[]const u8 = null,
     /// When true, append an inline `<script>` that subscribes to SSE so the
     /// transcript and status badge update live. The script is opt-in so
     /// snapshot tests can render a JS-free page.
@@ -373,6 +396,17 @@ pub fn renderItem(
         }
         try w.writeAll("</dd>");
     }
+    if (input.item.thread) |th| {
+        try w.writeAll("<dt>thread</dt><dd><a href=\"/stacks/");
+        try escape(w, input.stack);
+        try w.writeAll("/threads/");
+        try escape(w, th.name);
+        try w.writeAll("\">");
+        try escape(w, th.name);
+        try w.writeAll("</a> ");
+        try escape(w, th.mode.toString());
+        try w.writeAll("</dd>");
+    }
     if (input.item.target) |t| {
         try w.writeAll("<dt>target</dt><dd>");
         var first = true;
@@ -426,6 +460,26 @@ pub fn renderItem(
         try escape(w, body);
         try w.writeAll("</pre>");
     }
+    if (input.rendered_prompt_href) |href| {
+        try w.writeAll("<p><a href=\"");
+        try escape(w, href);
+        try w.writeAll("\">rendered prompt</a></p>");
+    }
+    if (input.rendered_prompt_body) |body| {
+        try w.writeAll("<h2 id=\"rendered-prompt\">Rendered Prompt</h2><pre class=\"prompt\">");
+        try escape(w, body);
+        try w.writeAll("</pre>");
+    }
+
+    if (input.output_summary) |summary| {
+        try w.writeAll("<h2>Output Summary</h2><pre class=\"prompt\">");
+        try escape(w, summary);
+        try w.writeAll("</pre>");
+    }
+    if (input.changed_paths) |raw| {
+        try w.writeAll("<h2>Changed Paths</h2>");
+        try renderChangedPaths(w, raw);
+    }
 
     // Transcript snapshot.
     try w.writeAll("<h2>Transcript</h2>");
@@ -477,6 +531,97 @@ pub fn renderItem(
     }
 
     try writeFooter(w);
+}
+
+pub const ThreadPageInput = struct {
+    stack: []const u8,
+    thread: *const stack_thread.Thread,
+};
+
+pub fn renderThread(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    input: ThreadPageInput,
+) !void {
+    const w = out.writer(allocator);
+    try writeHeader(w, "thread");
+    try w.writeAll("<nav class=\"crumbs\"><a href=\"/\">home</a> / stacks / <a href=\"/stacks/");
+    try escape(w, input.stack);
+    try w.writeAll("\">");
+    try escape(w, input.stack);
+    try w.writeAll("</a> / threads / ");
+    try escape(w, input.thread.name);
+    try w.writeAll("</nav><header><h1>");
+    try escape(w, input.thread.name);
+    try w.writeAll("</h1></header><dl class=\"kv\">");
+    try w.writeAll("<dt>status</dt><dd>");
+    try escape(w, input.thread.status.toString());
+    try w.writeAll("</dd><dt>created_at</dt><dd>");
+    try escape(w, input.thread.created_at);
+    try w.writeAll("</dd><dt>updated_at</dt><dd>");
+    try escape(w, input.thread.updated_at);
+    try w.writeAll("</dd>");
+    if (input.thread.target) |t| {
+        if (t.provider) |s| {
+            try w.writeAll("<dt>provider</dt><dd>");
+            try escape(w, s);
+            try w.writeAll("</dd>");
+        }
+        if (t.model) |s| {
+            try w.writeAll("<dt>model</dt><dd>");
+            try escape(w, s);
+            try w.writeAll("</dd>");
+        }
+        if (t.match) |m| {
+            try w.writeAll("<dt>match</dt><dd>");
+            try escape(w, m.toString());
+            try w.writeAll("</dd>");
+        }
+    }
+    if (input.thread.state) |s| {
+        if (s.last_item_id) |v| {
+            try w.writeAll("<dt>last_item</dt><dd><a href=\"/stacks/");
+            try escape(w, input.stack);
+            try w.writeAll("/items/");
+            try escape(w, v);
+            try w.writeAll("\">");
+            try escape(w, v);
+            try w.writeAll("</a></dd>");
+        }
+        if (s.last_harness) |v| {
+            try w.writeAll("<dt>last_harness</dt><dd>");
+            try escape(w, v);
+            try w.writeAll("</dd>");
+        }
+        if (s.last_session_id) |v| {
+            try w.writeAll("<dt>last_session</dt><dd>");
+            try escape(w, v);
+            try w.writeAll("</dd>");
+        }
+        if (s.last_transcript_path) |v| {
+            try w.writeAll("<dt>transcript</dt><dd>");
+            try escape(w, v);
+            try w.writeAll("</dd>");
+        }
+    }
+    try w.writeAll("</dl>");
+    try writeFooter(w);
+}
+
+fn renderChangedPaths(w: anytype, raw: []const u8) !void {
+    try w.writeAll("<ul>");
+    var any = false;
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        if (line.len == 0) continue;
+        any = true;
+        try w.writeAll("<li>");
+        try escape(w, line);
+        try w.writeAll("</li>");
+    }
+    if (!any) try w.writeAll("<li><em>No changed paths recorded.</em></li>");
+    try w.writeAll("</ul>");
 }
 
 /// Walk transcript.jsonl line by line, render each parseable event as a

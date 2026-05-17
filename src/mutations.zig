@@ -12,7 +12,11 @@
 
 const std = @import("std");
 const item_mod = @import("item.zig");
+const output_packet = @import("output_packet.zig");
+const prompt_materializer = @import("prompt_materializer.zig");
+const routine_mod = @import("routine.zig");
 const stack_config = @import("stack_config.zig");
+const stack_thread = @import("stack_thread.zig");
 const state = @import("state.zig");
 const storage = @import("storage.zig");
 const audit = @import("audit.zig");
@@ -29,6 +33,8 @@ pub const Error = error{
     DirtyTarget,
     BadConfigKey,
     BadConfigValue,
+    BadThreadKey,
+    BadThreadValue,
 } || anyerror;
 
 /// Bundle of information one mutation produces. Owned by the caller; freed
@@ -209,11 +215,27 @@ pub const AppendItemInput = struct {
     target_model: ?[]const u8 = null,
     target_match: ?item_mod.Match = null,
     target_workdir: ?[]const u8 = null,
+    input_items: ?[]const []const u8 = null,
+    input_files: ?[]const []const u8 = null,
+    input_commits: ?[]const []const u8 = null,
+    input_mode: ?item_mod.InputMode = null,
+    thread_name: ?[]const u8 = null,
+    thread_mode: ?item_mod.ThreadMode = null,
     /// Parents (e.g. for review items).
     parents: ?[]const []const u8 = null,
     /// Sleep `until` (RFC3339); required when kind=sleep.
     sleep_until: ?[]const u8 = null,
     /// When non-null, override `created_at` (for deterministic fixtures).
+    created_at_override: ?[]const u8 = null,
+};
+
+pub const AppendRoutineInput = struct {
+    stack: []const u8,
+    routine: *const routine_mod.Routine,
+    input_items: ?[]const []const u8 = null,
+    input_files: ?[]const []const u8 = null,
+    input_commits: ?[]const []const u8 = null,
+    input_mode: ?item_mod.InputMode = null,
     created_at_override: ?[]const u8 = null,
 };
 
@@ -246,10 +268,137 @@ pub fn applyAppendItem(
         .target_model = input.target_model,
         .target_match = input.target_match,
         .target_workdir = input.target_workdir,
+        .input_items = input.input_items,
+        .input_files = input.input_files,
+        .input_commits = input.input_commits,
+        .input_mode = input.input_mode,
+        .thread_name = input.thread_name,
+        .thread_mode = input.thread_mode,
         .parents = input.parents,
         .sleep_until = input.sleep_until,
         .created_at_override = input.created_at_override,
     });
+}
+
+pub fn applyAppendRoutine(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    ident: IdentityCtx,
+    input: AppendRoutineInput,
+) Error!MutationOutput {
+    if (!storage.isValidStackName(input.stack)) return error.InvalidName;
+    const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.stack });
+    defer allocator.free(stack_abs);
+    if (!dirExists(stack_abs)) return error.NotFound;
+
+    const order = input.routine.topologicalOrder(allocator) catch return error.ValidationFailed;
+    defer allocator.free(order);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const next_id_int = try computeNextItemIdInt(allocator, stack_abs);
+    const step_ids = try aa.alloc([]const u8, input.routine.steps.len);
+    for (order, 0..) |step_index, seq| {
+        const id_int: u32 = next_id_int + @as(u32, @intCast(seq));
+        step_ids[step_index] = try std.fmt.allocPrint(aa, "{d:0>4}", .{id_int});
+    }
+
+    const prompt_bodies = try aa.alloc([]const u8, input.routine.steps.len);
+    const effective_thread_modes = try aa.alloc(?item_mod.ThreadMode, input.routine.steps.len);
+    @memset(effective_thread_modes, null);
+    for (input.routine.steps, 0..) |*step, i| {
+        const body = input.routine.resolvePrompt(allocator, step) catch return error.ValidationFailed;
+        prompt_bodies[i] = try aa.dupe(u8, body);
+        allocator.free(body);
+
+        effective_thread_modes[i] = step.thread_mode;
+        if (step.thread) |thread_name| {
+            const thread_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.stack, "threads", try std.fmt.allocPrint(aa, "{s}.toml", .{thread_name}) });
+            defer allocator.free(thread_abs);
+            var th = readThreadFile(allocator, thread_abs) catch return error.ValidationFailed;
+            defer th.deinit();
+            if (th.status != .active) return error.ValidationFailed;
+            if (step.thread_mode == .@"resume" and !threadHasSession(&th)) {
+                effective_thread_modes[i] = .fresh;
+            }
+        }
+    }
+
+    for (order) |step_index| {
+        const step = &input.routine.steps[step_index];
+        const parents = try mapStepRefsToIds(aa, input.routine.steps, step.after, step_ids);
+        const inputs = try mapStepRefsToIds(aa, input.routine.steps, step.inputs_from, step_ids);
+        const routine_input_items = try mergeStringRefs(aa, inputs, input.input_items);
+        try validateExpandedRoutineStep(allocator, notes_root_abs, input.stack, step, effective_thread_modes[step_index], step_ids[step_index], parents, .{
+            .input_items = routine_input_items,
+            .input_files = input.input_files,
+            .input_commits = input.input_commits,
+            .input_mode = input.input_mode,
+        }, input.created_at_override);
+    }
+
+    var paths_list = std.ArrayList([]u8){};
+    errdefer {
+        for (paths_list.items) |p| allocator.free(p);
+        paths_list.deinit(allocator);
+    }
+
+    for (order) |step_index| {
+        const step = &input.routine.steps[step_index];
+        const parents = try mapStepRefsToIds(aa, input.routine.steps, step.after, step_ids);
+        const inputs = try mapStepRefsToIds(aa, input.routine.steps, step.inputs_from, step_ids);
+        const routine_input_items = try mergeStringRefs(aa, inputs, input.input_items);
+        var out = try writeItem(allocator, notes_root_abs, ident, .append_item, input.stack, step_ids[step_index], step.kind, step.slug, .{
+            .prompt_body = prompt_bodies[step_index],
+            .target_provider = step.target.provider,
+            .target_model = step.target.model,
+            .target_match = step.target.match,
+            .target_workdir = step.target.workdir,
+            .input_items = routine_input_items,
+            .input_files = input.input_files,
+            .input_commits = input.input_commits,
+            .input_mode = input.input_mode,
+            .thread_name = step.thread,
+            .thread_mode = effective_thread_modes[step_index],
+            .parents = if (parents.len > 0) parents else null,
+            .created_at_override = input.created_at_override,
+        });
+        defer out.deinit();
+        for (out.paths) |p| try paths_list.append(allocator, try allocator.dupe(u8, p));
+    }
+
+    const subject = try std.fmt.allocPrint(allocator, "routine: append {s} to {s}", .{ input.routine.name, input.stack });
+    errdefer allocator.free(subject);
+    const body = try std.fmt.allocPrint(allocator, "stack: {s}\nroutine: {s}\nsteps: {d}\nidentity: {s}\napi: {s}\n", .{ input.stack, input.routine.name, input.routine.steps.len, ident.identity, ident.api_path });
+    errdefer allocator.free(body);
+    const target = try std.fmt.allocPrint(allocator, "stack/{s}/routine/{s}", .{ input.stack, input.routine.name });
+    errdefer allocator.free(target);
+
+    var details_buf = std.ArrayList(u8){};
+    errdefer details_buf.deinit(allocator);
+    try details_buf.appendSlice(allocator, input.routine.name);
+    try details_buf.append(allocator, 0);
+    const steps_str_start = details_buf.items.len;
+    try details_buf.writer(allocator).print("{d}", .{input.routine.steps.len});
+    const detail_storage = try details_buf.toOwnedSlice(allocator);
+    errdefer allocator.free(detail_storage);
+    const details = try allocator.alloc(audit.DetailKV, 2);
+    errdefer allocator.free(details);
+    details[0] = .{ .key = "routine", .value = detail_storage[0..input.routine.name.len] };
+    details[1] = .{ .key = "steps", .value = detail_storage[steps_str_start..] };
+
+    return .{
+        .allocator = allocator,
+        .paths = try paths_list.toOwnedSlice(allocator),
+        .commit_subject = subject,
+        .commit_body = body,
+        .audit_action = .append_routine,
+        .audit_target = target,
+        .audit_details = details,
+        .detail_storage = detail_storage,
+    };
 }
 
 // ---------- insert item ----------
@@ -268,6 +417,12 @@ pub const InsertItemInput = struct {
     target_model: ?[]const u8 = null,
     target_match: ?item_mod.Match = null,
     target_workdir: ?[]const u8 = null,
+    input_items: ?[]const []const u8 = null,
+    input_files: ?[]const []const u8 = null,
+    input_commits: ?[]const []const u8 = null,
+    input_mode: ?item_mod.InputMode = null,
+    thread_name: ?[]const u8 = null,
+    thread_mode: ?item_mod.ThreadMode = null,
     parents: ?[]const []const u8 = null,
     sleep_until: ?[]const u8 = null,
     created_at_override: ?[]const u8 = null,
@@ -301,6 +456,12 @@ pub fn applyInsertItem(
         .target_model = input.target_model,
         .target_match = input.target_match,
         .target_workdir = input.target_workdir,
+        .input_items = input.input_items,
+        .input_files = input.input_files,
+        .input_commits = input.input_commits,
+        .input_mode = input.input_mode,
+        .thread_name = input.thread_name,
+        .thread_mode = input.thread_mode,
         .parents = input.parents,
         .sleep_until = input.sleep_until,
         .created_at_override = input.created_at_override,
@@ -503,6 +664,31 @@ pub const RuntimeTransitionInput = struct {
     result_transcript_path: ?[]const u8 = null,
     result_exit_code: ?i64 = null,
     result_completed_at: ?[]const u8 = null,
+    output_packet: ?output_packet.PacketInput = null,
+};
+
+pub const CreateThreadInput = struct {
+    stack: []const u8,
+    name: []const u8,
+    target_provider: ?[]const u8 = null,
+    target_model: ?[]const u8 = null,
+    target_match: ?stack_thread.Match = null,
+    created_at_override: ?[]const u8 = null,
+};
+
+pub const ThreadPatch = struct {
+    /// Supported keys: target.provider, target.model, target.match,
+    /// state.last_item_id, state.last_harness, state.last_session_id,
+    /// state.last_session_file, state.last_transcript_path, status.
+    key: []const u8,
+    /// Null clears optional target/state fields. `status` cannot be cleared.
+    value: ?[]const u8,
+};
+
+pub const PatchThreadInput = struct {
+    stack: []const u8,
+    name: []const u8,
+    patches: []const ThreadPatch,
 };
 
 pub fn applyRuntimeTransition(
@@ -578,6 +764,29 @@ pub fn applyRuntimeTransition(
     }
     try paths_list.append(allocator, path_rel);
 
+    if (terminal) {
+        if (try prompt_materializer.renderedPromptExists(allocator, notes_root_abs, input.stack, item_dir_name)) {
+            try paths_list.append(allocator, try prompt_materializer.renderedPromptRel(allocator, input.stack, item_dir_name));
+        }
+        const fallback_packet: output_packet.PacketInput = .{
+            .stack = input.stack,
+            .item_id = input.id,
+            .status = target_status.toString(),
+            .completed_at = input.result_completed_at,
+            .result = if (item.result) |r| r else .{},
+        };
+        const packet = input.output_packet orelse fallback_packet;
+        const output_paths = try output_packet.writePacket(allocator, notes_root_abs, input.stack, item_dir_name, packet);
+        defer allocator.free(output_paths);
+        for (output_paths) |p| try paths_list.append(allocator, p);
+        if (target_status == .completed) {
+            if (item.thread) |thread_ref| {
+                const thread_rel = try updateThreadFromItemResult(allocator, notes_root_abs, input.stack, item_dir_name, thread_ref.name, input, item.result);
+                try paths_list.append(allocator, thread_rel);
+            }
+        }
+    }
+
     const verb: []const u8 = switch (input.to) {
         .running => "running",
         .completed => "completed",
@@ -602,6 +811,109 @@ pub fn applyRuntimeTransition(
         .audit_details = details,
         .detail_storage = try allocator.alloc(u8, 0),
     };
+}
+
+pub fn applyCreateThread(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    ident: IdentityCtx,
+    input: CreateThreadInput,
+) Error!MutationOutput {
+    if (!storage.isValidStackName(input.stack)) return error.InvalidName;
+    if (!stack_thread.isValidName(input.name)) return error.InvalidName;
+    const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.stack });
+    defer allocator.free(stack_abs);
+    if (!dirExists(stack_abs)) return error.NotFound;
+
+    const rel = try threadRel(allocator, input.stack, input.name);
+    errdefer allocator.free(rel);
+    const abs = try std.fs.path.join(allocator, &.{ notes_root_abs, rel });
+    defer allocator.free(abs);
+    if (fileExists(abs)) return error.AlreadyExists;
+    const dir_abs = try std.fs.path.join(allocator, &.{ stack_abs, "threads" });
+    defer allocator.free(dir_abs);
+    try std.fs.cwd().makePath(dir_abs);
+
+    var ts_buf: [40]u8 = undefined;
+    const now = input.created_at_override orelse audit.nowRfc3339Millis(&ts_buf);
+    var thread: stack_thread.Thread = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .name = input.name,
+        .created_at = now,
+        .updated_at = now,
+        .status = .active,
+    };
+    defer thread.deinit();
+    const aa = thread.arena.allocator();
+    thread.name = try aa.dupe(u8, input.name);
+    thread.created_at = try aa.dupe(u8, now);
+    thread.updated_at = try aa.dupe(u8, now);
+    const has_target = input.target_provider != null or input.target_model != null or input.target_match != null;
+    if (has_target) {
+        var target: stack_thread.Target = .{};
+        if (input.target_provider) |s| target.provider = try aa.dupe(u8, s);
+        if (input.target_model) |s| target.model = try aa.dupe(u8, s);
+        target.match = input.target_match;
+        thread.target = target;
+    }
+
+    try writeThreadFile(allocator, abs, &thread);
+    return threadMutationOutput(allocator, ident, input.stack, input.name, rel, .create_thread, "create");
+}
+
+pub fn applyPatchThread(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    ident: IdentityCtx,
+    input: PatchThreadInput,
+) Error!MutationOutput {
+    if (!storage.isValidStackName(input.stack)) return error.InvalidName;
+    if (!stack_thread.isValidName(input.name)) return error.InvalidName;
+    if (input.patches.len == 0) return error.BadThreadValue;
+    const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.stack });
+    defer allocator.free(stack_abs);
+    if (!dirExists(stack_abs)) return error.NotFound;
+
+    const rel = try threadRel(allocator, input.stack, input.name);
+    errdefer allocator.free(rel);
+    const abs = try std.fs.path.join(allocator, &.{ notes_root_abs, rel });
+    defer allocator.free(abs);
+    var thread = try readThreadFile(allocator, abs);
+    defer thread.deinit();
+    if (!std.mem.eql(u8, thread.name, input.name)) return error.ValidationFailed;
+
+    try applyThreadPatches(&thread, input.patches);
+    var ts_buf: [40]u8 = undefined;
+    thread.updated_at = try thread.arena.allocator().dupe(u8, audit.nowRfc3339Millis(&ts_buf));
+    try writeThreadFile(allocator, abs, &thread);
+    return threadMutationOutput(allocator, ident, input.stack, input.name, rel, .update_thread, "patch");
+}
+
+pub fn applyArchiveThread(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    ident: IdentityCtx,
+    stack: []const u8,
+    name: []const u8,
+) Error!MutationOutput {
+    if (!storage.isValidStackName(stack)) return error.InvalidName;
+    if (!stack_thread.isValidName(name)) return error.InvalidName;
+    const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack });
+    defer allocator.free(stack_abs);
+    if (!dirExists(stack_abs)) return error.NotFound;
+
+    const rel = try threadRel(allocator, stack, name);
+    errdefer allocator.free(rel);
+    const abs = try std.fs.path.join(allocator, &.{ notes_root_abs, rel });
+    defer allocator.free(abs);
+    var thread = try readThreadFile(allocator, abs);
+    defer thread.deinit();
+    if (!std.mem.eql(u8, thread.name, name)) return error.ValidationFailed;
+    thread.status = .archived;
+    var ts_buf: [40]u8 = undefined;
+    thread.updated_at = try thread.arena.allocator().dupe(u8, audit.nowRfc3339Millis(&ts_buf));
+    try writeThreadFile(allocator, abs, &thread);
+    return threadMutationOutput(allocator, ident, stack, name, rel, .archive_thread, "archive");
 }
 
 // ---------- pause / resume / config patch ----------
@@ -747,12 +1059,22 @@ pub fn itemMetaRel(allocator: std.mem.Allocator, stack: []const u8, dir_name: []
     return std.fmt.allocPrint(allocator, "stacks/{s}/{s}/meta.toml", .{ stack, dir_name });
 }
 
+pub fn threadRel(allocator: std.mem.Allocator, stack: []const u8, name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "stacks/{s}/threads/{s}.toml", .{ stack, name });
+}
+
 const WriteItemOpts = struct {
     prompt_body: ?[]const u8 = null,
     target_provider: ?[]const u8 = null,
     target_model: ?[]const u8 = null,
     target_match: ?item_mod.Match = null,
     target_workdir: ?[]const u8 = null,
+    input_items: ?[]const []const u8 = null,
+    input_files: ?[]const []const u8 = null,
+    input_commits: ?[]const []const u8 = null,
+    input_mode: ?item_mod.InputMode = null,
+    thread_name: ?[]const u8 = null,
+    thread_mode: ?item_mod.ThreadMode = null,
     parents: ?[]const []const u8 = null,
     sleep_until: ?[]const u8 = null,
     created_at_override: ?[]const u8 = null,
@@ -794,7 +1116,6 @@ fn writeItem(
     // Item directory.
     const dir_name = try itemDirName(aa, id, slug);
     const dir_abs = try std.fs.path.join(aa, &.{ notes_root_abs, "stacks", stack, dir_name });
-    try std.fs.cwd().makePath(dir_abs);
 
     // Build meta.toml via item_mod.write so we use canonical key order.
     var item: item_mod.Item = .{
@@ -820,19 +1141,88 @@ fn writeItem(
         }
         item.parents = arr;
     }
+    var thread_defaults: ?stack_thread.Thread = null;
+    defer if (thread_defaults) |*th| th.deinit();
+    if (opts.thread_name) |name| {
+        if (!stack_thread.isValidName(name)) return error.ValidationFailed;
+        const thread_abs = try std.fs.path.join(aa, &.{ notes_root_abs, "stacks", stack, "threads", try std.fmt.allocPrint(aa, "{s}.toml", .{name}) });
+        thread_defaults = try readThreadFile(allocator, thread_abs);
+        if (thread_defaults.?.status != .active) return error.ValidationFailed;
+    }
     // Build [target] table if any field is set or kind requires it.
+    const thread_target = if (thread_defaults) |th| th.target else null;
+    const has_thread_target = if (thread_target) |t| t.provider != null or t.model != null or t.match != null else false;
     const has_any_target = opts.target_provider != null or opts.target_model != null or
-        opts.target_match != null or opts.target_workdir != null;
+        opts.target_match != null or opts.target_workdir != null or has_thread_target;
     if (has_any_target or kind == .prompt or kind == .review or kind == .compact) {
         var t: item_mod.Target = .{};
-        if (opts.target_provider) |s| t.provider = try ia.dupe(u8, s);
-        if (opts.target_model) |s| t.model = try ia.dupe(u8, s);
-        t.match = opts.target_match orelse .any;
+        if (opts.target_provider) |s| {
+            t.provider = try ia.dupe(u8, s);
+        } else if (thread_target) |tt| {
+            if (tt.provider) |s| t.provider = try ia.dupe(u8, s);
+        }
+        if (opts.target_model) |s| {
+            t.model = try ia.dupe(u8, s);
+        } else if (thread_target) |tt| {
+            if (tt.model) |s| t.model = try ia.dupe(u8, s);
+        }
+        if (opts.target_match) |m| {
+            t.match = m;
+        } else if (thread_target) |tt| {
+            if (tt.match) |m| t.match = switch (m) {
+                .exact => .exact,
+                .compatible => .compatible,
+                .any => .any,
+            };
+        }
+        if (t.match == null) t.match = .any;
         if (opts.target_workdir) |s| t.workdir = try ia.dupe(u8, s);
         item.target = t;
     }
     if (kind == .sleep) {
         item.sleep = .{ .until = try ia.dupe(u8, opts.sleep_until.?) };
+    }
+    const has_inputs = (opts.input_items != null and opts.input_items.?.len > 0) or
+        (opts.input_files != null and opts.input_files.?.len > 0) or
+        (opts.input_commits != null and opts.input_commits.?.len > 0) or
+        opts.input_mode != null;
+    if (has_inputs) {
+        var inp: item_mod.Inputs = .{ .mode = opts.input_mode orelse .append };
+        if (opts.input_items) |ids| {
+            const arr = try ia.alloc([]const u8, ids.len);
+            for (ids, 0..) |input_id, i| {
+                if (!item_mod.isValidId(input_id)) return error.ValidationFailed;
+                arr[i] = try ia.dupe(u8, input_id);
+            }
+            inp.items = arr;
+        }
+        if (opts.input_files) |paths| {
+            const arr = try ia.alloc([]const u8, paths.len);
+            for (paths, 0..) |path, i| {
+                if (!item_mod.isValidInputFilePath(path)) return error.ValidationFailed;
+                arr[i] = try ia.dupe(u8, path);
+            }
+            inp.files = arr;
+        }
+        if (opts.input_commits) |commits| {
+            const arr = try ia.alloc([]const u8, commits.len);
+            for (commits, 0..) |commit, i| arr[i] = try ia.dupe(u8, commit);
+            inp.commits = arr;
+        }
+        item.inputs = inp;
+    }
+    if (opts.thread_name) |name| {
+        if (!item_mod.isValidThreadName(name)) return error.ValidationFailed;
+        if (opts.thread_mode) |mode| switch (mode) {
+            .fresh, .@"resume" => {},
+            .@"continue", .fork => return error.ValidationFailed,
+        };
+        item.thread = .{
+            .name = try ia.dupe(u8, name),
+            .mode = opts.thread_mode orelse .fresh,
+        };
+    } else if (opts.thread_mode != null) {
+        return error.ValidationFailed;
     }
     if (kind == .clear) {
         item.clear_present = true;
@@ -843,6 +1233,7 @@ fn writeItem(
     item_mod.validate(&item, &vd) catch return error.ValidationFailed;
 
     // Serialize and write.
+    try std.fs.cwd().makePath(dir_abs);
     var meta_buf = std.ArrayList(u8){};
     defer meta_buf.deinit(allocator);
     try item_mod.write(&item, meta_buf.writer(allocator));
@@ -906,6 +1297,313 @@ fn dirExists(path: []const u8) bool {
     var d = std.fs.cwd().openDir(path, .{}) catch return false;
     d.close();
     return true;
+}
+
+fn fileExists(path: []const u8) bool {
+    var f = std.fs.cwd().openFile(path, .{}) catch return false;
+    f.close();
+    return true;
+}
+
+fn mapStepRefsToIds(
+    allocator: std.mem.Allocator,
+    steps: []const routine_mod.Step,
+    refs: []const []const u8,
+    ids: []const []const u8,
+) Error![]const []const u8 {
+    if (refs.len == 0) return &.{};
+    const out = try allocator.alloc([]const u8, refs.len);
+    for (refs, 0..) |name, i| {
+        var found: ?usize = null;
+        for (steps, 0..) |step, j| {
+            if (std.mem.eql(u8, step.name, name)) {
+                found = j;
+                break;
+            }
+        }
+        const idx = found orelse return error.ValidationFailed;
+        out[i] = ids[idx];
+    }
+    return out;
+}
+
+fn mergeStringRefs(
+    allocator: std.mem.Allocator,
+    left: []const []const u8,
+    right: ?[]const []const u8,
+) Error!?[]const []const u8 {
+    const right_items = right orelse &.{};
+    if (left.len == 0 and right_items.len == 0) return null;
+    const out = try allocator.alloc([]const u8, left.len + right_items.len);
+    for (left, 0..) |v, i| out[i] = v;
+    for (right_items, 0..) |v, i| out[left.len + i] = v;
+    return out;
+}
+
+const ExpandedInputs = struct {
+    input_items: ?[]const []const u8 = null,
+    input_files: ?[]const []const u8 = null,
+    input_commits: ?[]const []const u8 = null,
+    input_mode: ?item_mod.InputMode = null,
+};
+
+fn validateExpandedRoutineStep(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    stack: []const u8,
+    step: *const routine_mod.Step,
+    effective_thread_mode: ?item_mod.ThreadMode,
+    id: []const u8,
+    parents: []const []const u8,
+    inputs: ExpandedInputs,
+    created_at_override: ?[]const u8,
+) Error!void {
+    if (step.kind == .sleep) return error.ValidationFailed;
+
+    var item: item_mod.Item = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .id = id,
+        .slug = step.slug,
+        .kind = step.kind,
+        .status = .queued,
+        .created_at = "",
+        .updated_at = "",
+    };
+    defer item.deinit();
+    const aa = item.arena.allocator();
+
+    var ts_buf: [40]u8 = undefined;
+    const now = created_at_override orelse audit.nowRfc3339Millis(&ts_buf);
+    item.id = try aa.dupe(u8, id);
+    item.slug = try aa.dupe(u8, step.slug);
+    item.created_at = try aa.dupe(u8, now);
+    item.updated_at = try aa.dupe(u8, now);
+
+    if (parents.len > 0) {
+        const arr = try aa.alloc([]const u8, parents.len);
+        for (parents, 0..) |parent_id, i| arr[i] = try aa.dupe(u8, parent_id);
+        item.parents = arr;
+    }
+
+    var thread_defaults: ?stack_thread.Thread = null;
+    defer if (thread_defaults) |*th| th.deinit();
+    if (step.thread) |thread_name| {
+        const thread_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack, "threads", try std.fmt.allocPrint(aa, "{s}.toml", .{thread_name}) });
+        defer allocator.free(thread_abs);
+        thread_defaults = readThreadFile(allocator, thread_abs) catch return error.ValidationFailed;
+        if (thread_defaults.?.status != .active) return error.ValidationFailed;
+    }
+
+    const thread_target = if (thread_defaults) |th| th.target else null;
+    const has_thread_target = if (thread_target) |t| t.provider != null or t.model != null or t.match != null else false;
+    const has_any_target = step.target.provider != null or step.target.model != null or
+        step.target.match != null or step.target.workdir != null or has_thread_target;
+    if (has_any_target or step.kind == .prompt or step.kind == .review or step.kind == .compact) {
+        var target: item_mod.Target = .{};
+        if (step.target.provider) |s| {
+            target.provider = try aa.dupe(u8, s);
+        } else if (thread_target) |tt| {
+            if (tt.provider) |s| target.provider = try aa.dupe(u8, s);
+        }
+        if (step.target.model) |s| {
+            target.model = try aa.dupe(u8, s);
+        } else if (thread_target) |tt| {
+            if (tt.model) |s| target.model = try aa.dupe(u8, s);
+        }
+        if (step.target.match) |m| {
+            target.match = m;
+        } else if (thread_target) |tt| {
+            if (tt.match) |m| target.match = switch (m) {
+                .exact => .exact,
+                .compatible => .compatible,
+                .any => .any,
+            };
+        }
+        if (target.match == null) target.match = .any;
+        if (step.target.workdir) |s| target.workdir = try aa.dupe(u8, s);
+        item.target = target;
+    }
+
+    const has_inputs = (inputs.input_items != null and inputs.input_items.?.len > 0) or
+        (inputs.input_files != null and inputs.input_files.?.len > 0) or
+        (inputs.input_commits != null and inputs.input_commits.?.len > 0) or
+        inputs.input_mode != null;
+    if (has_inputs) {
+        var inp: item_mod.Inputs = .{ .mode = inputs.input_mode orelse .append };
+        if (inputs.input_items) |ids| {
+            const arr = try aa.alloc([]const u8, ids.len);
+            for (ids, 0..) |input_id, i| arr[i] = try aa.dupe(u8, input_id);
+            inp.items = arr;
+        }
+        if (inputs.input_files) |paths| {
+            const arr = try aa.alloc([]const u8, paths.len);
+            for (paths, 0..) |path, i| arr[i] = try aa.dupe(u8, path);
+            inp.files = arr;
+        }
+        if (inputs.input_commits) |commits| {
+            const arr = try aa.alloc([]const u8, commits.len);
+            for (commits, 0..) |commit, i| arr[i] = try aa.dupe(u8, commit);
+            inp.commits = arr;
+        }
+        item.inputs = inp;
+    }
+
+    if (step.thread) |name| {
+        item.thread = .{
+            .name = try aa.dupe(u8, name),
+            .mode = effective_thread_mode orelse .fresh,
+        };
+    }
+    if (step.kind == .clear) item.clear_present = true;
+
+    var vd: item_mod.ValidationDiagnostic = .{};
+    item_mod.validate(&item, &vd) catch return error.ValidationFailed;
+}
+
+fn threadHasSession(thread: *const stack_thread.Thread) bool {
+    const thread_state = thread.state orelse return false;
+    return thread_state.last_session_id != null;
+}
+
+fn readThreadFile(allocator: std.mem.Allocator, abs: []const u8) Error!stack_thread.Thread {
+    var f = std.fs.cwd().openFile(abs, .{}) catch |e| switch (e) {
+        error.FileNotFound => return error.NotFound,
+        else => return e,
+    };
+    defer f.close();
+    const stat = try f.stat();
+    const src = try allocator.alloc(u8, stat.size);
+    defer allocator.free(src);
+    const n = try f.readAll(src);
+    var diag: stack_thread.ParseDiagnostic = .{};
+    return stack_thread.parseSlice(allocator, src[0..n], &diag) catch return error.ValidationFailed;
+}
+
+fn writeThreadFile(allocator: std.mem.Allocator, abs: []const u8, thread: *const stack_thread.Thread) Error!void {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    try stack_thread.write(thread, out.writer(allocator));
+    var f = try std.fs.cwd().createFile(abs, .{ .truncate = true });
+    defer f.close();
+    try f.writeAll(out.items);
+}
+
+fn applyThreadPatches(thread: *stack_thread.Thread, patches: []const ThreadPatch) Error!void {
+    const arena = thread.arena.allocator();
+    for (patches) |p| {
+        if (std.mem.eql(u8, p.key, "status")) {
+            const value = p.value orelse return error.BadThreadValue;
+            thread.status = stack_thread.Status.fromString(value) orelse return error.BadThreadValue;
+        } else if (std.mem.eql(u8, p.key, "target.provider")) {
+            var target = thread.target orelse stack_thread.Target{};
+            target.provider = if (p.value) |v| try arena.dupe(u8, v) else null;
+            thread.target = target;
+        } else if (std.mem.eql(u8, p.key, "target.model")) {
+            var target = thread.target orelse stack_thread.Target{};
+            target.model = if (p.value) |v| try arena.dupe(u8, v) else null;
+            thread.target = target;
+        } else if (std.mem.eql(u8, p.key, "target.match")) {
+            var target = thread.target orelse stack_thread.Target{};
+            target.match = if (p.value) |v| stack_thread.Match.fromString(v) orelse return error.BadThreadValue else null;
+            thread.target = target;
+        } else if (std.mem.eql(u8, p.key, "state.last_item_id")) {
+            var st = thread.state orelse stack_thread.State{};
+            st.last_item_id = if (p.value) |v| try arena.dupe(u8, v) else null;
+            thread.state = st;
+        } else if (std.mem.eql(u8, p.key, "state.last_harness")) {
+            var st = thread.state orelse stack_thread.State{};
+            st.last_harness = if (p.value) |v| try arena.dupe(u8, v) else null;
+            thread.state = st;
+        } else if (std.mem.eql(u8, p.key, "state.last_session_id")) {
+            var st = thread.state orelse stack_thread.State{};
+            st.last_session_id = if (p.value) |v| try arena.dupe(u8, v) else null;
+            thread.state = st;
+        } else if (std.mem.eql(u8, p.key, "state.last_session_file")) {
+            var st = thread.state orelse stack_thread.State{};
+            st.last_session_file = if (p.value) |v| try arena.dupe(u8, v) else null;
+            thread.state = st;
+        } else if (std.mem.eql(u8, p.key, "state.last_transcript_path")) {
+            var st = thread.state orelse stack_thread.State{};
+            st.last_transcript_path = if (p.value) |v| try arena.dupe(u8, v) else null;
+            thread.state = st;
+        } else {
+            return error.BadThreadKey;
+        }
+    }
+}
+
+fn updateThreadFromItemResult(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    stack: []const u8,
+    item_dir_name: []const u8,
+    thread_name: []const u8,
+    input: RuntimeTransitionInput,
+    result: ?item_mod.Result,
+) Error![]u8 {
+    if (!stack_thread.isValidName(thread_name)) return error.ValidationFailed;
+    const rel = try threadRel(allocator, stack, thread_name);
+    errdefer allocator.free(rel);
+    const abs = try std.fs.path.join(allocator, &.{ notes_root_abs, rel });
+    defer allocator.free(abs);
+    var thread = try readThreadFile(allocator, abs);
+    defer thread.deinit();
+
+    const arena = thread.arena.allocator();
+    var st = thread.state orelse stack_thread.State{};
+    st.last_item_id = try arena.dupe(u8, input.id);
+    if (result) |r| {
+        if (r.harness) |s| st.last_harness = try arena.dupe(u8, s);
+        if (r.session_id) |s| st.last_session_id = try arena.dupe(u8, s);
+        if (r.session_file) |s| st.last_session_file = try arena.dupe(u8, s);
+        if (r.transcript_path) |s| {
+            if (std.fs.path.isAbsolute(s) and std.mem.startsWith(u8, s, notes_root_abs)) {
+                var start = notes_root_abs.len;
+                if (s.len > start and (s[start] == '/' or s[start] == '\\')) start += 1;
+                st.last_transcript_path = try arena.dupe(u8, s[start..]);
+            } else if (std.mem.eql(u8, s, "../transcript.jsonl")) {
+                st.last_transcript_path = try std.fmt.allocPrint(arena, "stacks/{s}/{s}/transcript.jsonl", .{ stack, item_dir_name });
+            } else {
+                st.last_transcript_path = try arena.dupe(u8, s);
+            }
+        }
+    }
+    thread.state = st;
+    var ts_buf: [40]u8 = undefined;
+    thread.updated_at = try arena.dupe(u8, audit.nowRfc3339Millis(&ts_buf));
+    try writeThreadFile(allocator, abs, &thread);
+    return rel;
+}
+
+fn threadMutationOutput(
+    allocator: std.mem.Allocator,
+    ident: IdentityCtx,
+    stack: []const u8,
+    name: []const u8,
+    rel: []u8,
+    action: audit.Action,
+    verb: []const u8,
+) Error!MutationOutput {
+    var paths_list = std.ArrayList([]u8){};
+    errdefer {
+        for (paths_list.items) |p| allocator.free(p);
+        paths_list.deinit(allocator);
+    }
+    try paths_list.append(allocator, rel);
+    const subject = try std.fmt.allocPrint(allocator, "thread: {s} {s}", .{ verb, name });
+    const body = try std.fmt.allocPrint(allocator, "stack: {s}\nthread: {s}\nidentity: {s}\napi: {s}\n", .{ stack, name, ident.identity, ident.api_path });
+    const target = try std.fmt.allocPrint(allocator, "stack/{s}/thread/{s}", .{ stack, name });
+    const details = try allocator.alloc(audit.DetailKV, 0);
+    return .{
+        .allocator = allocator,
+        .paths = try paths_list.toOwnedSlice(allocator),
+        .commit_subject = subject,
+        .commit_body = body,
+        .audit_action = action,
+        .audit_target = target,
+        .audit_details = details,
+        .detail_storage = try allocator.alloc(u8, 0),
+    };
 }
 
 /// Compute the next numeric item id by scanning `<stack_abs>/` for
@@ -1122,6 +1820,197 @@ fn isKeyLine(trimmed: []const u8, key: []const u8) bool {
     if (trimmed[i] != ' ' and trimmed[i] != '\t' and trimmed[i] != '=') return false;
     while (i < trimmed.len and (trimmed[i] == ' ' or trimmed[i] == '\t')) i += 1;
     return i < trimmed.len and trimmed[i] == '=';
+}
+
+test "applyRuntimeTransition: terminal transition writes output packet paths" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+    try tmp.dir.makePath("stacks/demo/0001-hello");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-hello/meta.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\id = "0001"
+            \\slug = "hello"
+            \\kind = "prompt"
+            \\status = "running"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\match = "any"
+            \\
+        );
+    }
+
+    var out = try applyRuntimeTransition(a, root, .{ .identity = "system", .api_path = "test" }, .{
+        .stack = "demo",
+        .id = "0001",
+        .to = .completed,
+        .result_harness = "fake",
+        .result_transcript_path = "../transcript.jsonl",
+        .result_completed_at = "2026-05-17T12:00:00.000Z",
+    });
+    defer out.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), out.paths.len);
+    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/meta.toml"));
+    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/output/summary.md"));
+    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/output/manifest.toml"));
+    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/output/changed_paths.txt"));
+
+    var f = try tmp.dir.openFile("stacks/demo/0001-hello/output/summary.md", .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "Item completed without a final assistant summary.") != null);
+}
+
+test "applyRuntimeTransition: terminal transition includes rendered prompt path when present" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+    try tmp.dir.makePath("stacks/demo/0001-hello");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-hello/meta.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\id = "0001"
+            \\slug = "hello"
+            \\kind = "prompt"
+            \\status = "running"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\match = "any"
+            \\
+        );
+    }
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-hello/rendered_prompt.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("rendered");
+    }
+
+    var out = try applyRuntimeTransition(a, root, .{ .identity = "system", .api_path = "test" }, .{
+        .stack = "demo",
+        .id = "0001",
+        .to = .completed,
+        .result_harness = "fake",
+        .result_completed_at = "2026-05-17T12:00:00.000Z",
+    });
+    defer out.deinit();
+    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/rendered_prompt.md"));
+}
+
+test "applyCreateThread writes thread file path" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+    try tmp.dir.makePath("stacks/demo");
+
+    var out = try applyCreateThread(a, root, .{ .identity = "local", .api_path = "test" }, .{
+        .stack = "demo",
+        .name = "admin",
+        .target_provider = "openai",
+        .target_model = "gpt-5",
+        .target_match = .compatible,
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    });
+    defer out.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), out.paths.len);
+    try std.testing.expectEqualStrings("stacks/demo/threads/admin.toml", out.paths[0]);
+    var f = try tmp.dir.openFile("stacks/demo/threads/admin.toml", .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "name = \"admin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "match = \"compatible\"") != null);
+}
+
+test "applyRuntimeTransition updates named thread on completion" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+    try tmp.dir.makePath("stacks/demo/0001-hello");
+    try tmp.dir.makePath("stacks/demo/threads");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-hello/meta.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\id = "0001"
+            \\slug = "hello"
+            \\kind = "prompt"
+            \\status = "running"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\match = "any"
+            \\
+            \\[thread]
+            \\name = "admin"
+            \\mode = "fresh"
+            \\
+        );
+    }
+    {
+        var f = try tmp.dir.createFile("stacks/demo/threads/admin.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "active"
+            \\
+        );
+    }
+
+    var out = try applyRuntimeTransition(a, root, .{ .identity = "system", .api_path = "test" }, .{
+        .stack = "demo",
+        .id = "0001",
+        .to = .completed,
+        .result_harness = "codex",
+        .result_session_id = "th-1",
+        .result_session_file = "~/.codex/sessions/1.jsonl",
+        .result_transcript_path = "../transcript.jsonl",
+        .result_completed_at = "2026-05-17T12:01:00.000Z",
+    });
+    defer out.deinit();
+    try std.testing.expect(pathListContains(out.paths, "stacks/demo/threads/admin.toml"));
+
+    var f = try tmp.dir.openFile("stacks/demo/threads/admin.toml", .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "[state]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "last_item_id = \"0001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "last_harness = \"codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "last_session_id = \"th-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "last_transcript_path = \"stacks/demo/0001-hello/transcript.jsonl\"") != null);
+}
+
+fn pathListContains(paths: []const []const u8, needle: []const u8) bool {
+    for (paths) |p| if (std.mem.eql(u8, p, needle)) return true;
+    return false;
 }
 
 fn writeTomlString(w: anytype, s: []const u8) !void {

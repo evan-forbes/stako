@@ -81,6 +81,60 @@ pub const Requires = struct {
     max_context_tokens: ?i64 = null,
 };
 
+pub const InputMode = enum {
+    append,
+    prepend,
+
+    pub fn fromString(s: []const u8) ?InputMode {
+        if (std.mem.eql(u8, s, "append")) return .append;
+        if (std.mem.eql(u8, s, "prepend")) return .prepend;
+        return null;
+    }
+
+    pub fn toString(self: InputMode) []const u8 {
+        return switch (self) {
+            .append => "append",
+            .prepend => "prepend",
+        };
+    }
+};
+
+pub const Inputs = struct {
+    items: ?[]const []const u8 = null,
+    files: ?[]const []const u8 = null,
+    commits: ?[]const []const u8 = null,
+    mode: InputMode = .append,
+};
+
+pub const ThreadMode = enum {
+    fresh,
+    @"resume",
+    @"continue",
+    fork,
+
+    pub fn fromString(s: []const u8) ?ThreadMode {
+        if (std.mem.eql(u8, s, "fresh")) return .fresh;
+        if (std.mem.eql(u8, s, "resume")) return .@"resume";
+        if (std.mem.eql(u8, s, "continue")) return .@"continue";
+        if (std.mem.eql(u8, s, "fork")) return .fork;
+        return null;
+    }
+
+    pub fn toString(self: ThreadMode) []const u8 {
+        return switch (self) {
+            .fresh => "fresh",
+            .@"resume" => "resume",
+            .@"continue" => "continue",
+            .fork => "fork",
+        };
+    }
+};
+
+pub const ThreadRef = struct {
+    name: []const u8,
+    mode: ThreadMode = .fresh,
+};
+
 pub const Sleep = struct {
     until: []const u8, // RFC3339 datetime literal
 };
@@ -121,6 +175,8 @@ pub const Item = struct {
     // Optional tables. `clear_present` is true iff `[clear]` appeared.
     target: ?Target = null,
     requires: ?Requires = null,
+    inputs: ?Inputs = null,
+    thread: ?ThreadRef = null,
     sleep: ?Sleep = null,
     clear_present: bool = false,
     sleep_has_body: bool = false,
@@ -144,6 +200,8 @@ pub const ParseError = error{
     UnknownKind,
     UnknownStatus,
     UnknownMatch,
+    UnknownInputMode,
+    UnknownThreadMode,
     InvalidSleep,
     BadType,
     OutOfMemory,
@@ -205,6 +263,16 @@ pub fn parseSlice(
     var req_caps: ?[]const []const u8 = null;
     var req_mct: ?i64 = null;
     const have_requires = doc.hasTable("requires");
+
+    var input_items: ?[]const []const u8 = null;
+    var input_files: ?[]const []const u8 = null;
+    var input_commits: ?[]const []const u8 = null;
+    var input_mode: InputMode = .append;
+    const have_inputs = doc.hasTable("inputs");
+
+    var thread_name: ?[]const u8 = null;
+    var thread_mode: ThreadMode = .fresh;
+    const have_thread = doc.hasTable("thread");
 
     var sleep_until: ?[]const u8 = null;
     var sleep_has_extra_body = false;
@@ -283,6 +351,33 @@ pub fn parseSlice(
             } else if (std.mem.eql(u8, e.key, "max_context_tokens")) {
                 req_mct = try requireInt(e.value, "requires.max_context_tokens", diag);
             }
+        } else if (std.mem.eql(u8, e.table, "inputs")) {
+            if (std.mem.eql(u8, e.key, "items")) {
+                const arr = try requireStringArray(e.value, "inputs.items", diag);
+                input_items = try dupeStringArray(arena, arr);
+            } else if (std.mem.eql(u8, e.key, "files")) {
+                const arr = try requireStringArray(e.value, "inputs.files", diag);
+                input_files = try dupeStringArray(arena, arr);
+            } else if (std.mem.eql(u8, e.key, "commits")) {
+                const arr = try requireStringArray(e.value, "inputs.commits", diag);
+                input_commits = try dupeStringArray(arena, arr);
+            } else if (std.mem.eql(u8, e.key, "mode")) {
+                const s = try requireString(e.value, "inputs.mode", diag);
+                input_mode = InputMode.fromString(s) orelse {
+                    diag.* = .{ .err = ParseError.UnknownInputMode, .message = "unknown inputs.mode value", .field = "inputs.mode" };
+                    return error.UnknownInputMode;
+                };
+            }
+        } else if (std.mem.eql(u8, e.table, "thread")) {
+            if (std.mem.eql(u8, e.key, "name")) {
+                thread_name = try arena.dupe(u8, try requireString(e.value, "thread.name", diag));
+            } else if (std.mem.eql(u8, e.key, "mode")) {
+                const s = try requireString(e.value, "thread.mode", diag);
+                thread_mode = ThreadMode.fromString(s) orelse {
+                    diag.* = .{ .err = ParseError.UnknownThreadMode, .message = "unknown thread.mode value", .field = "thread.mode" };
+                    return error.UnknownThreadMode;
+                };
+            }
         } else if (std.mem.eql(u8, e.table, "sleep")) {
             if (std.mem.eql(u8, e.key, "until")) {
                 sleep_until = try arena.dupe(u8, try requireDatetime(e.value, "sleep.until", diag));
@@ -328,6 +423,21 @@ pub fn parseSlice(
             .tools = req_tools,
             .capabilities = req_caps,
             .max_context_tokens = req_mct,
+        };
+    }
+    if (have_inputs) {
+        item.inputs = Inputs{
+            .items = input_items,
+            .files = input_files,
+            .commits = input_commits,
+            .mode = input_mode,
+        };
+    }
+    if (have_thread) {
+        if (thread_name == null) return missing(diag, "thread.name");
+        item.thread = .{
+            .name = thread_name.?,
+            .mode = thread_mode,
         };
     }
     if (have_sleep_table) {
@@ -445,6 +555,18 @@ pub fn write(item: *const Item, w: anytype) !void {
         if (r.capabilities) |v| try writeKVArray(w, "capabilities", v);
         if (r.max_context_tokens) |n| try writeKV(w, "max_context_tokens", .{ .integer = n });
     }
+    if (item.inputs) |inp| {
+        try w.writeAll("\n[inputs]\n");
+        if (inp.items) |v| try writeKVArray(w, "items", v);
+        if (inp.files) |v| try writeKVArray(w, "files", v);
+        if (inp.commits) |v| try writeKVArray(w, "commits", v);
+        try writeKV(w, "mode", .{ .string = inp.mode.toString() });
+    }
+    if (item.thread) |t| {
+        try w.writeAll("\n[thread]\n");
+        try writeKV(w, "name", .{ .string = t.name });
+        try writeKV(w, "mode", .{ .string = t.mode.toString() });
+    }
     if (item.sleep) |s| {
         try w.writeAll("\n[sleep]\n");
         try writeKV(w, "until", .{ .datetime = s.until });
@@ -501,6 +623,9 @@ pub const ValidationError = error{
     SleepHasBody,
     ClearHasBody,
     InvalidStateTransition,
+    InvalidInputItem,
+    InvalidInputFile,
+    InvalidThreadName,
 };
 
 pub const ValidationDiagnostic = struct {
@@ -543,6 +668,30 @@ pub fn validate(item: *const Item, diag: *ValidationDiagnostic) ValidationError!
                 diag.* = .{ .err = error.InvalidParentId, .message = "parent id must be 4+ ascii digits", .field = "parents" };
                 return error.InvalidParentId;
             }
+        }
+    }
+    if (item.inputs) |inp| {
+        if (inp.items) |ids| {
+            for (ids) |id| {
+                if (!isValidId(id)) {
+                    diag.* = .{ .err = error.InvalidInputItem, .message = "input item id must be 4+ ascii digits", .field = "inputs.items" };
+                    return error.InvalidInputItem;
+                }
+            }
+        }
+        if (inp.files) |paths| {
+            for (paths) |path| {
+                if (!isValidInputFilePath(path)) {
+                    diag.* = .{ .err = error.InvalidInputFile, .message = "input file path must be a normalized relative path or absolute path", .field = "inputs.files" };
+                    return error.InvalidInputFile;
+                }
+            }
+        }
+    }
+    if (item.thread) |t| {
+        if (!isValidThreadName(t.name)) {
+            diag.* = .{ .err = error.InvalidThreadName, .message = "thread name must be lowercase [a-z0-9_-] without leading/trailing or repeated separators", .field = "thread.name" };
+            return error.InvalidThreadName;
         }
     }
 
@@ -617,6 +766,32 @@ pub fn isValidSlug(slug: []const u8) bool {
         if (!ok) return false;
         if (c == '-' and prev_dash) return false;
         prev_dash = (c == '-');
+    }
+    return true;
+}
+
+pub fn isValidInputFilePath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |part| {
+        if (part.len == 0) continue;
+        if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+    }
+    return true;
+}
+
+pub fn isValidThreadName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (name[0] == '.' or name[0] == '-' or name[0] == '_') return false;
+    if (name[name.len - 1] == '-' or name[name.len - 1] == '_') return false;
+    var prev_sep = false;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+        if (!ok) return false;
+        const sep = c == '-' or c == '_';
+        if (sep and prev_sep) return false;
+        prev_sep = sep;
     }
     return true;
 }
@@ -728,4 +903,89 @@ test "isRfc3339" {
     try std.testing.expect(!isRfc3339("2026-05-10T14:60:00Z"));
     try std.testing.expect(!isRfc3339("2026-05-10T14:32:00+24:00"));
     try std.testing.expect(!isRfc3339("2026-05-10T14:32:00+02:60"));
+}
+
+test "parse/write preserves optional inputs table" {
+    const a = std.testing.allocator;
+    var diag: ParseDiagnostic = .{};
+    var it = try parseSlice(a,
+        \\id = "0002"
+        \\slug = "next"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+        \\[inputs]
+        \\items = ["0001"]
+        \\files = ["stacks/demo/context.md"]
+        \\commits = ["abc1234"]
+        \\mode = "prepend"
+        \\
+    , &diag);
+    defer it.deinit();
+    try std.testing.expect(it.inputs != null);
+    try std.testing.expectEqual(InputMode.prepend, it.inputs.?.mode);
+    try std.testing.expectEqualStrings("0001", it.inputs.?.items.?[0]);
+    try std.testing.expectEqualStrings("stacks/demo/context.md", it.inputs.?.files.?[0]);
+    try std.testing.expectEqualStrings("abc1234", it.inputs.?.commits.?[0]);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try write(&it, out.writer(a));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "[inputs]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "mode = \"prepend\"") != null);
+}
+
+test "parse/write preserves optional thread table" {
+    const a = std.testing.allocator;
+    const src =
+        \\id = "0002"
+        \\slug = "next"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+        \\[thread]
+        \\name = "admin"
+        \\mode = "resume"
+        \\
+    ;
+    var diag: ParseDiagnostic = .{};
+    var it = try parseSlice(a, src, &diag);
+    defer it.deinit();
+    try std.testing.expect(it.thread != null);
+    try std.testing.expectEqualStrings("admin", it.thread.?.name);
+    try std.testing.expectEqual(ThreadMode.@"resume", it.thread.?.mode);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try write(&it, out.writer(a));
+    try std.testing.expectEqualStrings(src, out.items);
+}
+
+test "omitted thread table remains absent" {
+    const a = std.testing.allocator;
+    var diag: ParseDiagnostic = .{};
+    var it = try parseSlice(a,
+        \\id = "0002"
+        \\slug = "next"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    , &diag);
+    defer it.deinit();
+    try std.testing.expect(it.thread == null);
 }

@@ -52,6 +52,7 @@ const config_mod = @import("config.zig");
 /// vocabulary so denials and allowances share one set of slugs.
 pub const Action = enum {
     create_stack,
+    read_stack,
     append_item,
     insert_item,
     retry_item,
@@ -66,6 +67,7 @@ pub const Action = enum {
     pub fn slug(self: Action) []const u8 {
         return switch (self) {
             .create_stack => "create_stack",
+            .read_stack => "read_stack",
             .append_item => "append_item",
             .insert_item => "insert_item",
             .retry_item => "retry_item",
@@ -84,6 +86,7 @@ pub const Action = enum {
     fn stackVerb(self: Action) ?[]const u8 {
         return switch (self) {
             .append_item => "append",
+            .read_stack => "read",
             .insert_item => "insert",
             .retry_item => "retry",
             .cancel_item => "cancel",

@@ -23,6 +23,7 @@ const std = @import("std");
 const init_mod = @import("init.zig");
 const daemon_mod = @import("daemon.zig");
 const cli_stack = @import("cli_stack.zig");
+const cli_routine = @import("cli_routine.zig");
 const harness_dispatch = @import("harness_dispatch.zig");
 
 pub const UsageError = error{
@@ -75,6 +76,7 @@ pub const Subcommand = enum {
     init,
     daemon,
     stack,
+    routine,
     auth,
 
     /// Accepts the canonical name and the short alias documented in
@@ -86,6 +88,8 @@ pub const Subcommand = enum {
             .{ .name = "d", .value = .daemon },
             .{ .name = "stack", .value = .stack },
             .{ .name = "s", .value = .stack },
+            .{ .name = "routine", .value = .routine },
+            .{ .name = "rtn", .value = .routine },
             .{ .name = "auth", .value = .auth },
             .{ .name = "a", .value = .auth },
         };
@@ -208,6 +212,12 @@ pub const StackAction = enum {
     supersede,
     pause,
     @"resume",
+    output,
+    threads,
+    thread_show,
+    thread_create,
+    thread_archive,
+    run_routine,
 
     pub fn fromString(s: []const u8) ?StackAction {
         const aliases = [_]Alias(StackAction){
@@ -231,6 +241,10 @@ pub const StackAction = enum {
             .{ .name = "p", .value = .pause },
             .{ .name = "resume", .value = .@"resume" },
             .{ .name = "r", .value = .@"resume" },
+            .{ .name = "output", .value = .output },
+            .{ .name = "out", .value = .output },
+            .{ .name = "threads", .value = .threads },
+            .{ .name = "run-routine", .value = .run_routine },
         };
         return matchAlias(StackAction, s, &aliases);
     }
@@ -289,6 +303,11 @@ pub const StackArgs = struct {
     item_id: []const u8 = "",
     /// `supersede`: replacement item id.
     replacement: []const u8 = "",
+    thread_name: []const u8 = "",
+    thread_mode: []const u8 = "",
+    routine_name: []const u8 = "",
+    input_items: [16][]const u8 = std.mem.zeroes([16][]const u8),
+    input_item_count: u8 = 0,
     /// `config`: one or more --set entries (key=value). Up to 8 in v1.
     set_pairs: [8][]const u8 = std.mem.zeroes([8][]const u8),
     set_count: u8 = 0,
@@ -298,10 +317,18 @@ pub const StackArgs = struct {
 /// after the positional `<name>` argument; positionals are taken in order.
 pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
     if (args.len == 0) return error.NoSubcommand;
-    const action = StackAction.fromString(args[0]) orelse return error.UnknownSubcommand;
+    var action: StackAction = undefined;
+    var nested_offset: usize = 1;
+    if (std.mem.eql(u8, args[0], "thread")) {
+        if (args.len < 2) return error.NoSubcommand;
+        if (std.mem.eql(u8, args[1], "show")) action = .thread_show else if (std.mem.eql(u8, args[1], "create")) action = .thread_create else if (std.mem.eql(u8, args[1], "archive")) action = .thread_archive else return error.UnknownSubcommand;
+        nested_offset = 2;
+    } else {
+        action = StackAction.fromString(args[0]) orelse return error.UnknownSubcommand;
+    }
     var out: StackArgs = .{ .action = action };
     var positional_seen: usize = 0;
-    var i: usize = 1;
+    var i: usize = nested_offset;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         // Global flags shared by every action.
@@ -321,6 +348,30 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
                 out.slug = v;
                 continue;
             }
+            if (try flagValue(args, &i, "--thread", null, "--thread=")) |v| {
+                out.thread_name = v;
+                continue;
+            }
+            if (try flagValue(args, &i, "--thread-mode", null, "--thread-mode=")) |v| {
+                out.thread_mode = v;
+                continue;
+            }
+            if (try flagValue(args, &i, "--input-item", null, "--input-item=")) |v| {
+                if (out.input_item_count >= out.input_items.len) return error.BadFlagValue;
+                out.input_items[out.input_item_count] = v;
+                out.input_item_count += 1;
+                continue;
+            }
+        }
+        if (out.action == .thread_create) {
+            if (try flagValue(args, &i, "--provider", null, "--provider=")) |v| {
+                out.target = v;
+                continue;
+            }
+            if (try flagValue(args, &i, "--model", null, "--model=")) |v| {
+                out.replacement = v;
+                continue;
+            }
         }
         if (out.action == .config) {
             if (try flagValue(args, &i, "--set", "-s", "--set=")) |v| {
@@ -336,9 +387,30 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
         // Positionals (per-action layout).
         switch (out.action) {
             .list => return error.BadFlagValue,
-            .show, .config, .new, .pause, .@"resume" => {
+            .show, .config, .new, .pause, .@"resume", .threads => {
                 if (positional_seen != 0) return error.BadFlagValue;
                 out.name = a;
+            },
+            .output => {
+                switch (positional_seen) {
+                    0 => out.name = a,
+                    1 => out.item_id = a,
+                    else => return error.BadFlagValue,
+                }
+            },
+            .thread_show, .thread_create, .thread_archive => {
+                switch (positional_seen) {
+                    0 => out.name = a,
+                    1 => out.thread_name = a,
+                    else => return error.BadFlagValue,
+                }
+            },
+            .run_routine => {
+                switch (positional_seen) {
+                    0 => out.name = a,
+                    1 => out.routine_name = a,
+                    else => return error.BadFlagValue,
+                }
             },
             .add => {
                 // positionals: <name> <kind>
@@ -381,7 +453,10 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
     // Validate per-action that we got the required positionals.
     switch (out.action) {
         .list => {},
-        .show, .config, .new, .pause, .@"resume" => if (out.name.len == 0) return error.NoSubcommand,
+        .show, .config, .new, .pause, .@"resume", .threads => if (out.name.len == 0) return error.NoSubcommand,
+        .output => if (out.name.len == 0 or out.item_id.len == 0) return error.NoSubcommand,
+        .thread_show, .thread_create, .thread_archive => if (out.name.len == 0 or out.thread_name.len == 0) return error.NoSubcommand,
+        .run_routine => if (out.name.len == 0 or out.routine_name.len == 0) return error.NoSubcommand,
         .add => if (out.name.len == 0 or out.kind.len == 0) return error.NoSubcommand,
         .insert => if (out.name.len == 0 or out.ref.len == 0 or out.kind.len == 0) return error.NoSubcommand,
         .retry, .cancel => if (out.name.len == 0 or out.item_id.len == 0) return error.NoSubcommand,
@@ -417,6 +492,53 @@ pub const AuthAction = enum {
         return matchAlias(AuthAction, s, &aliases);
     }
 };
+
+pub const RoutineAction = enum {
+    list,
+    show,
+
+    pub fn fromString(s: []const u8) ?RoutineAction {
+        const aliases = [_]Alias(RoutineAction){
+            .{ .name = "list", .value = .list },
+            .{ .name = "ls", .value = .list },
+            .{ .name = "show", .value = .show },
+            .{ .name = "sh", .value = .show },
+        };
+        return matchAlias(RoutineAction, s, &aliases);
+    }
+};
+
+pub const RoutineArgs = struct {
+    action: RoutineAction,
+    name: []const u8 = "",
+    flags: ApiFlags = .{},
+};
+
+pub fn parseRoutineArgs(args: []const []const u8) UsageError!RoutineArgs {
+    if (args.len == 0) return error.NoSubcommand;
+    const action = RoutineAction.fromString(args[0]) orelse return error.UnknownSubcommand;
+    var out: RoutineArgs = .{ .action = action };
+    var i: usize = 1;
+    var positional_seen: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (try parseApiFlag(args, &i, &out.flags)) continue;
+        if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
+        switch (out.action) {
+            .list => return error.BadFlagValue,
+            .show => {
+                if (positional_seen != 0) return error.BadFlagValue;
+                out.name = a;
+            },
+        }
+        positional_seen += 1;
+    }
+    switch (out.action) {
+        .list => {},
+        .show => if (out.name.len == 0) return error.NoSubcommand,
+    }
+    return out;
+}
 
 pub const AuthArgs = struct {
     action: AuthAction,
@@ -493,8 +615,23 @@ pub fn dispatch(
         .init => return try runInit(allocator, rest, stdout, stderr),
         .daemon => return try runDaemon(allocator, rest, stdout, stderr),
         .stack => return try runStack(allocator, rest, stdout, stderr),
+        .routine => return try runRoutine(allocator, rest, stdout, stderr),
         .auth => return try runAuth(allocator, rest, stdout, stderr),
     }
+}
+
+fn runRoutine(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const parsed = parseRoutineArgs(args) catch |e| {
+        try stderr.print("stako routine: {s}\n", .{@errorName(e)});
+        try printRoutineUsage(stderr);
+        return 2;
+    };
+    return cli_routine.run(allocator, parsed, stdout, stderr);
 }
 
 fn runAuth(
@@ -666,6 +803,7 @@ fn printUsage(w: anytype) !void {
         \\  init                        Bootstrap a notes-root layout
         \\  daemon, d  start|stop|st    Start/stop/inspect the local daemon
         \\  stack,  s  list|show|cfg    Read stacks via the daemon
+        \\  routine    list|show        Read routines via the daemon
         \\  auth,   a  status|<prov>    Report provider availability + auth state
         \\
         \\Run `stako <subcommand>` with no further args for per-subcommand help.
@@ -729,6 +867,23 @@ fn printStackUsage(w: anytype) !void {
         \\  list,   ls            List known stacks.
         \\  show,   sh   <name>   Show a stack's config + items.
         \\  config, cfg  <name>   Show a stack's config.
+        \\
+        \\Flags (common to every API subcommand):
+        \\  --json,    -j         Pass the daemon JSON through unchanged.
+        \\  --root,    -r <path>  Notes root for local config/token discovery.
+        \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
+        \\  --verbose, -v         Show request URL on errors.
+        \\
+    );
+}
+
+fn printRoutineUsage(w: anytype) !void {
+    try w.writeAll(
+        \\Usage: stako routine|rtn <list|show> [<name>] [flags...]
+        \\
+        \\Actions:
+        \\  list, ls            List routines.
+        \\  show, sh <name>     Show a routine.
         \\
         \\Flags (common to every API subcommand):
         \\  --json,    -j         Pass the daemon JSON through unchanged.
@@ -918,6 +1073,48 @@ test "parseStackArgs: cfg short alias for config with --root" {
     try std.testing.expectEqual(StackAction.config, a.action);
     try std.testing.expectEqualStrings("demo", a.name);
     try std.testing.expectEqualStrings("/tmp/n", a.flags.root);
+}
+
+test "parseStackArgs: output threads and routine commands" {
+    const out = try parseStackArgs(&.{ "output", "demo", "0001" });
+    try std.testing.expectEqual(StackAction.output, out.action);
+    try std.testing.expectEqualStrings("demo", out.name);
+    try std.testing.expectEqualStrings("0001", out.item_id);
+
+    const threads = try parseStackArgs(&.{ "threads", "demo" });
+    try std.testing.expectEqual(StackAction.threads, threads.action);
+    try std.testing.expectEqualStrings("demo", threads.name);
+
+    const show = try parseStackArgs(&.{ "thread", "show", "demo", "admin" });
+    try std.testing.expectEqual(StackAction.thread_show, show.action);
+    try std.testing.expectEqualStrings("admin", show.thread_name);
+
+    const create = try parseStackArgs(&.{ "thread", "create", "demo", "admin", "--provider", "openai", "--model", "gpt" });
+    try std.testing.expectEqual(StackAction.thread_create, create.action);
+    try std.testing.expectEqualStrings("openai", create.target);
+    try std.testing.expectEqualStrings("gpt", create.replacement);
+
+    const routine = try parseStackArgs(&.{ "run-routine", "demo", "review" });
+    try std.testing.expectEqual(StackAction.run_routine, routine.action);
+    try std.testing.expectEqualStrings("review", routine.routine_name);
+}
+
+test "parseStackArgs: add threaded input item" {
+    const a = try parseStackArgs(&.{ "add", "demo", "prompt", "--thread", "admin", "--thread-mode", "resume", "--input-item", "0001" });
+    try std.testing.expectEqual(StackAction.add, a.action);
+    try std.testing.expectEqualStrings("admin", a.thread_name);
+    try std.testing.expectEqualStrings("resume", a.thread_mode);
+    try std.testing.expectEqual(@as(u8, 1), a.input_item_count);
+    try std.testing.expectEqualStrings("0001", a.input_items[0]);
+}
+
+test "parseRoutineArgs: list and show" {
+    const list = try parseRoutineArgs(&.{"list"});
+    try std.testing.expectEqual(RoutineAction.list, list.action);
+    const show = try parseRoutineArgs(&.{ "show", "review", "--json" });
+    try std.testing.expectEqual(RoutineAction.show, show.action);
+    try std.testing.expectEqualStrings("review", show.name);
+    try std.testing.expect(show.flags.json);
 }
 
 test "parseStackArgs: rejects unknown flag" {

@@ -102,6 +102,33 @@ fn seedItem(
     try f.writeAll(body);
 }
 
+fn seedThread(a: std.mem.Allocator, root: []const u8, stack: []const u8, name: []const u8, body: []const u8) !void {
+    const dir = try std.fs.path.join(a, &.{ root, "stacks", stack, "threads" });
+    defer a.free(dir);
+    try std.fs.cwd().makePath(dir);
+    const file_name = try std.fmt.allocPrint(a, "{s}.toml", .{name});
+    defer a.free(file_name);
+    const path = try std.fs.path.join(a, &.{ dir, file_name });
+    defer a.free(path);
+    var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer f.close();
+    try f.writeAll(body);
+}
+
+fn readFileAlloc(a: std.mem.Allocator, path: []const u8) ![]u8 {
+    var f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    errdefer a.free(buf);
+    _ = try f.readAll(buf);
+    return buf;
+}
+
+fn metaPath(a: std.mem.Allocator, root: []const u8, stack: []const u8, dir_name: []const u8) ![]u8 {
+    return std.fs.path.join(a, &.{ root, "stacks", stack, dir_name, "meta.toml" });
+}
+
 // ---------- adapter / dispatch factory wiring ----------
 
 const CatScript = struct {
@@ -126,16 +153,76 @@ fn buildCatArgvDispatch(
     harness: []const u8,
     item: *const stako.item.Item,
     item_dir_abs: []const u8,
+    ctx: runtime_mod.ExecutionContext,
 ) anyerror![][]u8 {
     _ = harness;
     _ = item;
     _ = item_dir_abs;
+    _ = ctx;
     const cs = GLOBAL_CAT_SCRIPT orelse return error.NoCatScript;
     return fake.buildCatArgv(allocator, cs.script_abs, cs.fixture_abs);
 }
 
 fn fakeDispatchCat() runtime_mod.Dispatch {
     return .{ .factory = factoryFake, .build_argv = buildCatArgvDispatch };
+}
+
+fn factoryUnavailable(allocator: std.mem.Allocator, harness: []const u8) anyerror!?adapter_mod.Adapter {
+    _ = allocator;
+    _ = harness;
+    return null;
+}
+
+fn fakeDispatchUnavailable() runtime_mod.Dispatch {
+    return .{ .factory = factoryUnavailable, .build_argv = buildCatArgvDispatch };
+}
+
+const NoResumeState = struct {};
+
+fn noResumeParseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) anyerror![]adapter_mod.OwnedEvent {
+    _ = impl;
+    _ = raw;
+    return allocator.alloc(adapter_mod.OwnedEvent, 0);
+}
+
+fn noResumeOnExit(impl: *anyopaque, allocator: std.mem.Allocator, exit_code: i32, ran_to_completion: bool) anyerror!adapter_mod.OwnedEvent {
+    _ = impl;
+    _ = exit_code;
+    _ = ran_to_completion;
+    const storage = try allocator.dupe(u8, "{\"exit_code\":0}");
+    return .{
+        .ev = .{ .stack = "", .item = "", .kind = .session_ended, .data_json = storage },
+        .storage = storage,
+    };
+}
+
+fn noResumeSupports(impl: *anyopaque, cap: adapter_mod.Capability) bool {
+    _ = impl;
+    return cap != .@"resume";
+}
+
+fn noResumeDeinit(impl: *anyopaque, allocator: std.mem.Allocator) void {
+    const st: *NoResumeState = @ptrCast(@alignCast(impl));
+    allocator.destroy(st);
+}
+
+const no_resume_vtable: adapter_mod.Adapter.VTable = .{
+    .parse_line = noResumeParseLine,
+    .parse_stderr_line = noResumeParseLine,
+    .on_exit = noResumeOnExit,
+    .supports = noResumeSupports,
+    .deinit = noResumeDeinit,
+};
+
+fn factoryNoResume(allocator: std.mem.Allocator, harness: []const u8) anyerror!?adapter_mod.Adapter {
+    _ = harness;
+    const st = try allocator.create(NoResumeState);
+    st.* = .{};
+    return .{ .name = "fake", .impl = st, .vtable = &no_resume_vtable };
+}
+
+fn fakeDispatchNoResume() runtime_mod.Dispatch {
+    return .{ .factory = factoryNoResume, .build_argv = buildCatArgvDispatch };
 }
 
 const StubbornScript = struct {
@@ -153,10 +240,12 @@ fn buildStubbornArgvDispatch(
     harness: []const u8,
     item: *const stako.item.Item,
     item_dir_abs: []const u8,
+    ctx: runtime_mod.ExecutionContext,
 ) anyerror![][]u8 {
     _ = harness;
     _ = item;
     _ = item_dir_abs;
+    _ = ctx;
     const sc = GLOBAL_STUBBORN orelse return error.NoStubbornScript;
     return fake.buildScriptArgv(allocator, sc.script_abs);
 }
@@ -294,6 +383,38 @@ test "runtime: end-to-end fake run produces transcript and completes item" {
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"kind\":\"message\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"kind\":\"session_ended\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"terminal_status\":\"completed\"") != null);
+
+    const summary_path = try std.fs.path.join(a, &.{ item_dir, "output/summary.md" });
+    defer a.free(summary_path);
+    {
+        var f = try std.fs.cwd().openFile(summary_path, .{});
+        defer f.close();
+        const stat = try f.stat();
+        const buf = try a.alloc(u8, stat.size);
+        defer a.free(buf);
+        _ = try f.readAll(buf);
+        try std.testing.expect(std.mem.indexOf(u8, buf, "Hello, world!") != null);
+    }
+    const manifest_path = try std.fs.path.join(a, &.{ item_dir, "output/manifest.toml" });
+    defer a.free(manifest_path);
+    {
+        var f = try std.fs.cwd().openFile(manifest_path, .{});
+        defer f.close();
+        const stat = try f.stat();
+        const buf = try a.alloc(u8, stat.size);
+        defer a.free(buf);
+        _ = try f.readAll(buf);
+        try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"completed\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, buf, "transcript_path = \"../transcript.jsonl\"") != null);
+    }
+    const changed_path = try std.fs.path.join(a, &.{ item_dir, "output/changed_paths.txt" });
+    defer a.free(changed_path);
+    {
+        var f = try std.fs.cwd().openFile(changed_path, .{});
+        defer f.close();
+        const stat = try f.stat();
+        try std.testing.expect(stat.size > 0);
+    }
 
     // Runtime file was deleted.
     const rp = try runtime_file.read(a, s.abs_path, "demo", "0001");
@@ -626,6 +747,598 @@ test "runtime: routing preflight blocks on harness_denied when allowed_harnesses
     _ = try f.readAll(buf);
     try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "blocked_reason = \"harness_denied\"") != null);
+}
+
+test "runtime: threaded preflight blocks missing archived no-session and unsupported resume" {
+    const a = std.testing.allocator;
+
+    const Case = struct {
+        hint: []const u8,
+        mode: []const u8,
+        thread_body: ?[]const u8,
+        dispatch: runtime_mod.Dispatch,
+        reason: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .hint = "thread-missing",
+            .mode = "resume",
+            .thread_body = null,
+            .dispatch = runtime_mod.fakeDispatch(),
+            .reason = "thread_not_found",
+        },
+        .{
+            .hint = "thread-archived",
+            .mode = "resume",
+            .thread_body =
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "archived"
+            \\
+            ,
+            .dispatch = runtime_mod.fakeDispatch(),
+            .reason = "thread_archived",
+        },
+        .{
+            .hint = "thread-no-session",
+            .mode = "resume",
+            .thread_body =
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "active"
+            \\
+            ,
+            .dispatch = runtime_mod.fakeDispatch(),
+            .reason = "thread_no_session",
+        },
+        .{
+            .hint = "thread-continue",
+            .mode = "continue",
+            .thread_body =
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "active"
+            \\
+            ,
+            .dispatch = runtime_mod.fakeDispatch(),
+            .reason = "thread_mode_unsupported",
+        },
+        .{
+            .hint = "thread-fork",
+            .mode = "fork",
+            .thread_body =
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "active"
+            \\
+            ,
+            .dispatch = runtime_mod.fakeDispatch(),
+            .reason = "thread_mode_unsupported",
+        },
+        .{
+            .hint = "thread-no-resume-cap",
+            .mode = "resume",
+            .thread_body =
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "active"
+            \\
+            \\[state]
+            \\last_harness = "fake"
+            \\last_session_id = "sess-old"
+            \\
+            ,
+            .dispatch = fakeDispatchNoResume(),
+            .reason = "thread_mode_unsupported",
+        },
+        .{
+            .hint = "thread-harness-mismatch",
+            .mode = "resume",
+            .thread_body =
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "active"
+            \\
+            \\[state]
+            \\last_harness = "codex"
+            \\last_session_id = "sess-old"
+            \\
+            ,
+            .dispatch = runtime_mod.fakeDispatch(),
+            .reason = "thread_mode_unsupported",
+        },
+    };
+
+    for (cases) |case| {
+        var s = try Scratch.create(a, case.hint);
+        defer s.deinit();
+        try initNotesRoot(a, s.abs_path);
+        try seedStack(a, s.abs_path, "demo", false);
+        if (case.thread_body) |body| try seedThread(a, s.abs_path, "demo", "admin", body);
+        const item_body = try std.fmt.allocPrint(a,
+            \\id = "0001"
+            \\slug = "hi"
+            \\kind = "prompt"
+            \\status = "queued"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\match = "any"
+            \\
+            \\[thread]
+            \\name = "admin"
+            \\mode = "{s}"
+            \\
+        , .{case.mode});
+        defer a.free(item_body);
+        try seedItem(a, s.abs_path, "demo", "0001", "hi", item_body);
+
+        var aw = try audit_mod.Writer.init(a, s.abs_path);
+        defer aw.deinit();
+        var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+        defer reg.deinit();
+        var sup = runtime_mod.Supervisor.init(a, .{
+            .notes_root_abs = s.abs_path,
+            .stack_registry = &reg,
+            .audit_writer = &aw,
+            .dispatch = case.dispatch,
+        });
+        defer sup.deinit();
+        try sup.tickStack("demo");
+        sup.sm.waitAll();
+
+        const path = try metaPath(a, s.abs_path, "demo", "0001-hi");
+        defer a.free(path);
+        const meta = try readFileAlloc(a, path);
+        defer a.free(meta);
+        try std.testing.expect(std.mem.indexOf(u8, meta, "status = \"blocked\"") != null);
+        const expected = try std.fmt.allocPrint(a, "blocked_reason = \"{s}\"", .{case.reason});
+        defer a.free(expected);
+        try std.testing.expect(std.mem.indexOf(u8, meta, expected) != null);
+    }
+}
+
+test "runtime: target provider merge order is item then thread then stack default" {
+    const a = std.testing.allocator;
+
+    const Case = struct {
+        hint: []const u8,
+        item_provider: ?[]const u8,
+        expected_harness: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .hint = "target-thread-wins-stack", .item_provider = null, .expected_harness = "codex" },
+        .{ .hint = "target-item-wins-thread", .item_provider = "anthropic", .expected_harness = "claude" },
+    };
+
+    for (cases) |case| {
+        var s = try Scratch.create(a, case.hint);
+        defer s.deinit();
+        try initNotesRoot(a, s.abs_path);
+
+        const dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "demo" });
+        defer a.free(dir);
+        try std.fs.cwd().makePath(dir);
+        {
+            const cfg = try std.fs.path.join(a, &.{ dir, "stack.toml" });
+            defer a.free(cfg);
+            var f = try std.fs.cwd().createFile(cfg, .{ .truncate = true });
+            defer f.close();
+            try f.writeAll(
+                \\description = "runtime test stack"
+                \\created_at = 2026-05-10T14:00:00Z
+                \\paused = false
+                \\continuity = "fresh"
+                \\max_concurrent_per_stack = 1
+                \\allowed_harnesses = ["claude", "codex"]
+                \\
+            );
+        }
+        try seedThread(a, s.abs_path, "demo", "admin",
+            \\version = 1
+            \\name = "admin"
+            \\created_at = 2026-05-17T12:00:00.000Z
+            \\updated_at = 2026-05-17T12:00:00.000Z
+            \\status = "active"
+            \\
+            \\[target]
+            \\provider = "openai"
+            \\
+        );
+
+        const target_provider_line = if (case.item_provider) |provider|
+            try std.fmt.allocPrint(a, "provider = \"{s}\"\n", .{provider})
+        else
+            try a.dupe(u8, "");
+        defer a.free(target_provider_line);
+        const item_body = try std.fmt.allocPrint(a,
+            \\id = "0001"
+            \\slug = "hi"
+            \\kind = "prompt"
+            \\status = "queued"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\{s}match = "any"
+            \\
+            \\[thread]
+            \\name = "admin"
+            \\mode = "fresh"
+            \\
+        , .{target_provider_line});
+        defer a.free(item_body);
+        try seedItem(a, s.abs_path, "demo", "0001", "hi", item_body);
+
+        var aw = try audit_mod.Writer.init(a, s.abs_path);
+        defer aw.deinit();
+        var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+        defer reg.deinit();
+        var sup = runtime_mod.Supervisor.init(a, .{
+            .notes_root_abs = s.abs_path,
+            .stack_registry = &reg,
+            .audit_writer = &aw,
+            .dispatch = runtime_mod.fakeDispatch(),
+        });
+        defer sup.deinit();
+        try sup.tickStack("demo");
+        sup.sm.waitAll();
+
+        const path = try metaPath(a, s.abs_path, "demo", "0001-hi");
+        defer a.free(path);
+        const meta = try readFileAlloc(a, path);
+        defer a.free(meta);
+        const expected = try std.fmt.allocPrint(a, "harness = \"{s}\"", .{case.expected_harness});
+        defer a.free(expected);
+        try std.testing.expect(std.mem.indexOf(u8, meta, "status = \"completed\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, meta, expected) != null);
+    }
+}
+
+test "runtime: fake resume carries session into output manifest and advances thread on completion" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "thread-resume");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+    try seedThread(a, s.abs_path, "demo", "admin",
+        \\version = 1
+        \\name = "admin"
+        \\created_at = 2026-05-17T12:00:00.000Z
+        \\updated_at = 2026-05-17T12:00:00.000Z
+        \\status = "active"
+        \\
+        \\[state]
+        \\last_item_id = "0001"
+        \\last_harness = "fake"
+        \\last_session_id = "sess-old"
+        \\
+    );
+    try seedItem(a, s.abs_path, "demo", "0002", "resume",
+        \\id = "0002"
+        \\slug = "resume"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+        \\[thread]
+        \\name = "admin"
+        \\mode = "resume"
+        \\
+    );
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .stack_registry = &reg,
+        .audit_writer = &aw,
+        .dispatch = runtime_mod.fakeDispatch(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const thread_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/threads/admin.toml" });
+    defer a.free(thread_path);
+    const thread = try readFileAlloc(a, thread_path);
+    defer a.free(thread);
+    try std.testing.expect(std.mem.indexOf(u8, thread, "last_item_id = \"0002\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, thread, "last_session_id = \"sess-old\"") != null);
+
+    const manifest_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0002-resume/output/manifest.toml" });
+    defer a.free(manifest_path);
+    const manifest = try readFileAlloc(a, manifest_path);
+    defer a.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "[thread]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "name = \"admin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "mode = \"resume\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "resume_session_id = \"sess-old\"") != null);
+}
+
+test "runtime: input item summary materializes rendered prompt before dispatch" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "prompt-input-item");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+    try seedItem(a, s.abs_path, "demo", "0001", "plan",
+        \\id = "0001"
+        \\slug = "plan"
+        \\kind = "prompt"
+        \\status = "completed"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    );
+    const output_dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-plan/output" });
+    defer a.free(output_dir);
+    try std.fs.cwd().makePath(output_dir);
+    {
+        const summary_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-plan/output/summary.md" });
+        defer a.free(summary_path);
+        var f = try std.fs.cwd().createFile(summary_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("prior item summary\n");
+    }
+    try seedItem(a, s.abs_path, "demo", "0002", "next",
+        \\id = "0002"
+        \\slug = "next"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+        \\[inputs]
+        \\items = ["0001"]
+        \\mode = "append"
+        \\
+    );
+    {
+        const prompt_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0002-next/prompt.md" });
+        defer a.free(prompt_path);
+        var f = try std.fs.cwd().createFile(prompt_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("base prompt");
+    }
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
+
+    const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
+    defer a.free(fixture);
+    const script = try absFixturePath(a, "harness/cat_jsonl.sh");
+    defer a.free(script);
+    const cs = CatScript{ .fixture_abs = fixture, .script_abs = script };
+    GLOBAL_CAT_SCRIPT = &cs;
+    defer GLOBAL_CAT_SCRIPT = null;
+
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .stack_registry = &reg,
+        .audit_writer = &aw,
+        .dispatch = fakeDispatchCat(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const rendered_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0002-next/rendered_prompt.md" });
+    defer a.free(rendered_path);
+    var f = try std.fs.cwd().openFile(rendered_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "base prompt\n\n---\n\n## Registered Inputs") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "Source: stacks/demo/0001-plan/output/summary.md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "prior item summary") != null);
+}
+
+test "runtime: rendered prompt is not written for later preflight block" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "prompt-input-harness-block");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+    try seedItem(a, s.abs_path, "demo", "0001", "plan",
+        \\id = "0001"
+        \\slug = "plan"
+        \\kind = "prompt"
+        \\status = "completed"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    );
+    const output_dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-plan/output" });
+    defer a.free(output_dir);
+    try std.fs.cwd().makePath(output_dir);
+    {
+        const summary_path = try std.fs.path.join(a, &.{ output_dir, "summary.md" });
+        defer a.free(summary_path);
+        var f = try std.fs.cwd().createFile(summary_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("prior item summary\n");
+    }
+    try seedItem(a, s.abs_path, "demo", "0002", "next",
+        \\id = "0002"
+        \\slug = "next"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+        \\[inputs]
+        \\items = ["0001"]
+        \\
+    );
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .stack_registry = &reg,
+        .audit_writer = &aw,
+        .dispatch = fakeDispatchUnavailable(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+
+    const rendered_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0002-next/rendered_prompt.md" });
+    defer a.free(rendered_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(rendered_path, .{}));
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0002-next/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "blocked_reason = \"harness_unavailable\"") != null);
+}
+
+test "runtime: missing input item blocks before spawn" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "prompt-input-missing");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+    try seedItem(a, s.abs_path, "demo", "0001", "next",
+        \\id = "0001"
+        \\slug = "next"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+        \\[inputs]
+        \\items = ["0009"]
+        \\
+    );
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .stack_registry = &reg,
+        .audit_writer = &aw,
+        .dispatch = runtime_mod.fakeDispatch(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-next/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "blocked_reason = \"input_missing\"") != null);
+}
+
+test "runtime: oversized input file blocks before spawn" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "prompt-input-large");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+    {
+        const big_path = try std.fs.path.join(a, &.{ s.abs_path, "big.md" });
+        defer a.free(big_path);
+        var f = try std.fs.cwd().createFile(big_path, .{ .truncate = true });
+        defer f.close();
+        const chunk = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n";
+        var n: usize = 0;
+        while (n <= stako.prompt_materializer.MAX_INPUT_BYTES) : (n += chunk.len) try f.writeAll(chunk);
+    }
+    try seedItem(a, s.abs_path, "demo", "0001", "next",
+        \\id = "0001"
+        \\slug = "next"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+        \\[inputs]
+        \\files = ["big.md"]
+        \\
+    );
+
+    var aw = try audit_mod.Writer.init(a, s.abs_path);
+    defer aw.deinit();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
+    var sup = runtime_mod.Supervisor.init(a, .{
+        .notes_root_abs = s.abs_path,
+        .stack_registry = &reg,
+        .audit_writer = &aw,
+        .dispatch = runtime_mod.fakeDispatch(),
+    });
+    defer sup.deinit();
+    try sup.tickStack("demo");
+    sup.sm.waitAll();
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-next/meta.toml" });
+    defer a.free(meta_path);
+    var f = try std.fs.cwd().openFile(meta_path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    defer a.free(buf);
+    _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "blocked_reason = \"input_too_large\"") != null);
 }
 
 test "runtime: sleep item with elapsed `until` transitions to completed" {

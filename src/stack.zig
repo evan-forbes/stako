@@ -9,7 +9,10 @@ const std = @import("std");
 const audit = @import("audit.zig");
 const item_mod = @import("item.zig");
 const mutations = @import("mutations.zig");
+const output_packet = @import("output_packet.zig");
+const routine_mod = @import("routine.zig");
 const stack_config = @import("stack_config.zig");
+const stack_thread = @import("stack_thread.zig");
 const storage = @import("storage.zig");
 const vcs = @import("vcs.zig");
 
@@ -27,6 +30,8 @@ pub const MutationFailureKind = enum {
     git_failed,
     bad_config_key,
     bad_config_value,
+    bad_thread_key,
+    bad_thread_value,
     internal,
 };
 
@@ -86,6 +91,10 @@ pub const Stack = struct {
         return self.runMutationLocked(ident, .{ .append_item = input });
     }
 
+    pub fn appendRoutine(self: *Stack, ident: mutations.IdentityCtx, input: mutations.AppendRoutineInput) MutationResult {
+        return self.runMutationLocked(ident, .{ .append_routine = input });
+    }
+
     pub fn insertItem(self: *Stack, ident: mutations.IdentityCtx, input: mutations.InsertItemInput) MutationResult {
         return self.runMutationLocked(ident, .{ .insert_item = input });
     }
@@ -107,6 +116,19 @@ pub const Stack = struct {
 
     pub fn patchConfig(self: *Stack, ident: mutations.IdentityCtx, patches: []const mutations.ConfigPatch) MutationResult {
         return self.runMutationLocked(ident, .{ .config_patch = .{ .stack = self.name, .patches = patches } });
+    }
+
+    pub fn createThread(self: *Stack, ident: mutations.IdentityCtx, input: mutations.CreateThreadInput) MutationResult {
+        if (!std.mem.eql(u8, input.stack, self.name)) return .{ .err = .validation_failed };
+        return self.runMutationLocked(ident, .{ .create_thread = input });
+    }
+
+    pub fn patchThread(self: *Stack, ident: mutations.IdentityCtx, name: []const u8, patches: []const mutations.ThreadPatch) MutationResult {
+        return self.runMutationLocked(ident, .{ .patch_thread = .{ .stack = self.name, .name = name, .patches = patches } });
+    }
+
+    pub fn archiveThread(self: *Stack, ident: mutations.IdentityCtx, name: []const u8) MutationResult {
+        return self.runMutationLocked(ident, .{ .archive_thread = .{ .stack = self.name, .name = name } });
     }
 
     fn runMutationLocked(self: *Stack, ident: mutations.IdentityCtx, kind: MutationKind) MutationResult {
@@ -265,10 +287,93 @@ pub const StackClient = struct {
         reader.freeItemList(list);
     }
 
+    pub fn listThreads(self: *const StackClient, name: []const u8) ![]storage.ThreadSummary {
+        var reader = try storage.Reader.init(self.registry.allocator, self.registry.notes_root_abs);
+        defer reader.deinit();
+        return reader.listThreads(name);
+    }
+
+    pub fn freeThreadList(self: *const StackClient, list: []storage.ThreadSummary) void {
+        var reader = storage.Reader{
+            .allocator = self.registry.allocator,
+            .notes_root_abs = @constCast(self.registry.notes_root_abs),
+        };
+        reader.freeThreadList(list);
+    }
+
+    pub fn readThread(self: *const StackClient, name: []const u8, thread_name: []const u8) !stack_thread.Thread {
+        var reader = try storage.Reader.init(self.registry.allocator, self.registry.notes_root_abs);
+        defer reader.deinit();
+        return reader.readThread(name, thread_name);
+    }
+
+    pub fn listRoutines(self: *const StackClient) ![]storage.RoutineSummary {
+        var reader = try storage.Reader.init(self.registry.allocator, self.registry.notes_root_abs);
+        defer reader.deinit();
+        return reader.listRoutines();
+    }
+
+    pub fn freeRoutineList(self: *const StackClient, list: []storage.RoutineSummary) void {
+        var reader = storage.Reader{
+            .allocator = self.registry.allocator,
+            .notes_root_abs = @constCast(self.registry.notes_root_abs),
+        };
+        reader.freeRoutineList(list);
+    }
+
+    pub fn readRoutine(self: *const StackClient, name: []const u8) !routine_mod.Routine {
+        var reader = try storage.Reader.init(self.registry.allocator, self.registry.notes_root_abs);
+        defer reader.deinit();
+        return reader.readRoutine(name);
+    }
+
     pub fn readItem(self: *const StackClient, name: []const u8, id: []const u8) !item_mod.Item {
         var reader = try storage.Reader.init(self.registry.allocator, self.registry.notes_root_abs);
         defer reader.deinit();
         return reader.readItem(name, id);
+    }
+
+    pub fn readItemOutputSummary(self: *const StackClient, name: []const u8, id: []const u8) ![]u8 {
+        const item_dir = try findItemDirForRead(self.registry.allocator, self.registry.notes_root_abs, name, id);
+        defer self.registry.allocator.free(item_dir);
+        const path = try std.fs.path.join(self.registry.allocator, &.{ self.registry.notes_root_abs, "stacks", name, item_dir, "output", "summary.md" });
+        defer self.registry.allocator.free(path);
+        return output_packet.readSummary(self.registry.allocator, path);
+    }
+
+    pub fn readItemOutputManifest(self: *const StackClient, name: []const u8, id: []const u8) !output_packet.Manifest {
+        const item_dir = try findItemDirForRead(self.registry.allocator, self.registry.notes_root_abs, name, id);
+        defer self.registry.allocator.free(item_dir);
+        const path = try std.fs.path.join(self.registry.allocator, &.{ self.registry.notes_root_abs, "stacks", name, item_dir, "output", "manifest.toml" });
+        defer self.registry.allocator.free(path);
+        return output_packet.readManifest(self.registry.allocator, path);
+    }
+
+    pub fn recentCompletedOutputSummaryInputs(self: *const StackClient, name: []const u8, limit: usize) ![][]const u8 {
+        const items = try self.listItems(name);
+        defer self.freeItemList(items);
+
+        var out = std.ArrayList([]const u8){};
+        errdefer {
+            for (out.items) |id| self.registry.allocator.free(id);
+            out.deinit(self.registry.allocator);
+        }
+
+        var i = items.len;
+        while (i > 0 and out.items.len < limit) {
+            i -= 1;
+            const summary = items[i];
+            if (!std.mem.eql(u8, summary.status, "completed")) continue;
+            if (!try itemOutputSummaryExists(self.registry.allocator, self.registry.notes_root_abs, name, summary.id)) continue;
+            try out.append(self.registry.allocator, try self.registry.allocator.dupe(u8, summary.id));
+        }
+        std.mem.reverse([]const u8, out.items);
+        return out.toOwnedSlice(self.registry.allocator);
+    }
+
+    pub fn freeStringList(self: *const StackClient, list: []const []const u8) void {
+        for (list) |s| self.registry.allocator.free(s);
+        self.registry.allocator.free(list);
     }
 
     pub fn readStack(self: *const StackClient, name: []const u8) !struct {
@@ -322,6 +427,11 @@ pub const StackClient = struct {
         return st.appendItem(self.ident(), input);
     }
 
+    pub fn appendRoutine(self: *const StackClient, stack_name: []const u8, input: mutations.AppendRoutineInput) MutationResult {
+        const st = self.registry.getStack(stack_name) orelse return .{ .err = .not_found };
+        return st.appendRoutine(self.ident(), input);
+    }
+
     pub fn insertItem(self: *const StackClient, stack_name: []const u8, input: mutations.InsertItemInput) MutationResult {
         const st = self.registry.getStack(stack_name) orelse return .{ .err = .not_found };
         return st.insertItem(self.ident(), input);
@@ -346,17 +456,47 @@ pub const StackClient = struct {
         const st = self.registry.getStack(stack_name) orelse return .{ .err = .not_found };
         return st.patchConfig(self.ident(), patches);
     }
+
+    pub fn createThread(self: *const StackClient, stack_name: []const u8, input: mutations.CreateThreadInput) MutationResult {
+        const st = self.registry.getStack(stack_name) orelse return .{ .err = .not_found };
+        return st.createThread(self.ident(), input);
+    }
+
+    pub fn ensureThread(self: *const StackClient, stack_name: []const u8, input: mutations.CreateThreadInput) MutationResult {
+        if (!std.mem.eql(u8, stack_name, input.stack)) return .{ .err = .validation_failed };
+        var existing = self.readThread(stack_name, input.name) catch |e| switch (e) {
+            error.NotFound => return self.createThread(stack_name, input),
+            error.BadThreadName => return .{ .err = .invalid_name },
+            else => return .{ .err = .internal },
+        };
+        existing.deinit();
+        return noOpThreadResult(self.registry.allocator, self.ident(), stack_name, input.name);
+    }
+
+    pub fn patchThread(self: *const StackClient, stack_name: []const u8, thread_name: []const u8, patches: []const mutations.ThreadPatch) MutationResult {
+        const st = self.registry.getStack(stack_name) orelse return .{ .err = .not_found };
+        return st.patchThread(self.ident(), thread_name, patches);
+    }
+
+    pub fn archiveThread(self: *const StackClient, stack_name: []const u8, thread_name: []const u8) MutationResult {
+        const st = self.registry.getStack(stack_name) orelse return .{ .err = .not_found };
+        return st.archiveThread(self.ident(), thread_name);
+    }
 };
 
 const MutationKind = union(enum) {
     create_stack: mutations.CreateStackInput,
     append_item: mutations.AppendItemInput,
+    append_routine: mutations.AppendRoutineInput,
     insert_item: mutations.InsertItemInput,
     transition: mutations.TransitionInput,
     pause_stack: struct { stack: []const u8 },
     resume_stack: struct { stack: []const u8 },
     config_patch: struct { stack: []const u8, patches: []const mutations.ConfigPatch },
     runtime_transition: mutations.RuntimeTransitionInput,
+    create_thread: mutations.CreateThreadInput,
+    patch_thread: struct { stack: []const u8, name: []const u8, patches: []const mutations.ThreadPatch },
+    archive_thread: struct { stack: []const u8, name: []const u8 },
 
     const ItemTarget = struct {
         stack: []const u8,
@@ -372,12 +512,16 @@ const MutationKind = union(enum) {
         return switch (self) {
             .create_stack => |inp| mutations.applyCreateStack(allocator, notes_root_abs, ident, inp),
             .append_item => |inp| mutations.applyAppendItem(allocator, notes_root_abs, ident, inp),
+            .append_routine => |inp| mutations.applyAppendRoutine(allocator, notes_root_abs, ident, inp),
             .insert_item => |inp| mutations.applyInsertItem(allocator, notes_root_abs, ident, inp),
             .transition => |inp| mutations.applyTransition(allocator, notes_root_abs, ident, inp),
             .pause_stack => |p| mutations.applySetPaused(allocator, notes_root_abs, ident, p.stack, true),
             .resume_stack => |p| mutations.applySetPaused(allocator, notes_root_abs, ident, p.stack, false),
             .config_patch => |p| mutations.applyConfigPatch(allocator, notes_root_abs, ident, p.stack, p.patches),
             .runtime_transition => |inp| mutations.applyRuntimeTransition(allocator, notes_root_abs, ident, inp),
+            .create_thread => |inp| mutations.applyCreateThread(allocator, notes_root_abs, ident, inp),
+            .patch_thread => |p| mutations.applyPatchThread(allocator, notes_root_abs, ident, .{ .stack = p.stack, .name = p.name, .patches = p.patches }),
+            .archive_thread => |p| mutations.applyArchiveThread(allocator, notes_root_abs, ident, p.stack, p.name),
         };
     }
 
@@ -397,6 +541,14 @@ const MutationKind = union(enum) {
         };
     }
 
+    fn threadPreflight(self: MutationKind) ?struct { stack: []const u8, name: []const u8 } {
+        return switch (self) {
+            .patch_thread => |p| .{ .stack = p.stack, .name = p.name },
+            .archive_thread => |p| .{ .stack = p.stack, .name = p.name },
+            else => null,
+        };
+    }
+
     fn stackDirPreflight(self: MutationKind) ?[]const u8 {
         return switch (self) {
             .insert_item => |inp| inp.stack,
@@ -408,6 +560,13 @@ const MutationKind = union(enum) {
         return switch (self) {
             .transition => |inp| .{ .stack = inp.stack, .id = inp.id },
             .runtime_transition => |inp| .{ .stack = inp.stack, .id = inp.id },
+            else => null,
+        };
+    }
+
+    fn runtimeThreadPreflight(self: MutationKind) ?ItemTarget {
+        return switch (self) {
+            .runtime_transition => |inp| if (inp.to == .completed) .{ .stack = inp.stack, .id = inp.id } else null,
             else => null,
         };
     }
@@ -503,6 +662,12 @@ fn computePreflightPaths(
     if (kind.itemMetaPreflight()) |target| {
         try appendItemMetaPreflight(allocator, notes_root_abs, &out, target.stack, target.id);
     }
+    if (kind.runtimeThreadPreflight()) |target| {
+        try appendRuntimeThreadPreflight(allocator, notes_root_abs, &out, target.stack, target.id);
+    }
+    if (kind.threadPreflight()) |target| {
+        try out.append(allocator, try mutations.threadRel(allocator, target.stack, target.name));
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -528,6 +693,99 @@ fn appendItemMetaPreflight(
     }
 }
 
+fn appendRuntimeThreadPreflight(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    out: *std.ArrayList([]u8),
+    stack_name: []const u8,
+    id: []const u8,
+) !void {
+    const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack_name });
+    defer allocator.free(stack_abs);
+    var d = std.fs.openDirAbsolute(stack_abs, .{ .iterate = true }) catch return;
+    defer d.close();
+
+    var it = d.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        const dash = std.mem.indexOfScalar(u8, entry.name, '-') orelse continue;
+        if (!std.mem.eql(u8, entry.name[0..dash], id)) continue;
+
+        const meta_abs = try std.fs.path.join(allocator, &.{ stack_abs, entry.name, "meta.toml" });
+        defer allocator.free(meta_abs);
+        var meta_file = std.fs.cwd().openFile(meta_abs, .{}) catch return;
+        defer meta_file.close();
+        const stat = try meta_file.stat();
+        const src = try allocator.alloc(u8, stat.size);
+        defer allocator.free(src);
+        const n = try meta_file.readAll(src);
+        var diag: item_mod.ParseDiagnostic = .{};
+        var parsed = item_mod.parseSlice(allocator, src[0..n], &diag) catch return;
+        defer parsed.deinit();
+        if (parsed.thread) |thread_ref| {
+            if (item_mod.isValidThreadName(thread_ref.name)) {
+                try out.append(allocator, try mutations.threadRel(allocator, stack_name, thread_ref.name));
+            }
+        }
+        return;
+    }
+}
+
+fn findItemDirForRead(allocator: std.mem.Allocator, notes_root_abs: []const u8, stack_name: []const u8, id: []const u8) ![]u8 {
+    const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack_name });
+    defer allocator.free(stack_abs);
+    var d = try std.fs.openDirAbsolute(stack_abs, .{ .iterate = true });
+    defer d.close();
+    var it = d.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const dash = std.mem.indexOfScalar(u8, entry.name, '-') orelse continue;
+        if (std.mem.eql(u8, entry.name[0..dash], id)) return allocator.dupe(u8, entry.name);
+    }
+    return error.NotFound;
+}
+
+fn itemOutputSummaryExists(allocator: std.mem.Allocator, notes_root_abs: []const u8, stack_name: []const u8, id: []const u8) !bool {
+    const item_dir = findItemDirForRead(allocator, notes_root_abs, stack_name, id) catch return false;
+    defer allocator.free(item_dir);
+    const path = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack_name, item_dir, "output", "summary.md" });
+    defer allocator.free(path);
+    var f = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
+        error.FileNotFound, error.IsDir => return false,
+        else => return e,
+    };
+    f.close();
+    return true;
+}
+
+fn noOpThreadResult(allocator: std.mem.Allocator, ident: mutations.IdentityCtx, stack_name: []const u8, thread_name: []const u8) MutationResult {
+    const paths = allocator.alloc([]u8, 0) catch return .{ .err = .internal };
+    errdefer allocator.free(paths);
+    const subject = std.fmt.allocPrint(allocator, "thread: ensure {s}", .{thread_name}) catch return .{ .err = .internal };
+    errdefer allocator.free(subject);
+    const body = std.fmt.allocPrint(allocator, "stack: {s}\nthread: {s}\nidentity: {s}\napi: {s}\n", .{ stack_name, thread_name, ident.identity, ident.api_path }) catch return .{ .err = .internal };
+    errdefer allocator.free(body);
+    const target = std.fmt.allocPrint(allocator, "stack/{s}/thread/{s}", .{ stack_name, thread_name }) catch return .{ .err = .internal };
+    errdefer allocator.free(target);
+    const details = allocator.alloc(audit.DetailKV, 0) catch return .{ .err = .internal };
+    errdefer allocator.free(details);
+    const detail_storage = allocator.alloc(u8, 0) catch {
+        allocator.free(details);
+        return .{ .err = .internal };
+    };
+    return .{ .ok = .{ .output = .{
+        .allocator = allocator,
+        .paths = paths,
+        .commit_subject = subject,
+        .commit_body = body,
+        .audit_action = .create_thread,
+        .audit_target = target,
+        .audit_details = details,
+        .detail_storage = detail_storage,
+        .no_op = true,
+    } } };
+}
+
 fn freePreflightPaths(allocator: std.mem.Allocator, paths: [][]u8) void {
     for (paths) |p| allocator.free(p);
     allocator.free(paths);
@@ -549,6 +807,8 @@ fn mutationErrorToKind(e: anyerror) MutationFailureKind {
         error.DirtyTarget => .vcs_dirty,
         error.BadConfigKey => .bad_config_key,
         error.BadConfigValue => .bad_config_value,
+        error.BadThreadKey => .bad_thread_key,
+        error.BadThreadValue => .bad_thread_value,
         else => .internal,
     };
 }
@@ -611,4 +871,368 @@ test "StackClient: create stack, append item, and pause" {
     defer client.freeItemList(items);
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqualStrings("0001", items[0].id);
+}
+
+test "StackClient: create, patch, archive, and read thread" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".stako");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    var aw = try audit.Writer.init(a, abs);
+    defer aw.deinit();
+
+    var reg = try StackRegistry.init(a, abs, &aw, false);
+    defer reg.deinit();
+    const client = reg.localClient("local", "test");
+
+    switch (client.createStack(.{
+        .name = "demo",
+        .created_at_override = "2026-05-10T14:00:00Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    switch (client.createThread("demo", .{
+        .stack = "demo",
+        .name = "admin",
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    const threads = try client.listThreads("demo");
+    defer client.freeThreadList(threads);
+    try std.testing.expectEqual(@as(usize, 1), threads.len);
+    try std.testing.expectEqualStrings("admin", threads[0].name);
+
+    const patches = [_]mutations.ThreadPatch{
+        .{ .key = "target.provider", .value = "openai" },
+        .{ .key = "target.match", .value = "compatible" },
+    };
+    switch (client.patchThread("demo", "admin", &patches)) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    var thread = try client.readThread("demo", "admin");
+    defer thread.deinit();
+    try std.testing.expectEqualStrings("openai", thread.target.?.provider.?);
+    try std.testing.expectEqual(stack_thread.Match.compatible, thread.target.?.match.?);
+
+    switch (client.archiveThread("demo", "admin")) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+    var archived = try client.readThread("demo", "admin");
+    defer archived.deinit();
+    try std.testing.expectEqual(stack_thread.Status.archived, archived.status);
+}
+
+test "StackClient: ensureThread creates admin thread by convention and is idempotent" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".stako");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    var aw = try audit.Writer.init(a, abs);
+    defer aw.deinit();
+
+    var reg = try StackRegistry.init(a, abs, &aw, false);
+    defer reg.deinit();
+    const client = reg.localClient("local", "test");
+
+    switch (client.createStack(.{ .name = "demo", .created_at_override = "2026-05-10T14:00:00Z" })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    switch (client.ensureThread("demo", .{
+        .stack = "demo",
+        .name = "admin",
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+            try std.testing.expect(!ok.output.no_op);
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    switch (client.ensureThread("demo", .{
+        .stack = "demo",
+        .name = "admin",
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+            try std.testing.expect(ok.output.no_op);
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    var thread = try client.readThread("demo", "admin");
+    defer thread.deinit();
+    try std.testing.expectEqualStrings("admin", thread.name);
+}
+
+test "admin routine targets admin thread and ingests recent completed output summaries" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath(".stako");
+    try tmp.dir.makePath("routines/prompts");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+
+    {
+        var f = try tmp.dir.createFile("routines/admin-review.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\version = 1
+            \\name = "admin-review"
+            \\description = "Review recent stack results and decide what to do next."
+            \\
+            \\[[step]]
+            \\name = "evaluate"
+            \\slug = "admin-evaluate"
+            \\kind = "prompt"
+            \\thread = "admin"
+            \\thread_mode = "resume"
+            \\prompt_file = "prompts/admin-evaluate.md"
+            \\
+        );
+    }
+    {
+        var f = try tmp.dir.createFile("routines/prompts/admin-evaluate.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("Evaluate the registered outputs.\n");
+    }
+
+    var aw = try audit.Writer.init(a, abs);
+    defer aw.deinit();
+
+    var reg = try StackRegistry.init(a, abs, &aw, false);
+    defer reg.deinit();
+    const client = reg.localClient("local", "test");
+
+    switch (client.createStack(.{ .name = "demo", .created_at_override = "2026-05-10T14:00:00Z" })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+    switch (client.ensureThread("demo", .{
+        .stack = "demo",
+        .name = "admin",
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    try writeCompletedSummary(&tmp.dir, "0001", "plan", "first summary\n");
+    try writeCompletedSummary(&tmp.dir, "0002", "build", "second summary\n");
+    try writeQueuedItem(&tmp.dir, "0003", "todo");
+
+    const inputs = try client.recentCompletedOutputSummaryInputs("demo", 8);
+    defer client.freeStringList(inputs);
+    try std.testing.expectEqual(@as(usize, 2), inputs.len);
+    try std.testing.expectEqualStrings("0001", inputs[0]);
+    try std.testing.expectEqualStrings("0002", inputs[1]);
+
+    var routine = try client.readRoutine("admin-review");
+    defer routine.deinit();
+    switch (client.appendRoutine("demo", .{
+        .stack = "demo",
+        .routine = &routine,
+        .input_items = inputs,
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+            try std.testing.expect(pathListContains(ok.output.paths, "stacks/demo/0004-admin-evaluate/meta.toml"));
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    var admin_item = try client.readItem("demo", "0004");
+    defer admin_item.deinit();
+    try std.testing.expectEqualStrings("admin", admin_item.thread.?.name);
+    try std.testing.expectEqual(item_mod.ThreadMode.fresh, admin_item.thread.?.mode);
+    try std.testing.expectEqualStrings("0001", admin_item.inputs.?.items.?[0]);
+    try std.testing.expectEqualStrings("0002", admin_item.inputs.?.items.?[1]);
+
+    const item_dir = try std.fs.path.join(a, &.{ abs, "stacks/demo/0004-admin-evaluate" });
+    defer a.free(item_dir);
+    const rendered = try @import("prompt_materializer.zig").resolvePrompt(a, abs, "demo", &admin_item, item_dir);
+    defer a.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "first summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "second summary") != null);
+
+    switch (client.runtimeTransitionItem("demo", .{ .stack = "demo", .id = "0004", .to = .running })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+    switch (client.runtimeTransitionItem("demo", .{
+        .stack = "demo",
+        .id = "0004",
+        .to = .completed,
+        .result_harness = "codex",
+        .result_session_id = "admin-session",
+        .result_completed_at = "2026-05-17T12:01:00.000Z",
+        .output_packet = .{
+            .stack = "demo",
+            .item_id = "0004",
+            .status = "completed",
+            .summary = "needs follow-up\nReview item 0002.",
+        },
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    var thread = try client.readThread("demo", "admin");
+    defer thread.deinit();
+    try std.testing.expectEqualStrings("0004", thread.state.?.last_item_id.?);
+    try std.testing.expectEqualStrings("admin-session", thread.state.?.last_session_id.?);
+
+    const items_after = try client.listItems("demo");
+    defer client.freeItemList(items_after);
+    try std.testing.expectEqual(@as(usize, 4), items_after.len);
+
+    switch (client.appendRoutine("demo", .{
+        .stack = "demo",
+        .routine = &routine,
+        .input_items = inputs,
+        .created_at_override = "2026-05-17T12:02:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    var second_admin_item = try client.readItem("demo", "0005");
+    defer second_admin_item.deinit();
+    try std.testing.expectEqualStrings("admin", second_admin_item.thread.?.name);
+    try std.testing.expectEqual(item_mod.ThreadMode.@"resume", second_admin_item.thread.?.mode);
+}
+
+test "runtime completion preflights named thread file" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    try tmp.dir.makePath("stacks/demo/0001-hello");
+    try tmp.dir.makePath("stacks/demo/threads");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-hello/meta.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\id = "0001"
+            \\slug = "hello"
+            \\kind = "prompt"
+            \\status = "running"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\match = "any"
+            \\
+            \\[thread]
+            \\name = "admin"
+            \\mode = "fresh"
+            \\
+        );
+    }
+
+    const paths = try computePreflightPaths(a, abs, .{ .runtime_transition = .{
+        .stack = "demo",
+        .id = "0001",
+        .to = .completed,
+    } });
+    defer freePreflightPaths(a, paths);
+    try std.testing.expect(pathListContains(paths, "stacks/demo/0001-hello/meta.toml"));
+    try std.testing.expect(pathListContains(paths, "stacks/demo/threads/admin.toml"));
+}
+
+fn writeCompletedSummary(dir: *std.fs.Dir, id: []const u8, slug: []const u8, summary: []const u8) !void {
+    var path_buf: [128]u8 = undefined;
+    const item_dir = try std.fmt.bufPrint(&path_buf, "stacks/demo/{s}-{s}/output", .{ id, slug });
+    try dir.makePath(item_dir);
+    try writeItemMeta(dir, id, slug, "completed");
+    const summary_path = try std.fmt.bufPrint(&path_buf, "stacks/demo/{s}-{s}/output/summary.md", .{ id, slug });
+    var f = try dir.createFile(summary_path, .{ .truncate = true });
+    defer f.close();
+    try f.writeAll(summary);
+}
+
+fn writeQueuedItem(dir: *std.fs.Dir, id: []const u8, slug: []const u8) !void {
+    var path_buf: [128]u8 = undefined;
+    const item_dir = try std.fmt.bufPrint(&path_buf, "stacks/demo/{s}-{s}", .{ id, slug });
+    try dir.makePath(item_dir);
+    try writeItemMeta(dir, id, slug, "queued");
+}
+
+fn writeItemMeta(dir: *std.fs.Dir, id: []const u8, slug: []const u8, status: []const u8) !void {
+    var path_buf: [128]u8 = undefined;
+    const meta = try std.fmt.bufPrint(&path_buf, "stacks/demo/{s}-{s}/meta.toml", .{ id, slug });
+    var f = try dir.createFile(meta, .{ .truncate = true });
+    defer f.close();
+    var content_buf: [512]u8 = undefined;
+    const content = try std.fmt.bufPrint(&content_buf,
+        \\id = "{s}"
+        \\slug = "{s}"
+        \\kind = "prompt"
+        \\status = "{s}"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    , .{ id, slug, status });
+    try f.writeAll(content);
+}
+
+fn pathListContains(paths: []const []const u8, needle: []const u8) bool {
+    for (paths) |p| if (std.mem.eql(u8, p, needle)) return true;
+    return false;
 }
