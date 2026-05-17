@@ -59,12 +59,17 @@ pub const Options = struct {
     /// off so the scripted subprocess actually runs.
     enable_provider_preflight: bool = false,
     /// Optional capability check applied at routing preflight (M10).
-    /// Called with the resolved provider slug (e.g. "anthropic"); returns
-    /// true to allow dispatch, false to block with `capability_denied`.
-    /// When null, the routing layer behaves exactly as in M6–M8 (no
-    /// capability check). The daemon installs a closure here that
-    /// evaluates `policy.evaluate(local-identity, dispatch_harness, ...)`.
-    policy_check_provider: ?*const fn (ctx: ?*anyopaque, provider_slug: []const u8) bool = null,
+    /// Called with the resolved provider slug (e.g. "anthropic"), the
+    /// stack name, and the queued item's id; returns true to allow
+    /// dispatch, false to block with `capability_denied`. Implementations
+    /// own emitting any audit-log `denied` line for the dispatch attempt
+    /// (the subsequent transition-to-blocked mutation produces its own
+    /// `allowed` audit line, which is not a denial signal). When null,
+    /// the routing layer behaves exactly as in M6–M8 (no capability
+    /// check). The daemon installs a closure here that evaluates
+    /// `policy.evaluate(local-identity, dispatch_harness, ...)` and
+    /// writes the parallel `denied` line via `auditDenied`.
+    policy_check_provider: ?*const fn (ctx: ?*anyopaque, provider_slug: []const u8, stack_name: []const u8, item_id: []const u8) bool = null,
     policy_check_ctx: ?*anyopaque = null,
 };
 
@@ -223,7 +228,7 @@ pub const Supervisor = struct {
             }
 
             // Routing preflight.
-            const decision = try self.routingPreflight(&cfg, &item);
+            const decision = try self.routingPreflight(stack_name, &cfg, &item);
             switch (decision) {
                 .blocked => |reason| {
                     const transition_client = self.systemClient("runtime/preflight");
@@ -288,7 +293,7 @@ pub const Supervisor = struct {
         }
     };
 
-    fn routingPreflight(self: *Supervisor, cfg: *const stack_config.StackConfig, item: *const item_mod.Item) !PreflightDecision {
+    fn routingPreflight(self: *Supervisor, stack_name: []const u8, cfg: *const stack_config.StackConfig, item: *const item_mod.Item) !PreflightDecision {
         // Resolve harness.
         //
         // v1 routing precedence:
@@ -394,7 +399,7 @@ pub const Supervisor = struct {
                     .openai => "openai",
                     .google => "google",
                 };
-                if (!check(self.opts.policy_check_ctx, slug)) {
+                if (!check(self.opts.policy_check_ctx, slug, stack_name, item.id)) {
                     return .{ .blocked = "capability_denied" };
                 }
             }

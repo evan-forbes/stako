@@ -882,7 +882,13 @@ fn stackPostCommitWake(ctx: ?*anyopaque, stack_name: []const u8) void {
 /// dispatch by checking the local identity's `provider.<slug>` capability.
 /// In v1 the only mutator is `local`; once items carry a `created_by`
 /// identity field this callback grows that lookup.
-fn runtimePolicyCheck(ctx: ?*anyopaque, provider_slug: []const u8) bool {
+///
+/// On denial, writes a parallel `denied` audit line. The runtime's own
+/// subsequent transition-to-blocked mutation produces an `allowed` line
+/// (because the transition mutation itself was allowed), which is NOT a
+/// denial signal — without this companion line the audit log would never
+/// record that the policy rejected the dispatch.
+fn runtimePolicyCheck(ctx: ?*anyopaque, provider_slug: []const u8, stack_name: []const u8, item_id: []const u8) bool {
     // Fail-closed default: an authorization callback with no context can
     // never positively assert that dispatch is allowed. In v1 the daemon
     // always installs `@ptrCast(self)` (never null) at install time, so
@@ -892,7 +898,9 @@ fn runtimePolicyCheck(ctx: ?*anyopaque, provider_slug: []const u8) bool {
     const self: *Daemon = @ptrCast(@alignCast(self_any));
     const id = policy.resolveLocal(&self.config);
     const decision = policy.evaluate(id, .dispatch_harness, .{ .provider = provider_slug });
-    return decision == .allow;
+    if (decision == .allow) return true;
+    auditDenied(self, id.name, .dispatch_harness, stack_name, item_id, "capability_denied");
+    return false;
 }
 
 /// Translate a `policy.Action` to the matching `audit.Action` so denied

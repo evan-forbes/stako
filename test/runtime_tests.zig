@@ -1816,3 +1816,322 @@ test "Worker: tear-down right after start cleanly joins the worker thread" {
     sup.deinit();
     // If we reach here without hanging, the join completed cleanly.
 }
+
+// ---------- F1 (follow-up): dispatch denial audit-log shape ----------
+//
+// The runtime supervisor calls `policy_check_provider` for items routed to
+// a known provider. The daemon-installed callback denies via the local
+// identity's capability set. Before this follow-up, the only audit signal
+// was the transition-to-blocked mutation, which writes `outcome=allowed`
+// because the *mutation itself* is allowed — there was no parallel
+// `denied` line attributing the dispatch refusal to the policy. These
+// tests pin: (a) the parallel `denied` line is now emitted, (b) the
+// allowed path is unchanged (no spurious denied lines), and (c) one
+// item's denial does not break the supervisor's tick over its siblings.
+
+fn writeIdentityCaps(a: std.mem.Allocator, root: []const u8, caps_toml_array: []const u8) !void {
+    const path = try std.fs.path.join(a, &.{ root, ".stako", "config.toml" });
+    defer a.free(path);
+    const body = try std.fmt.allocPrint(a,
+        \\[identity.local]
+        \\type = "user"
+        \\capabilities = {s}
+        \\
+    , .{caps_toml_array});
+    defer a.free(body);
+    var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer f.close();
+    try f.writeAll(body);
+    const local_path = try std.fs.path.join(a, &.{ root, ".stako", "config.local.toml" });
+    defer a.free(local_path);
+    var lf = try std.fs.cwd().createFile(local_path, .{ .truncate = true });
+    defer lf.close();
+    try lf.writeAll("# cleared so config.toml is authoritative for the test\n");
+}
+
+fn readAuditLogF1(a: std.mem.Allocator, root: []const u8) ![]u8 {
+    const path = try std.fs.path.join(a, &.{ root, ".stako", "audit.log" });
+    defer a.free(path);
+    var f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    _ = try f.readAll(buf);
+    return buf;
+}
+
+fn readItemMeta(a: std.mem.Allocator, root: []const u8, stack: []const u8, item_dir: []const u8) ![]u8 {
+    const path = try std.fs.path.join(a, &.{ root, "stacks", stack, item_dir, "meta.toml" });
+    defer a.free(path);
+    var f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const buf = try a.alloc(u8, stat.size);
+    _ = try f.readAll(buf);
+    return buf;
+}
+
+fn seedAnthropicItem(a: std.mem.Allocator, root: []const u8, stack: []const u8, id: []const u8, slug: []const u8) !void {
+    const body = try std.fmt.allocPrint(a,
+        \\id = "{s}"
+        \\slug = "{s}"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\provider = "anthropic"
+        \\match = "exact"
+        \\
+    , .{ id, slug });
+    defer a.free(body);
+    try seedItem(a, root, stack, id, slug, body);
+}
+
+fn seedClaudeAllowedStack(a: std.mem.Allocator, root: []const u8, stack: []const u8) !void {
+    const dir = try std.fs.path.join(a, &.{ root, "stacks", stack });
+    defer a.free(dir);
+    try std.fs.cwd().makePath(dir);
+    const cfg_path = try std.fs.path.join(a, &.{ dir, "stack.toml" });
+    defer a.free(cfg_path);
+    var f = try std.fs.cwd().createFile(cfg_path, .{ .truncate = true });
+    defer f.close();
+    try f.writeAll(
+        \\description = "F1 dispatch-denial stack"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\paused = false
+        \\continuity = "fresh"
+        \\max_concurrent_per_stack = 1
+        \\allowed_harnesses = ["claude"]
+        \\
+    );
+}
+
+const F1ServeCtx = struct { d: *daemon_mod.Daemon };
+fn f1ServeFn(ctx: *F1ServeCtx) void {
+    daemon_mod.serveUntilShutdown(ctx.d) catch {};
+}
+
+fn waitMetaContains(a: std.mem.Allocator, meta_path: []const u8, needle: []const u8, deadline_ms: i64) !bool {
+    while (std.time.milliTimestamp() < deadline_ms) {
+        var mf = std.fs.cwd().openFile(meta_path, .{}) catch {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        defer mf.close();
+        const stat = try mf.stat();
+        const buf = try a.alloc(u8, stat.size);
+        defer a.free(buf);
+        _ = try mf.readAll(buf);
+        if (std.mem.indexOf(u8, buf, needle) != null) return true;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "F1: dispatch denied by policy emits parallel denied audit line and blocks item" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "f1-denied");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    // No provider.* capability → dispatch_harness denied for anthropic.
+    try writeIdentityCaps(a, s.abs_path, "[\"stack.*.*\"]");
+    try seedClaudeAllowedStack(a, s.abs_path, "demo");
+    try seedAnthropicItem(a, s.abs_path, "demo", "0001", "denied-prompt");
+
+    // Use the cat_jsonl dispatch as the factory — the per-harness factory
+    // resolves whether or not the item ever dispatches. Denial fires
+    // *before* spawn, so the script never runs.
+    const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
+    defer a.free(fixture);
+    const script = try absFixturePath(a, "harness/cat_jsonl.sh");
+    defer a.free(script);
+    const cs = CatScript{ .fixture_abs = fixture, .script_abs = script };
+    GLOBAL_CAT_SCRIPT = &cs;
+    defer GLOBAL_CAT_SCRIPT = null;
+
+    var d = try daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .check_repo_conflicts = false,
+        .enable_runtime = true,
+        .dispatch = fakeDispatchCat(),
+    });
+    defer d.deinit();
+    try d.startWorker();
+
+    var sc = F1ServeCtx{ .d = &d };
+    const th = try std.Thread.spawn(.{}, f1ServeFn, .{&sc});
+    defer {
+        d.requestShutdown();
+        th.join();
+    }
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-denied-prompt/meta.toml" });
+    defer a.free(meta_path);
+    const deadline = std.time.milliTimestamp() + 5000;
+    try std.testing.expect(try waitMetaContains(a, meta_path, "status = \"blocked\"", deadline));
+
+    const meta = try readItemMeta(a, s.abs_path, "demo", "0001-denied-prompt");
+    defer a.free(meta);
+    try std.testing.expect(std.mem.indexOf(u8, meta, "blocked_reason = \"capability_denied\"") != null);
+
+    // The parallel `denied` audit line — this is the bug F1 fixes.
+    const log = try readAuditLogF1(a, s.abs_path);
+    defer a.free(log);
+    // One denial line: action=dispatch_harness, outcome=denied,
+    // reason=capability_denied, identity=local, target=stack/demo/item/0001.
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"action\":\"dispatch_harness\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"outcome\":\"denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"reason\":\"capability_denied\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"identity\":\"local\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"target\":\"stack/demo/item/0001\"") != null);
+
+    // No spawn happened: no transcript file was written.
+    const t_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-denied-prompt/transcript.ndjson" });
+    defer a.free(t_path);
+    if (std.fs.cwd().openFile(t_path, .{})) |f| {
+        var ff = f;
+        defer ff.close();
+        const stat = try ff.stat();
+        try std.testing.expectEqual(@as(u64, 0), stat.size);
+    } else |_| {}
+}
+
+test "F1: dispatch allowed leaves audit log free of spurious denied lines" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "f1-allowed");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    // Full access — dispatch must succeed.
+    try writeIdentityCaps(a, s.abs_path, "[\"*\"]");
+    try seedClaudeAllowedStack(a, s.abs_path, "demo");
+    try seedAnthropicItem(a, s.abs_path, "demo", "0001", "ok-prompt");
+
+    const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
+    defer a.free(fixture);
+    const script = try absFixturePath(a, "harness/cat_jsonl.sh");
+    defer a.free(script);
+    const cs = CatScript{ .fixture_abs = fixture, .script_abs = script };
+    GLOBAL_CAT_SCRIPT = &cs;
+    defer GLOBAL_CAT_SCRIPT = null;
+
+    var d = try daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .check_repo_conflicts = false,
+        .enable_runtime = true,
+        .dispatch = fakeDispatchCat(),
+    });
+    defer d.deinit();
+    try d.startWorker();
+
+    var sc = F1ServeCtx{ .d = &d };
+    const th = try std.Thread.spawn(.{}, f1ServeFn, .{&sc});
+    defer {
+        d.requestShutdown();
+        th.join();
+    }
+
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-ok-prompt/meta.toml" });
+    defer a.free(meta_path);
+    const deadline = std.time.milliTimestamp() + 5000;
+    try std.testing.expect(try waitMetaContains(a, meta_path, "status = \"completed\"", deadline));
+
+    const log = try readAuditLogF1(a, s.abs_path);
+    defer a.free(log);
+    // Regression guard: no denied lines in the audit log on the happy path.
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"outcome\":\"denied\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, log, "\"reason\":\"capability_denied\"") == null);
+}
+
+test "F1: policy denial on one item does not break subsequent ticks for sibling items" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "f1-sibling");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    // Identity allows openai but not anthropic — item 0001 (anthropic)
+    // will be denied; item 0002 (openai) must still proceed.
+    try writeIdentityCaps(a, s.abs_path, "[\"provider.openai\", \"stack.*.*\"]");
+
+    // Stack allows both claude and codex so the harness allowlist gate
+    // doesn't pre-empt either item.
+    const dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "demo" });
+    defer a.free(dir);
+    try std.fs.cwd().makePath(dir);
+    {
+        const cfg_path = try std.fs.path.join(a, &.{ dir, "stack.toml" });
+        defer a.free(cfg_path);
+        var f = try std.fs.cwd().createFile(cfg_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\description = "F1 sibling stack"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\paused = false
+            \\continuity = "fresh"
+            \\max_concurrent_per_stack = 1
+            \\allowed_harnesses = ["claude", "codex"]
+            \\
+        );
+    }
+    try seedAnthropicItem(a, s.abs_path, "demo", "0001", "denied");
+    // Item 0002 targets openai (→ codex harness, allowed).
+    {
+        const body =
+            \\id = "0002"
+            \\slug = "ok"
+            \\kind = "prompt"
+            \\status = "queued"
+            \\created_at = 2026-05-10T14:00:00Z
+            \\updated_at = 2026-05-10T14:00:00Z
+            \\
+            \\[target]
+            \\provider = "openai"
+            \\match = "exact"
+            \\
+        ;
+        try seedItem(a, s.abs_path, "demo", "0002", "ok", body);
+    }
+
+    const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
+    defer a.free(fixture);
+    const script = try absFixturePath(a, "harness/cat_jsonl.sh");
+    defer a.free(script);
+    const cs = CatScript{ .fixture_abs = fixture, .script_abs = script };
+    GLOBAL_CAT_SCRIPT = &cs;
+    defer GLOBAL_CAT_SCRIPT = null;
+
+    var d = try daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .check_repo_conflicts = false,
+        .enable_runtime = true,
+        .dispatch = fakeDispatchCat(),
+    });
+    defer d.deinit();
+    try d.startWorker();
+
+    var sc = F1ServeCtx{ .d = &d };
+    const th = try std.Thread.spawn(.{}, f1ServeFn, .{&sc});
+    defer {
+        d.requestShutdown();
+        th.join();
+    }
+
+    // 0001 must reach blocked; 0002 must reach completed. Polling for each
+    // independently lets us tolerate any tick ordering.
+    const meta1 = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-denied/meta.toml" });
+    defer a.free(meta1);
+    const meta2 = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0002-ok/meta.toml" });
+    defer a.free(meta2);
+    const deadline = std.time.milliTimestamp() + 8000;
+    try std.testing.expect(try waitMetaContains(a, meta1, "status = \"blocked\"", deadline));
+    try std.testing.expect(try waitMetaContains(a, meta2, "status = \"completed\"", deadline));
+}
