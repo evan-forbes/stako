@@ -106,6 +106,29 @@ test "init: on a fresh empty dir creates the documented layout" {
     try std.testing.expect(fileExists(&d, ".git"));
 }
 
+test "init: creates the requested notes root when it does not exist" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "create-root-parent");
+    defer s.deinit();
+
+    const root = try std.fs.path.join(a, &.{ s.abs_path, "stako" });
+    defer a.free(root);
+
+    var report = try init_mod.run(a, .{
+        .root = root,
+        .yes = true,
+        .quiet = true,
+        .now_override = "2026-05-10T14:00:00Z",
+        .rng_seed_override = 0x123456,
+    });
+    defer report.deinit();
+
+    var d = try std.fs.openDirAbsolute(root, .{ .iterate = true });
+    defer d.close();
+    try std.testing.expect(fileExists(&d, "stacks/default/stack.toml"));
+    try std.testing.expect(fileExists(&d, ".stako/config.toml"));
+}
+
 test "init: credential dir has 0700 and local_token has 0600 (POSIX)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;

@@ -1158,6 +1158,7 @@ test "runtime: input item summary materializes rendered prompt before dispatch" 
     const buf = try a.alloc(u8, stat.size);
     defer a.free(buf);
     _ = try f.readAll(buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "## Stako I/O Contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "base prompt\n\n---\n\n## Registered Inputs") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "Source: stacks/demo/0001-plan/output/summary.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "prior item summary") != null);

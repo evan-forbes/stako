@@ -25,6 +25,7 @@ const daemon_mod = @import("daemon.zig");
 const cli_stack = @import("cli_stack.zig");
 const cli_routine = @import("cli_routine.zig");
 const harness_dispatch = @import("harness_dispatch.zig");
+const paths = @import("paths.zig");
 
 pub const UsageError = error{
     NoSubcommand,
@@ -116,7 +117,7 @@ pub const DaemonAction = enum {
 
 pub const DaemonArgs = struct {
     action: DaemonAction,
-    root: []const u8 = ".",
+    root: []const u8 = paths.DEFAULT_NOTES_ROOT,
     /// Override `daemon.port` from config.
     port_override: ?u16 = null,
     /// When true, run the daemon in the foreground instead of forking.
@@ -147,8 +148,8 @@ pub fn parseDaemonArgs(args: []const []const u8) UsageError!DaemonArgs {
 }
 
 pub const InitArgs = struct {
-    /// Defaults to "." (cwd) when --root is absent.
-    root: []const u8 = ".",
+    /// Defaults to the user's visible stako notes root when --root is absent.
+    root: []const u8 = paths.DEFAULT_NOTES_ROOT,
     yes: bool = false,
     quiet: bool = false,
     /// Hidden: override `created_at` for deterministic fixture regeneration.
@@ -253,7 +254,7 @@ pub const StackAction = enum {
 /// Flags shared by every API-touching subcommand. Initialized from the
 /// command line; merged with config / env in `http_client.open`.
 pub const ApiFlags = struct {
-    root: []const u8 = ".",
+    root: []const u8 = paths.DEFAULT_NOTES_ROOT,
     port_override: ?u16 = null,
     json: bool = false,
     verbose: bool = false,
@@ -662,8 +663,10 @@ fn runDaemon(
 
     switch (parsed.action) {
         .start => {
+            const root = try paths.resolveNotesRoot(allocator, parsed.root);
+            defer allocator.free(root);
             var d = daemon_mod.start(allocator, .{
-                .notes_root = parsed.root,
+                .notes_root = root,
                 .port_override = parsed.port_override,
                 .enable_runtime = true,
                 .dispatch = harness_dispatch.dispatch(),
@@ -698,7 +701,9 @@ fn runDaemon(
             return 0;
         },
         .stop => {
-            const result = daemon_mod.stop(allocator, parsed.root, 5) catch |e| {
+            const root = try paths.resolveNotesRoot(allocator, parsed.root);
+            defer allocator.free(root);
+            const result = daemon_mod.stop(allocator, root, 5) catch |e| {
                 try stderr.print("stako daemon stop: failed: {s}\n", .{@errorName(e)});
                 return 1;
             };
@@ -713,7 +718,9 @@ fn runDaemon(
             return 0;
         },
         .status => {
-            const info = daemon_mod.readPidFile(allocator, parsed.root) catch |e| {
+            const root = try paths.resolveNotesRoot(allocator, parsed.root);
+            defer allocator.free(root);
+            const info = daemon_mod.readPidFile(allocator, root) catch |e| {
                 try stderr.print("stako daemon status: failed: {s}\n", .{@errorName(e)});
                 return 1;
             };
@@ -776,8 +783,11 @@ fn runInit(
         return 2;
     };
 
+    const root = try paths.resolveNotesRoot(allocator, parsed.root);
+    defer allocator.free(root);
+
     var report = init_mod.run(allocator, .{
-        .root = parsed.root,
+        .root = root,
         .yes = parsed.yes,
         .quiet = parsed.quiet,
         .now_override = parsed.now_override,
@@ -852,7 +862,7 @@ fn printInitUsage(w: anytype) !void {
     try w.writeAll(
         \\Usage: stako init [--root, -r <path>] [--yes, -y] [--quiet, -q]
         \\
-        \\  --root, -r <path>   Path to the notes root (default: cwd).
+        \\  --root, -r <path>   Path to the notes root (default: ~/stako).
         \\  --yes, -y           Skip prompts; auto-init git when needed.
         \\  --quiet, -q         Suppress per-line output; print a summary only.
         \\
@@ -925,7 +935,7 @@ fn printReport(w: anytype, r: *const init_mod.Report, quiet: bool) !void {
 
 test "parseInitArgs: defaults" {
     const a = try parseInitArgs(&.{});
-    try std.testing.expectEqualStrings(".", a.root);
+    try std.testing.expectEqualStrings(paths.DEFAULT_NOTES_ROOT, a.root);
     try std.testing.expect(!a.yes);
     try std.testing.expect(!a.quiet);
 }

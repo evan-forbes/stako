@@ -9,7 +9,7 @@
 - The notes root contains both user-visible content and a daemon state subtree.
 - User-visible stack content lives at `<notes-root>/stacks/<name>/`.
 - Daemon state lives at `<notes-root>/.stako/`, gitignored except for `config.toml`.
-- `stako init` is idempotent: re-running on an already-initialized root is a no-op (plus a confirmation message).
+- `stako init` defaults to `~/stako`, creates the notes root if it is missing, and is idempotent: re-running on an already-initialized root is a no-op (plus a confirmation message).
 - The notes root must be a git repository. If it is not, `stako init` initializes one (after confirmation when run interactively).
 - **Init inside an existing git repo**: proceed without auto `git init`, print a warning that the stako layout will join the existing repo's history.
 - **Default stack creation**: eager at `init` time. `stacks/default/` is created with an empty `stack.toml` carrying defaults.
@@ -119,7 +119,7 @@ Load order: `config.toml` first, then `config.local.toml` is merged on top, last
 
 ## stako init Behavior
 
-1. Resolve the notes root (cwd, override via `--root <path>`).
+1. Resolve the notes root (`~/stako` by default, override via `--root <path>`), creating the directory if missing.
 2. If the root is not a git repo, prompt to `git init` it (or proceed automatically when `--yes`).
 3. Create the layout above if pieces are missing. Never overwrite an existing `config.toml`.
 4. Generate `.stako/local_token` if absent. Never rewrite it once created.

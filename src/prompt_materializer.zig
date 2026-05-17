@@ -9,6 +9,13 @@ const item_mod = @import("item.zig");
 
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
+pub const IO_CONTRACT =
+    \\## Stako I/O Contract
+    \\
+    \\Treat registered inputs as the explicit input packet for this prompt. When prior commits are listed, use them as the relevant commit context and inspect git history only as needed for that context. Keep the final response suitable for `output/summary.md`: state the result, list durable outputs or decisions, and name any follow-up prompt, thread, routine, item, or commit context that should be passed forward.
+    \\
+;
+
 pub const Error = error{
     InputMissing,
     InputTooLarge,
@@ -23,6 +30,10 @@ pub fn hasRegisteredInputs(item: *const item_mod.Item) bool {
         (inp.commits != null and inp.commits.?.len > 0);
 }
 
+pub fn shouldMaterializePrompt(item: *const item_mod.Item) bool {
+    return item.kind == .prompt;
+}
+
 pub fn materializePrompt(
     allocator: std.mem.Allocator,
     notes_root_abs: []const u8,
@@ -30,7 +41,7 @@ pub fn materializePrompt(
     item: *const item_mod.Item,
     item_dir_abs: []const u8,
 ) Error!void {
-    if (!hasRegisteredInputs(item)) return;
+    if (!shouldMaterializePrompt(item)) return;
     const rendered = try resolvePrompt(allocator, notes_root_abs, stack_name, item, item_dir_abs);
     defer allocator.free(rendered);
     const path = try std.fs.path.join(allocator, &.{ item_dir_abs, "rendered_prompt.md" });
@@ -49,7 +60,7 @@ pub fn resolvePrompt(
 ) Error![]u8 {
     const base = try readBasePrompt(allocator, item, item_dir_abs);
     defer allocator.free(base);
-    if (!hasRegisteredInputs(item)) return allocator.dupe(u8, base);
+    if (!hasRegisteredInputs(item)) return renderPrompt(allocator, base, .prepend, &.{});
 
     var sections = std.ArrayList(InputSection){};
     defer {
@@ -102,7 +113,7 @@ pub fn resolvePrompt(
                 .kind = .commit,
                 .title = try allocator.dupe(u8, commit),
                 .source = null,
-                .content = try allocator.dupe(u8, "(recorded for traceability; content not expanded in v1)"),
+                .content = try allocator.dupe(u8, "Use this commit as relevant context. Inspect the notes/workdir git history for the commit diff and surrounding commits when the task needs those details."),
             });
         }
     }
@@ -134,19 +145,21 @@ fn renderPrompt(
     var inputs_buf = std.ArrayList(u8){};
     defer inputs_buf.deinit(allocator);
     const iw = inputs_buf.writer(allocator);
-    try iw.writeAll("## Registered Inputs\n");
-    for (sections) |s| {
-        try iw.writeByte('\n');
-        switch (s.kind) {
-            .item => {
-                try iw.print("### Item {s}\n\n", .{s.title});
-                if (s.source) |src| try iw.print("Source: {s}\n\n", .{src});
-            },
-            .file => try iw.print("### File {s}\n\n", .{s.title}),
-            .commit => try iw.print("### Commit {s}\n\n", .{s.title}),
+    if (sections.len > 0) {
+        try iw.writeAll("## Registered Inputs\n");
+        for (sections) |s| {
+            try iw.writeByte('\n');
+            switch (s.kind) {
+                .item => {
+                    try iw.print("### Item {s}\n\n", .{s.title});
+                    if (s.source) |src| try iw.print("Source: {s}\n\n", .{src});
+                },
+                .file => try iw.print("### File {s}\n\n", .{s.title}),
+                .commit => try iw.print("### Commit {s}\n\n", .{s.title}),
+            }
+            try iw.writeAll(s.content);
+            if (!std.mem.endsWith(u8, s.content, "\n")) try iw.writeByte('\n');
         }
-        try iw.writeAll(s.content);
-        if (!std.mem.endsWith(u8, s.content, "\n")) try iw.writeByte('\n');
     }
     const inputs_rendered = try inputs_buf.toOwnedSlice(allocator);
     defer allocator.free(inputs_rendered);
@@ -154,15 +167,21 @@ fn renderPrompt(
     var out = std.ArrayList(u8){};
     errdefer out.deinit(allocator);
     const w = out.writer(allocator);
+    try w.writeAll(IO_CONTRACT);
+    try w.writeAll("---\n\n");
     switch (mode) {
         .append => {
             try w.writeAll(base);
-            try w.writeAll("\n\n---\n\n");
-            try w.writeAll(inputs_rendered);
+            if (inputs_rendered.len > 0) {
+                try w.writeAll("\n\n---\n\n");
+                try w.writeAll(inputs_rendered);
+            }
         },
         .prepend => {
-            try w.writeAll(inputs_rendered);
-            try w.writeAll("\n---\n\n");
+            if (inputs_rendered.len > 0) {
+                try w.writeAll(inputs_rendered);
+                try w.writeAll("\n---\n\n");
+            }
             try w.writeAll(base);
         },
     }
@@ -277,7 +296,39 @@ test "render prompt appends registered item input" {
     defer a.free(item_dir);
     const rendered = try resolvePrompt(a, root, "demo", &it, item_dir);
     defer a.free(rendered);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, IO_CONTRACT));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "base prompt\n\n---\n\n## Registered Inputs") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Source: stacks/demo/0001-plan/output/summary.md") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "prior summary") != null);
+}
+
+test "render prompt prepends I/O contract without registered inputs" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("stacks/demo/0001-next");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-next/prompt.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("base prompt");
+    }
+    var it = item_mod.Item{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0001",
+        .slug = "next",
+        .kind = .prompt,
+        .status = .queued,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer it.deinit();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+    const item_dir = try std.fs.path.join(a, &.{ root, "stacks/demo/0001-next" });
+    defer a.free(item_dir);
+    const rendered = try resolvePrompt(a, root, "demo", &it, item_dir);
+    defer a.free(rendered);
+    try std.testing.expect(std.mem.startsWith(u8, rendered, IO_CONTRACT));
+    try std.testing.expect(std.mem.endsWith(u8, rendered, "base prompt"));
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "## Registered Inputs") == null);
 }

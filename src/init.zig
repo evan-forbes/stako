@@ -86,6 +86,11 @@ pub const GITIGNORE_LINES = [_][]const u8{
 
 /// Resolve `root` and run `stako init`. Caller owns the returned report.
 pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
+    std.fs.cwd().makePath(opts.root) catch |e| switch (e) {
+        error.PathAlreadyExists => {},
+        else => return e,
+    };
+
     // Open the notes root (must already exist as a directory).
     var root_dir = std.fs.cwd().openDir(opts.root, .{ .iterate = true }) catch |e| switch (e) {
         error.FileNotFound, error.NotDir => return error.RootNotADirectory,

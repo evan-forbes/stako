@@ -382,7 +382,7 @@ pub const Supervisor = struct {
             }
         }
 
-        if (prompt_materializer.hasRegisteredInputs(item)) {
+        if (prompt_materializer.shouldMaterializePrompt(item)) {
             const dir_name = try std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ item.id, item.slug });
             defer self.allocator.free(dir_name);
             const item_dir_abs = try std.fs.path.join(self.allocator, &.{ self.opts.notes_root_abs, "stacks", stack_name, dir_name });
@@ -451,7 +451,7 @@ pub const Supervisor = struct {
             }
         }
 
-        if (prompt_materializer.hasRegisteredInputs(item)) {
+        if (prompt_materializer.shouldMaterializePrompt(item)) {
             const dir_name = try std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ item.id, item.slug });
             defer self.allocator.free(dir_name);
             const item_dir_abs = try std.fs.path.join(self.allocator, &.{ self.opts.notes_root_abs, "stacks", stack_name, dir_name });

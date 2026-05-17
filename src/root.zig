@@ -42,6 +42,7 @@ pub const provider_status = @import("provider_status.zig");
 pub const cli_auth = @import("cli_auth.zig");
 pub const html = @import("html.zig");
 pub const policy = @import("policy.zig");
+pub const paths = @import("paths.zig");
 
 pub const Status = state.Status;
 pub const Kind = item.Kind;

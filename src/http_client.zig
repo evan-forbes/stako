@@ -20,6 +20,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 const local_token = @import("local_token.zig");
+const paths = @import("paths.zig");
 
 /// We use `anyerror` for the public surface because the combined error set of
 /// network + file + config-loading is broad and unlikely to be exhaustively
@@ -79,6 +80,9 @@ pub const Response = struct {
 /// (tolerant of missing files) and optionally the local token. Caller owns
 /// the returned client and must call `deinit`.
 pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
+    const root = try paths.resolveNotesRoot(allocator, opts.root);
+    defer allocator.free(root);
+
     // Port resolution.
     var port: u16 = 7421;
     // Missing `.stako/` is the common case (user invokes from outside an
@@ -88,7 +92,7 @@ pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
     // user sees a confusing "daemon not started" against a daemon that's
     // actually listening on the configured port.
     blk: {
-        var cfg = config_mod.loadFromRoot(allocator, opts.root) catch |e| switch (e) {
+        var cfg = config_mod.loadFromRoot(allocator, root) catch |e| switch (e) {
             error.FileNotFound, error.NotDir => break :blk,
             else => return e,
         };
@@ -112,7 +116,7 @@ pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
     // Token (optional). If `.stako/local_token` exists, use it. Otherwise
     // we proceed without one — read endpoints don't require it.
     var token_owned: ?[]u8 = null;
-    if (loadTokenIfPresent(allocator, opts.root)) |t| {
+    if (loadTokenIfPresent(allocator, root)) |t| {
         token_owned = t;
     } else |_| {}
 

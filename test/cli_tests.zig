@@ -494,13 +494,21 @@ test "cli: init re-run prints the `already initialized` line and exits 0" {
     try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "already initialized") != null);
 }
 
-test "cli: init on a missing root exits 1 with a useful stderr message" {
+test "cli: init on a missing root creates it" {
     const a = std.testing.allocator;
-    var r = try runCli(a, &.{ "init", "--root", "/path/does/not/exist/anywhere/12345", "--yes", "--quiet" });
+    var s = try Scratch.create(a, "init-create-root-parent");
+    defer s.deinit();
+
+    const root = try std.fs.path.join(a, &.{ s.abs_path, "stako" });
+    defer a.free(root);
+
+    var r = try runCli(a, &.{ "init", "--root", root, "--yes", "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
     defer r.deinit();
-    try std.testing.expectEqual(@as(u8, 1), r.code);
-    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "stako init:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "RootNotADirectory") != null);
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    var d = try std.fs.openDirAbsolute(root, .{});
+    defer d.close();
+    try d.access(".stako/local_token", .{});
+    try d.access("stacks/default/stack.toml", .{});
 }
 
 test "cli: init --now= malformed rejected at parse time (exit 2)" {

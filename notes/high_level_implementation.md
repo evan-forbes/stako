@@ -5,7 +5,7 @@ This document covers *how* the daemon, web view, CLI, provider dispatch, and loc
 ## Build Order
 
 1. Stack item file format (per-item directory, `meta.toml` schema).
-2. On-disk layout + `stako init` (creates one `stacks/` directory and `.stako/` under the notes root).
+2. On-disk layout + `stako init` (defaults to `~/stako`, creates one `stacks/` directory and `.stako/` under the notes root).
 3. Daemon skeleton: start/stop, loopback HTTP server, local bearer token, read/list/show endpoints.
 4. CLI client wrapping those read endpoints, with short aliases and short flags for common inspection/debugging commands.
 5. Mutation endpoints: append, insert, retry, cancel, supersede, pause, resume, stack config — wired to the single-writer queue and version-control commits.
