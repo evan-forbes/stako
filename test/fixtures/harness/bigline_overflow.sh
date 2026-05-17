@@ -5,8 +5,8 @@
 # drop the run-on payload and emit one `error` event into the transcript.
 set -u
 echo '{"kind":"session_started","data":{"harness":"claude","model":"claude-opus-4-7","session":"sess-bigline"}}'
-# 1.5 MiB of 'x' on a single (newline-less) line.
-awk 'BEGIN { for (i = 0; i < 1536; i++) for (j = 0; j < 1024; j++) printf("x") }'
+# 1.5 MiB of 'x' with no newlines. head -c + tr is far faster than awk.
+head -c 1572864 </dev/zero | tr '\0' 'x'
 printf '\n'
 echo '{"kind":"session_ended","data":{"terminal_status":"completed","exit_code":0}}'
 exit 0

@@ -2849,3 +2849,97 @@ test "F1: policy denial on one item does not break subsequent ticks for sibling 
     try std.testing.expect(try waitMetaContains(a, meta1, "status = \"blocked\"", deadline));
     try std.testing.expect(try waitMetaContains(a, meta2, "status = \"completed\"", deadline));
 }
+
+// ---------- F2 (follow-up): line-buffer overflow E2E ----------
+//
+// The LineBuffer cap + emitLineBufOverflow path is unit-tested in
+// src/session_manager.zig. This E2E pins the real subprocess→pump→cap→
+// transcript chain: the script emits a valid session_started, then >1
+// MiB of 'x' with no newline, then a clean session_ended. The cap must
+// drop the run-on payload and surface a `line_buf_overflow` `error`
+// event in the transcript so the UI records the loss.
+
+test "F2: stdout >1 MiB run-on line is dropped and an error event lands in the transcript" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "f2-bigline");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+
+    const item_body =
+        \\id = "0001"
+        \\slug = "bigline"
+        \\kind = "prompt"
+        \\status = "queued"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+        \\[target]
+        \\match = "any"
+        \\
+    ;
+    try seedItem(a, s.abs_path, "demo", "0001", "bigline", item_body);
+
+    const script = try absFixturePath(a, "harness/bigline_overflow.sh");
+    defer a.free(script);
+    const sc = StubbornScript{ .script_abs = script };
+    GLOBAL_STUBBORN = &sc;
+    defer GLOBAL_STUBBORN = null;
+
+    var d = try daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .check_repo_conflicts = false,
+        .enable_runtime = true,
+        .dispatch = fakeDispatchStubborn(),
+    });
+    defer d.deinit();
+    try d.startWorker();
+
+    var sc_serve = F1ServeCtx{ .d = &d };
+    const th = try std.Thread.spawn(.{}, f1ServeFn, .{&sc_serve});
+    defer {
+        d.requestShutdown();
+        th.join();
+    }
+
+    // Wait until the item reaches a terminal status (completed or failed
+    // — either is acceptable; the assertion below is about the overflow
+    // event, not the outcome).
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-bigline/meta.toml" });
+    defer a.free(meta_path);
+    const deadline = std.time.milliTimestamp() + 15000;
+    var done = false;
+    while (std.time.milliTimestamp() < deadline) {
+        var mf = std.fs.cwd().openFile(meta_path, .{}) catch {
+            std.Thread.sleep(20 * std.time.ns_per_ms);
+            continue;
+        };
+        defer mf.close();
+        const stat = try mf.stat();
+        const buf = try a.alloc(u8, stat.size);
+        defer a.free(buf);
+        _ = try mf.readAll(buf);
+        if (std.mem.indexOf(u8, buf, "status = \"completed\"") != null or
+            std.mem.indexOf(u8, buf, "status = \"failed\"") != null)
+        {
+            done = true;
+            break;
+        }
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(done);
+
+    // Transcript must carry the overflow signal. The pump emits a kind
+    // = "error" event with message = "line_buf_overflow" — search the
+    // raw NDJSON for both markers.
+    const item_dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-bigline" });
+    defer a.free(item_dir);
+    const t_buf = try fake.readTranscript(a, item_dir);
+    defer a.free(t_buf);
+    try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"kind\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"message\":\"line_buf_overflow\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"stream\":\"stdout\"") != null);
+}
