@@ -2943,3 +2943,139 @@ test "F2: stdout >1 MiB run-on line is dropped and an error event lands in the t
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"message\":\"line_buf_overflow\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"stream\":\"stdout\"") != null);
 }
+
+// ---------- F4 (follow-up): enable_sse status matrix ----------
+//
+// The item-page HTML embeds a `new EventSource("/stacks/.../events")`
+// subscription script only when the item is in status `running` AND
+// the daemon has a live SSE hub (i.e. the runtime is wired). For every
+// other status — queued, paused, blocked, completed, failed,
+// canceled, superseded — the page is rendered static and the user
+// must refresh to see updates.
+//
+// Decision recorded here: keep the gate as `status == .running` only.
+// Live updates for queued/paused/blocked would be reasonable future
+// work (they're non-terminal and might transition while the page is
+// open), but expanding the gate is a behavior change, not a coverage
+// fix. These tests pin the current contract; widening the gate later
+// must update them deliberately.
+
+fn seedItemWithStatus(
+    a: std.mem.Allocator,
+    root: []const u8,
+    stack: []const u8,
+    id: []const u8,
+    slug: []const u8,
+    status_str: []const u8,
+) !void {
+    // `running` items also need a runtime_file present, but only for the
+    // restart-orphan sweep — the HTML render path doesn't require it.
+    // Skipping it keeps these tests focused on the render gate.
+    const body = try std.fmt.allocPrint(a,
+        \\id = "{s}"
+        \\slug = "{s}"
+        \\kind = "prompt"
+        \\status = "{s}"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+    , .{ id, slug, status_str });
+    defer a.free(body);
+    try seedItem(a, root, stack, id, slug, body);
+}
+
+fn getItemHtmlWithRuntime(
+    a: std.mem.Allocator,
+    root: []const u8,
+    stack: []const u8,
+    item_id: []const u8,
+    slug: []const u8,
+) ![]u8 {
+    // Need enable_runtime=true so the daemon owns a live SSE hub; the
+    // gate evaluates `sse_hub != null and status == .running`.
+    var d = try daemon_mod.start(a, .{
+        .notes_root = root,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .check_repo_conflicts = false,
+        .enable_runtime = true,
+        .dispatch = fakeDispatchCat(),
+    });
+    try d.startWorker();
+    defer d.deinit();
+
+    var sc = F1ServeCtx{ .d = &d };
+    const th = try std.Thread.spawn(.{}, f1ServeFn, .{&sc});
+    defer {
+        d.requestShutdown();
+        th.join();
+    }
+
+    const path = try std.fmt.allocPrint(a, "/stacks/{s}/items/{s}", .{ stack, item_id });
+    defer a.free(path);
+    const req = try std.fmt.allocPrint(a,
+        "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept: text/html\r\n\r\n",
+        .{path});
+    defer a.free(req);
+    // Suppress unused-var warning when slug is only for the meta filename.
+    _ = slug;
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", d.bound_port);
+    var stream = try std.net.tcpConnectToAddress(addr);
+    defer stream.close();
+    try stream.writeAll(req);
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(a);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = stream.read(&tmp) catch break;
+        if (n == 0) break;
+        try buf.appendSlice(a, tmp[0..n]);
+        if (buf.items.len > 1024 * 1024) break;
+    }
+    return buf.toOwnedSlice(a);
+}
+
+fn assertSseGate(
+    a: std.mem.Allocator,
+    status_str: []const u8,
+    should_have_eventsource: bool,
+) !void {
+    const tag = try std.fmt.allocPrint(a, "f4-sse-{s}", .{status_str});
+    defer a.free(tag);
+    var s = try Scratch.create(a, tag);
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try seedStack(a, s.abs_path, "demo", false);
+    try seedItemWithStatus(a, s.abs_path, "demo", "0001", "p", status_str);
+
+    const resp = try getItemHtmlWithRuntime(a, s.abs_path, "demo", "0001", "p");
+    defer a.free(resp);
+    const present = std.mem.indexOf(u8, resp, "new EventSource(\"/stacks/demo/events\")") != null;
+    try std.testing.expectEqual(should_have_eventsource, present);
+}
+
+test "F4: enable_sse = true only for running items (running)" {
+    try assertSseGate(std.testing.allocator, "running", true);
+}
+
+test "F4: enable_sse = false for queued items" {
+    try assertSseGate(std.testing.allocator, "queued", false);
+}
+
+test "F4: enable_sse = false for blocked items" {
+    try assertSseGate(std.testing.allocator, "blocked", false);
+}
+
+test "F4: enable_sse = false for paused items" {
+    try assertSseGate(std.testing.allocator, "paused", false);
+}
+
+test "F4: enable_sse = false for completed items" {
+    try assertSseGate(std.testing.allocator, "completed", false);
+}
+
+test "F4: enable_sse = false for failed items" {
+    try assertSseGate(std.testing.allocator, "failed", false);
+}
