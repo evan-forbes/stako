@@ -9,13 +9,13 @@
 
 ## Design Context
 
-Organo should integrate tightly with Neovim Markdown workflows. The editor should make notes and indexes easy to navigate and update without requiring the user to leave the writing flow.
+Stako should integrate tightly with Neovim Markdown workflows. The editor should make notes and indexes easy to navigate and update without requiring the user to leave the writing flow.
 
 ## Research Before Implementation
 
 - Identify the current Markdown plugin or Neovim setup to modify.
 - Determine whether existing plugins already provide link following, wrapping, and completion that can be configured instead of rewritten.
-- Define how Neovim discovers the canonical Organo notes repository.
+- Define how Neovim discovers the canonical Stako notes repository.
 - Determine the completion source format for indexed links and tags.
 - Determine how indexing should be triggered from Neovim: on save, explicit command, macro, or deferred job.
 - Define toggle behavior for index completion so it does not interfere with normal writing.
@@ -23,7 +23,7 @@ Organo should integrate tightly with Neovim Markdown workflows. The editor shoul
 
 ## Planning Notes
 
-- Neovim should call Organo services rather than duplicating indexing logic.
+- Neovim should call Stako services rather than duplicating indexing logic.
 - Completion should be fast enough for large note repositories.
 - Toggle state should be visible but not noisy.
 - Auto-wrap should respect Markdown lists, code blocks, headings, and existing formatting.
@@ -31,10 +31,10 @@ Organo should integrate tightly with Neovim Markdown workflows. The editor shoul
 ## Implementation Plan Draft
 
 - Document the current Neovim Markdown workflow.
-- Define Organo CLI commands or local APIs needed by Neovim.
-- Implement link-following behavior for normal Markdown links and Organo source syntax.
+- Define Stako CLI commands or local APIs needed by Neovim.
+- Implement link-following behavior for normal Markdown links and Stako source syntax.
 - Implement completion source backed by the index.
-- Add a command or keybinding to toggle Organo index completion.
+- Add a command or keybinding to toggle Stako index completion.
 - Add a save hook or explicit mapping to trigger indexing.
 - Test with representative notes, tags, project files, and stack files.
 
@@ -44,7 +44,7 @@ Organo should integrate tightly with Neovim Markdown workflows. The editor shoul
 - Indexed notes/tags can be completed through tab or fuzzy completion.
 - Completion can be toggled on and off.
 - Auto-wrap works without corrupting Markdown structures.
-- Neovim-triggered indexing integrates with Organo indexing service.
+- Neovim-triggered indexing integrates with Stako indexing service.
 
 ## Dependencies
 

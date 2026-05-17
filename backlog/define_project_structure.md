@@ -8,7 +8,7 @@
 
 ## Design Context
 
-Projects are the core unit of active work. Organo assumes one canonical notes repository, and active projects are expected to live under:
+Projects are the core unit of active work. Stako assumes one canonical notes repository, and active projects are expected to live under:
 
 ```text
 notes/a/proj

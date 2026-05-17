@@ -28,7 +28,7 @@ pub fn build(b: *std.Build) void {
     // to our consumers. We must give it a name because a Zig package can expose
     // multiple modules and consumers will need to be able to specify which
     // module they want to access.
-    const mod = b.addModule("organo", .{
+    const mod = b.addModule("stako", .{
         // The root source file is the "entry point" of this module. Users of
         // this module will only be able to access public declarations contained
         // in this file, which means that if you have declarations that you
@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
     // If neither case applies to you, feel free to delete the declaration you
     // don't need and to put everything under a single module.
     const exe = b.addExecutable(.{
-        .name = "organo",
+        .name = "stako",
         .root_module = b.createModule(.{
             // b.createModule defines a new module just like b.addModule but,
             // unlike b.addModule, it does not expose the module to consumers of
@@ -73,12 +73,12 @@ pub fn build(b: *std.Build) void {
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
-                // Here "organo" is the name you will use in your source code to
-                // import this module (e.g. `@import("organo")`). The name is
+                // Here "stako" is the name you will use in your source code to
+                // import this module (e.g. `@import("stako")`). The name is
                 // repeated because you are allowed to rename your imports, which
                 // can be extremely useful in case of collisions (which can happen
                 // importing modules from different packages).
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
@@ -136,7 +136,7 @@ pub fn build(b: *std.Build) void {
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     // Milestone 1: stack item file format tests live under test/.
-    // These tests import the `organo` module and load fixtures from disk;
+    // These tests import the `stako` module and load fixtures from disk;
     // they run from the build root.
     const item_format_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -144,7 +144,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
@@ -160,7 +160,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
@@ -177,7 +177,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
@@ -187,24 +187,24 @@ pub fn build(b: *std.Build) void {
     // Milestone 4: CLI read-path tests. Spawns the daemon ephemerally and
     // drives `cli.dispatch` in-process plus one subprocess invocation against
     // the installed binary. The subprocess test depends on the install step
-    // so `zig-out/bin/organo` exists at runtime; we wire that explicitly.
+    // so `zig-out/bin/stako` exists at runtime; we wire that explicitly.
     const cli_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/cli_tests.zig"),
             .target = target,
             .optimize = optimize,
-            // Links libc for the ORGANO_PORT env-override test, which uses
+            // Links libc for the STAKO_PORT env-override test, which uses
             // `setenv` to mutate the process environment in-place. No other
             // module needs libc.
             .link_libc = true,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
     run_cli_tests.setCwd(b.path("."));
-    // The subprocess test reads `zig-out/bin/organo`; make sure the binary
+    // The subprocess test reads `zig-out/bin/stako`; make sure the binary
     // is installed before the test runs.
     run_cli_tests.step.dependOn(b.getInstallStep());
 
@@ -217,7 +217,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
@@ -235,7 +235,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
@@ -245,7 +245,7 @@ pub fn build(b: *std.Build) void {
     // Milestone 7: Claude/Codex adapter integration tests. Uses scripted
     // JSONL fixtures via bash cat_jsonl.sh so the default test run is
     // mock-only and never reaches the network. Real-provider smoke tests
-    // are gated by the ORGANO_WITH_REAL_CREDENTIALS env var and tagged
+    // are gated by the STAKO_WITH_REAL_CREDENTIALS env var and tagged
     // `@integration:provider:<name>`.
     const adapter_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -253,7 +253,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
@@ -270,7 +270,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });
@@ -287,7 +287,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "organo", .module = mod },
+                .{ .name = "stako", .module = mod },
             },
         }),
     });

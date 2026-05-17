@@ -111,7 +111,7 @@ fn writeHeader(w: anytype, title: []const u8) !void {
 }
 
 fn writeFooter(w: anytype) !void {
-    try w.writeAll("<footer>organo daemon</footer></body></html>");
+    try w.writeAll("<footer>stako daemon</footer></body></html>");
 }
 
 // ---------- page: index ----------
@@ -123,11 +123,11 @@ pub fn renderIndex(
     stacks: []const []const u8,
 ) !void {
     const w = out.writer(allocator);
-    try writeHeader(w, "organo");
-    try w.writeAll("<header><h1>organo</h1></header>");
+    try writeHeader(w, "stako");
+    try w.writeAll("<header><h1>stako</h1></header>");
     try w.writeAll("<h2>Stacks</h2>");
     if (stacks.len == 0) {
-        try w.writeAll("<p><em>No stacks yet. Run <code>organo stack create &lt;name&gt;</code>.</em></p>");
+        try w.writeAll("<p><em>No stacks yet. Run <code>stako stack create &lt;name&gt;</code>.</em></p>");
     } else {
         try w.writeAll("<ul>");
         for (stacks) |name| {
@@ -689,7 +689,7 @@ test "renderIndex: empty stack list" {
     var out = std.ArrayList(u8){};
     defer out.deinit(a);
     try renderIndex(a, &out, &.{});
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "<title>organo</title>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<title>stako</title>") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "No stacks yet") != null);
 }
 

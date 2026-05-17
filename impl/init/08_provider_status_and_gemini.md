@@ -27,9 +27,9 @@ Make provider availability visible and predictable: Claude and Codex get status 
    - `capabilities()`
    - `login_hint()` for the exact official command or config needed when signed out.
 3. Add CLI auth/status commands with short aliases:
-   - `organo auth status` / `organo a st`
-   - `organo auth <provider>` / `organo a <provider>`
-   - `organo auth signout <provider>` / `organo a out <provider>` only where signout is safe and provider-supported.
+   - `stako auth status` / `stako a st`
+   - `stako auth <provider>` / `stako a <provider>`
+   - `stako auth signout <provider>` / `stako a out <provider>` only where signout is safe and provider-supported.
 4. Implement Anthropic/Claude status:
    - Prefer existing Claude Code CLI auth detection.
    - API-key fallback is acceptable.
@@ -45,7 +45,7 @@ Make provider availability visible and predictable: Claude and Codex get status 
 7. Attempt Gemini adapter and auth as a bonus:
    - Probe `gemini --output-format stream-json -p "ok"`.
    - If the installed CLI supports structured output, implement `parse_line`.
-   - If not, mark Gemini disabled and surface a clear status in `organo auth status`.
+   - If not, mark Gemini disabled and surface a clear status in `stako auth status`.
    - Gemini failing does not block milestone acceptance for Claude/Codex.
 8. Revisit `compact` and `clear` only if Claude/Codex resume behavior is stable:
    - `clear` is daemon-level: complete immediately and force the next item fresh.
@@ -60,7 +60,7 @@ Make provider availability visible and predictable: Claude and Codex get status 
 
 ## Acceptance
 
-- `organo auth status` accurately reports Claude and Codex availability.
+- `stako auth status` accurately reports Claude and Codex availability.
 - Claude and Codex routed items use one credential-resolution path instead of hidden ad-hoc logic.
 - Gemini is either working end-to-end or explicitly disabled with a clear reason; it is not a source of ambiguous runtime failure.
 - Provider-specific code stays behind provider/adapter interfaces; session management and transcript handling remain shared.

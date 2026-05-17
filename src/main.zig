@@ -1,10 +1,10 @@
-//! `organo` binary entry point.
+//! `stako` binary entry point.
 //!
-//! Milestone 2 wires `organo init`. Subcommand routing lives in `cli.zig`;
+//! Milestone 2 wires `stako init`. Subcommand routing lives in `cli.zig`;
 //! this file is a thin wrapper around it.
 
 const std = @import("std");
-const organo = @import("organo");
+const stako = @import("stako");
 
 pub fn main() !u8 {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
@@ -33,8 +33,8 @@ pub fn main() !u8 {
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
 
-    const code = organo.cli.dispatch(allocator, args.items, stdout, stderr) catch |e| {
-        stderr.print("organo: internal error: {s}\n", .{@errorName(e)}) catch {};
+    const code = stako.cli.dispatch(allocator, args.items, stdout, stderr) catch |e| {
+        stderr.print("stako: internal error: {s}\n", .{@errorName(e)}) catch {};
         stderr.flush() catch {};
         return 1;
     };

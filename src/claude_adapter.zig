@@ -1,7 +1,7 @@
 //! Claude Code adapter (milestone 7).
 //!
 //! Parses the JSONL emitted by `claude -p <prompt> --output-format stream-json
-//! --verbose --include-partial-messages` and maps each event onto organo's
+//! --verbose --include-partial-messages` and maps each event onto stako's
 //! normalized event schema (see `events.zig`).
 //!
 //! Mapping table (claude → normalized):

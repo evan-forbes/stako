@@ -2,7 +2,7 @@
 
 ## Scope
 
-The organo daemon is the single process that owns the stack runtime, exposes it over HTTP, renders HTML views, and dispatches to model providers. The CLI and web browser are the core v1 clients. MCP and Python wrapper clients are follow-ups.
+The stako daemon is the single process that owns the stack runtime, exposes it over HTTP, renders HTML views, and dispatches to model providers. The CLI and web browser are the core v1 clients. MCP and Python wrapper clients are follow-ups.
 
 ## Decided
 
@@ -27,11 +27,11 @@ The organo daemon is the single process that owns the stack runtime, exposes it 
 
 ### Resolved (was: To Decide)
 
-- **`organo daemon stop` mid-execution behavior**: send SIGINT to all running subprocesses, wait the configured grace period, send SIGTERM, then exit. Items that exited cleanly land in `completed`/`canceled`/`failed` per their adapter's `on_exit`. Items still alive after SIGTERM are marked `failed` with reason `daemon_shutdown`. See `design_execution_harness.md`.
+- **`stako daemon stop` mid-execution behavior**: send SIGINT to all running subprocesses, wait the configured grace period, send SIGTERM, then exit. Items that exited cleanly land in `completed`/`canceled`/`failed` per their adapter's `on_exit`. Items still alive after SIGTERM are marked `failed` with reason `daemon_shutdown`. See `design_execution_harness.md`.
 
 ### Resolved here, see other docs
 
-- **Process supervision** — plain background process; PID file and log file under `<notes-root>/.organo/`. systemd is a user concern, not a daemon dependency. (See `design_init_and_layout.md`.)
+- **Process supervision** — plain background process; PID file and log file under `<notes-root>/.stako/`. systemd is a user concern, not a daemon dependency. (See `design_init_and_layout.md`.)
 - **Port count** — single port (decided above).
 - **Mutation concurrency** — single-writer queue (decided above).
 
@@ -52,7 +52,7 @@ Stack runtime  (internal)
 
 Storage  (filesystem, under notes-root)
 ├── stacks/<name>/<id>-<slug>/       # user-visible, version-controlled
-└── .organo/
+└── .stako/
     ├── config.toml                   # daemon config, identity-capability map
     ├── credentials/                  # provider tokens, restrictive perms, gitignored
     ├── runtime/                      # live per-item subprocess state, gitignored

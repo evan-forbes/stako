@@ -3,14 +3,14 @@
 //! Owns the registry of live subprocess sessions. Each item that the
 //! runtime decides to run gets a `Session` here; on exit, the session
 //! deletes its runtime file, publishes a terminal `session_ended` event,
-//! and asks the mutation queue to write the terminal status transition.
+//! and asks the stack API to write the terminal status transition.
 //!
 //! Design constraints honored:
 //!
 //!   - The runtime is NOT a second writer: every status change goes through
-//!     the same `mutation_queue.Queue` the HTTP mutation surface uses, with
-//!     a new internal `runtime_transition` request kind that the API path
-//!     can't reach.
+//!     the same in-process `StackClient` path the HTTP mutation surface uses,
+//!     with an internal runtime transition method that the API path can't
+//!     reach.
 //!   - One item ↔ one subprocess.
 //!   - Stdout / stderr are pumped on dedicated threads through the adapter.
 //!     Normalized events fan out to the transcript file and SSE hub before
@@ -29,7 +29,7 @@ const transcript_mod = @import("transcript.zig");
 const sse_mod = @import("sse.zig");
 const audit = @import("audit.zig");
 const runtime_file = @import("runtime_file.zig");
-const mutation_queue = @import("mutation_queue.zig");
+const stack_mod = @import("stack.zig");
 
 pub const Error = error{
     SpawnFailed,
@@ -87,7 +87,7 @@ pub const Manager = struct {
     notes_root_abs: []const u8,
     hub: ?*sse_mod.Hub,
     audit_writer: *audit.Writer,
-    queue: *mutation_queue.Queue,
+    stack_registry: *stack_mod.StackRegistry,
 
     mutex: std.Thread.Mutex = .{},
     sessions: std.ArrayList(*Session) = .{},
@@ -104,14 +104,14 @@ pub const Manager = struct {
         notes_root_abs: []const u8,
         hub: ?*sse_mod.Hub,
         audit_writer: *audit.Writer,
-        queue: *mutation_queue.Queue,
+        stack_registry: *stack_mod.StackRegistry,
     ) Manager {
         return .{
             .allocator = allocator,
             .notes_root_abs = notes_root_abs,
             .hub = hub,
             .audit_writer = audit_writer,
-            .queue = queue,
+            .stack_registry = stack_registry,
         };
     }
 
@@ -322,8 +322,8 @@ pub const Manager = struct {
             }) catch {};
         } else |_| {}
 
-        // Apply queued → running through the shared mutation queue.
-        applyTransition(self.queue, .{
+        // Apply queued → running through the shared stack API.
+        applyTransition(self.stack_registry, .{
             .stack = input.stack,
             .id = input.item_id,
             .to = .running,
@@ -456,13 +456,15 @@ pub const TerminalReason = enum {
     canceled,
 };
 
-fn applyTransition(queue: *mutation_queue.Queue, input: mutation_queue.RuntimeTransitionInput) void {
-    var req = mutation_queue.Request{
-        .kind = .{ .runtime_transition = input },
-        .ident = .{ .identity = "system", .api_path = "runtime" },
-    };
-    queue.submitAndWait(&req);
-    if (req.output) |*o| o.deinit();
+fn applyTransition(registry: *stack_mod.StackRegistry, input: stack_mod.RuntimeTransitionInput) void {
+    const client = registry.localClient("system", "runtime");
+    switch (client.runtimeTransitionItem(input.stack, input)) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            ok.deinit();
+        },
+        .err => {},
+    }
 }
 
 fn stdoutPump(s: *Session) void {
@@ -618,7 +620,7 @@ fn onExitMain(s: *Session, term_opt: ?std.process.Child.Term) void {
 
     runtime_file.deleteFor(s.allocator, s.manager.notes_root_abs, s.stack, s.item_id) catch {};
 
-    const tag: mutation_queue.RuntimeTargetStatus = blk: {
+    const tag: stack_mod.RuntimeTargetStatus = blk: {
         if (canceled) break :blk .canceled;
         if (exit_code == 0) break :blk .completed;
         break :blk .failed;
@@ -643,7 +645,7 @@ fn onExitMain(s: *Session, term_opt: ?std.process.Child.Term) void {
     var ts_buf: [40]u8 = undefined;
     const completed_at = audit.nowRfc3339Millis(&ts_buf);
 
-    var input: mutation_queue.RuntimeTransitionInput = .{
+    var input: stack_mod.RuntimeTransitionInput = .{
         .stack = s.stack,
         .id = s.item_id,
         .to = tag,
@@ -657,7 +659,7 @@ fn onExitMain(s: *Session, term_opt: ?std.process.Child.Term) void {
     };
     if (tag == .failed) input.failed_reason = "subprocess_nonzero_exit";
     if (tag == .canceled) input.canceled_by = "system";
-    applyTransition(s.manager.queue, input);
+    applyTransition(s.manager.stack_registry, input);
 }
 
 /// Extract a JSON string value for `key_with_colon` (e.g. `"\"foo\":"`)

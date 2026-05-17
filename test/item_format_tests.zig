@@ -4,9 +4,9 @@
 //! so all fixture paths are relative to it.
 
 const std = @import("std");
-const organo = @import("organo");
-const item = organo.item;
-const state = organo.state;
+const stako = @import("stako");
+const item = stako.item;
+const state = stako.state;
 
 const FIXTURES = "test/fixtures/items";
 const INVALID = "test/fixtures/items_invalid";

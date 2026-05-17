@@ -1,6 +1,6 @@
 //! Per-running-item runtime state on disk (milestone 6).
 //!
-//! Path: `<notes-root>/.organo/runtime/<stack>/<id>.toml`.
+//! Path: `<notes-root>/.stako/runtime/<stack>/<id>.toml`.
 //!
 //! This is *daemon state*, not tracked notes content. Items in `running`
 //! status have a corresponding runtime file; on a clean shutdown the file
@@ -27,17 +27,17 @@ pub const RuntimeFile = struct {
 };
 
 pub fn dirPath(allocator: std.mem.Allocator, notes_root_abs: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ notes_root_abs, ".organo", "runtime" });
+    return std.fs.path.join(allocator, &.{ notes_root_abs, ".stako", "runtime" });
 }
 
 pub fn stackDirPath(allocator: std.mem.Allocator, notes_root_abs: []const u8, stack: []const u8) ![]u8 {
-    return std.fs.path.join(allocator, &.{ notes_root_abs, ".organo", "runtime", stack });
+    return std.fs.path.join(allocator, &.{ notes_root_abs, ".stako", "runtime", stack });
 }
 
 pub fn filePath(allocator: std.mem.Allocator, notes_root_abs: []const u8, stack: []const u8, id: []const u8) ![]u8 {
     const file_name = try std.fmt.allocPrint(allocator, "{s}.toml", .{id});
     defer allocator.free(file_name);
-    return std.fs.path.join(allocator, &.{ notes_root_abs, ".organo", "runtime", stack, file_name });
+    return std.fs.path.join(allocator, &.{ notes_root_abs, ".stako", "runtime", stack, file_name });
 }
 
 /// Atomically write a runtime file: write to `<file>.tmp` then rename.
@@ -161,7 +161,7 @@ pub const Orphan = struct {
     parsed: ?Parsed = null,
 };
 
-/// Walk `.organo/runtime/` and return one Orphan per file found. Caller
+/// Walk `.stako/runtime/` and return one Orphan per file found. Caller
 /// frees via `freeOrphans`.
 pub fn listAll(
     allocator: std.mem.Allocator,

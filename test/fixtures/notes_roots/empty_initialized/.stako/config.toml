@@ -1,4 +1,4 @@
-# .organo/config.toml — committed: project-wide defaults.
+# .stako/config.toml — committed: project-wide defaults.
 # Per-machine overrides live in config.local.toml (gitignored).
 # Schema: todos/design_init_and_layout.md
 

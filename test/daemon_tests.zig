@@ -5,10 +5,10 @@
 //! fixtures, then drives HTTP read endpoints with the std.http client.
 
 const std = @import("std");
-const organo = @import("organo");
-const init_mod = organo.init;
-const daemon_mod = organo.daemon;
-const errors_mod = organo.errors;
+const stako = @import("stako");
+const init_mod = stako.init;
+const daemon_mod = stako.daemon;
+const errors_mod = stako.errors;
 
 // ---------- harness ----------
 
@@ -21,7 +21,7 @@ const Scratch = struct {
         var ts_buf: [32]u8 = undefined;
         const ts = std.time.nanoTimestamp();
         const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{ts});
-        const path = try std.fs.path.join(allocator, &.{ tmp, "organo-test-daemon" });
+        const path = try std.fs.path.join(allocator, &.{ tmp, "stako-test-daemon" });
         defer allocator.free(path);
         try std.fs.cwd().makePath(path);
 
@@ -38,7 +38,7 @@ const Scratch = struct {
     }
 };
 
-/// Run `organo init` on the scratch dir with deterministic timestamp / seed.
+/// Run `stako init` on the scratch dir with deterministic timestamp / seed.
 fn initNotesRoot(allocator: std.mem.Allocator, root: []const u8) !void {
     var r = try init_mod.run(allocator, .{
         .root = root,
@@ -438,7 +438,7 @@ test "daemon: daemon.log is created on non-ephemeral start" {
     defer d.deinit();
 
     // Log file exists.
-    const log_path = try std.fs.path.join(a, &.{ s.abs_path, ".organo", "daemon.log" });
+    const log_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "daemon.log" });
     defer a.free(log_path);
     var f = try std.fs.cwd().openFile(log_path, .{});
     defer f.close();
@@ -797,7 +797,7 @@ test "daemon: daemon_started and daemon_stopped events recorded in audit.log" {
     try d.startWorker();
     d.deinit();
 
-    const path = try std.fs.path.join(a, &.{ s.abs_path, ".organo", "audit.log" });
+    const path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "audit.log" });
     defer a.free(path);
     var f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -825,12 +825,12 @@ test "daemon: stop returns not_running and cleans pidfile when pid is dead" {
     defer s.deinit();
     try initNotesRoot(a, s.abs_path);
 
-    const organo_dir = try std.fs.path.join(a, &.{ s.abs_path, ".organo" });
-    defer a.free(organo_dir);
-    try std.fs.cwd().makePath(organo_dir);
+    const stako_dir = try std.fs.path.join(a, &.{ s.abs_path, ".stako" });
+    defer a.free(stako_dir);
+    try std.fs.cwd().makePath(stako_dir);
 
     // Write a pidfile pointing at a PID that's almost certainly absent.
-    const pid_path = try std.fs.path.join(a, &.{ s.abs_path, ".organo", "daemon.pid" });
+    const pid_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "daemon.pid" });
     defer a.free(pid_path);
     {
         var f = try std.fs.cwd().createFile(pid_path, .{ .truncate = true, .mode = 0o600 });

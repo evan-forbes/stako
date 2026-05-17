@@ -7,16 +7,16 @@
 //!   3. Drives `cli.dispatch` in-process against that daemon, capturing
 //!      stdout / stderr to ArrayList buffers.
 //!
-//! The one out-of-process test exec's the compiled `organo` binary as a
+//! The one out-of-process test exec's the compiled `stako` binary as a
 //! subprocess so we cover the real argv → main() → dispatch path that
 //! `cli.dispatch` callers would miss.
 
 const std = @import("std");
-const organo = @import("organo");
-const cli = organo.cli;
-const init_mod = organo.init;
-const daemon_mod = organo.daemon;
-const http_client = organo.http_client;
+const stako = @import("stako");
+const cli = stako.cli;
+const init_mod = stako.init;
+const daemon_mod = stako.daemon;
+const http_client = stako.http_client;
 
 // ---------- harness (mirrors test/daemon_tests.zig) ----------
 
@@ -29,7 +29,7 @@ const Scratch = struct {
         var ts_buf: [32]u8 = undefined;
         const ts = std.time.nanoTimestamp();
         const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{ts});
-        const path = try std.fs.path.join(allocator, &.{ tmp, "organo-test-cli" });
+        const path = try std.fs.path.join(allocator, &.{ tmp, "stako-test-cli" });
         defer allocator.free(path);
         try std.fs.cwd().makePath(path);
 
@@ -173,11 +173,11 @@ fn buildDriver(allocator: std.mem.Allocator, root: []const u8) !Driver {
     return .{ .allocator = allocator, .daemon = d };
 }
 
-/// Write `<root>/.organo/config.local.toml` with `daemon.port = <port>` so
+/// Write `<root>/.stako/config.local.toml` with `daemon.port = <port>` so
 /// the CLI's port-resolution layer finds the ephemeral port without needing
 /// `--port` on every invocation.
 fn writePortConfig(allocator: std.mem.Allocator, root: []const u8, port: u16) !void {
-    const path = try std.fs.path.join(allocator, &.{ root, ".organo", "config.local.toml" });
+    const path = try std.fs.path.join(allocator, &.{ root, ".stako", "config.local.toml" });
     defer allocator.free(path);
     var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer f.close();
@@ -364,7 +364,7 @@ test "cli: connection refused prints the daemon-not-started hint" {
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 1), r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "daemon not started") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "organo daemon start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "stako daemon start") != null);
 }
 
 test "cli: --verbose includes the request URL on connection failure" {
@@ -379,7 +379,7 @@ test "cli: --verbose includes the request URL on connection failure" {
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "attempted: http://127.0.0.1:1/stacks") != null);
 }
 
-test "cli: ORGANO_PORT env override is honored" {
+test "cli: STAKO_PORT env override is honored" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "env-port");
     defer s.deinit();
@@ -398,8 +398,8 @@ test "cli: ORGANO_PORT env override is honored" {
     };
     var port_buf: [16:0]u8 = undefined;
     _ = try std.fmt.bufPrintZ(&port_buf, "{d}", .{drv.daemon.bound_port});
-    _ = c.setenv("ORGANO_PORT", &port_buf, 1);
-    defer _ = c.unsetenv("ORGANO_PORT");
+    _ = c.setenv("STAKO_PORT", &port_buf, 1);
+    defer _ = c.unsetenv("STAKO_PORT");
 
     var r = try runCli(a, &.{ "stack", "list", "--root", s.abs_path });
     defer r.deinit();
@@ -442,7 +442,7 @@ test "cli: daemon st (short alias for status) reports `stopped` on empty root" {
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "stopped") != null);
 }
 
-// ---------- milestone 2: organo init via cli.dispatch ----------
+// ---------- milestone 2: stako init via cli.dispatch ----------
 
 test "cli: init on a fresh dir exits 0 and prints created list" {
     const a = std.testing.allocator;
@@ -453,12 +453,12 @@ test "cli: init on a fresh dir exits 0 and prints created list" {
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 0), r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, ".organo/local_token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, ".stako/local_token") != null);
 
     // Layout actually landed on disk.
     var d = try std.fs.openDirAbsolute(s.abs_path, .{});
     defer d.close();
-    d.access(".organo/local_token", .{}) catch return error.LayoutNotCreated;
+    d.access(".stako/local_token", .{}) catch return error.LayoutNotCreated;
     d.access("stacks/default/stack.toml", .{}) catch return error.LayoutNotCreated;
 }
 
@@ -472,9 +472,9 @@ test "cli: init --quiet suppresses per-line output but prints a summary" {
     try std.testing.expectEqual(@as(u8, 0), r.code);
     // No per-line `created:` block under --quiet.
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created:\n") == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "  .organo/local_token\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "  .stako/local_token\n") == null);
     // But a one-line summary is present.
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "organo init:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "stako init:") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "already present") != null);
 }
@@ -499,7 +499,7 @@ test "cli: init on a missing root exits 1 with a useful stderr message" {
     var r = try runCli(a, &.{ "init", "--root", "/path/does/not/exist/anywhere/12345", "--yes", "--quiet" });
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 1), r.code);
-    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "organo init:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "stako init:") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "RootNotADirectory") != null);
 }
 
@@ -526,7 +526,7 @@ test "cli: init without --yes does not auto-init git on a non-git root" {
     // Layout landed, but .git was NOT created because --yes was absent.
     var d = try std.fs.openDirAbsolute(s.abs_path, .{});
     defer d.close();
-    d.access(".organo/local_token", .{}) catch return error.LayoutNotCreated;
+    d.access(".stako/local_token", .{}) catch return error.LayoutNotCreated;
     if (d.access(".git", .{})) |_| {
         return error.GitInitShouldHaveBeenSkipped;
     } else |_| {}
@@ -537,7 +537,7 @@ test "cli: init without --yes does not auto-init git on a non-git root" {
 // One end-to-end test exec's the compiled binary so we cover the argv parsing
 // path inside `main.zig` that the in-process tests skip.
 
-test "cli (subprocess): organo stack list against a live daemon" {
+test "cli (subprocess): stako stack list against a live daemon" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "subproc");
     defer s.deinit();
@@ -550,11 +550,11 @@ test "cli (subprocess): organo stack list against a live daemon" {
     try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
 
     // Resolve binary path. `zig build test` runs from the build root and
-    // installs to `zig-out/bin/organo` for the default install step. Tests
+    // installs to `zig-out/bin/stako` for the default install step. Tests
     // that need the binary depend on the install step via build.zig.
     const candidates = [_][]const u8{
-        "zig-out/bin/organo",
-        "./zig-out/bin/organo",
+        "zig-out/bin/stako",
+        "./zig-out/bin/stako",
     };
     var bin_path: []const u8 = "";
     for (candidates) |c| {
@@ -704,7 +704,7 @@ test "cli: auth status with daemon down prints helpful hint" {
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 1), r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "daemon not started") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "organo daemon start") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "stako daemon start") != null);
 }
 
 test "cli: auth status --verbose includes request URL on connection failure" {
@@ -916,18 +916,18 @@ test "cli: silent daemon triggers transport timeout, not infinite hang" {
     // without expanding the public surface, so drive http_client directly
     // with a short timeout. This still exercises the production code path
     // (setsockopt + EAGAIN → TransportTimeout).
-    const organo_root = organo;
-    var client = try organo_root.http_client.open(a, .{
+    const stako_root = stako;
+    var client = try stako_root.http_client.open(a, .{
         .root = s.abs_path,
         .port_override = fake.port,
         .read_timeout_ms = 200,
     });
     defer client.deinit();
-    const result = organo_root.http_client.get(&client, "/stacks");
+    const result = stako_root.http_client.get(&client, "/stacks");
     try std.testing.expectError(error.TransportTimeout, result);
 }
 
-test "cli: --port flag wins over ORGANO_PORT and config" {
+test "cli: --port flag wins over STAKO_PORT and config" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "port-prec");
     defer s.deinit();
@@ -944,8 +944,8 @@ test "cli: --port flag wins over ORGANO_PORT and config" {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
     };
-    _ = c.setenv("ORGANO_PORT", "65222", 1);
-    defer _ = c.unsetenv("ORGANO_PORT");
+    _ = c.setenv("STAKO_PORT", "65222", 1);
+    defer _ = c.unsetenv("STAKO_PORT");
 
     var port_buf: [16]u8 = undefined;
     const port_str = try std.fmt.bufPrint(&port_buf, "{d}", .{drv.daemon.bound_port});
@@ -1147,10 +1147,10 @@ test "cli: renderStackList does not match nested `name` fields outside `stacks[]
     defer fake.deinit();
     fake.setCanned(
         "HTTP/1.1 200 OK\r\n" ++
-            "Content-Length: 50\r\n" ++
+            "Content-Length: 49\r\n" ++
             "Connection: close\r\n" ++
             "\r\n" ++
-            "{\"name\":\"organo\",\"stacks\":[{\"name\":\"real-stack\"}]}",
+            "{\"name\":\"stako\",\"stacks\":[{\"name\":\"real-stack\"}]}",
     );
     try fake.serveAsync();
 
@@ -1160,10 +1160,10 @@ test "cli: renderStackList does not match nested `name` fields outside `stacks[]
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 0), r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "real-stack") != null);
-    // The top-level "organo" name must not be rendered as a stack row.
-    // Single-pass scan: split by newline, no line should be exactly "organo".
+    // The top-level "stako" name must not be rendered as a stack row.
+    // Single-pass scan: split by newline, no line should be exactly "stako".
     var it = std.mem.splitScalar(u8, r.stdout, '\n');
     while (it.next()) |line| {
-        try std.testing.expect(!std.mem.eql(u8, line, "organo"));
+        try std.testing.expect(!std.mem.eql(u8, line, "stako"));
     }
 }

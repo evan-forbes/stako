@@ -5,19 +5,19 @@
 //! HTTP requests through `serveOne` on a worker thread.
 //!
 //! The key new wrinkle is that each test seeds
-//! `<root>/.organo/config.toml` with an `[identity.local]` table BEFORE
+//! `<root>/.stako/config.toml` with an `[identity.local]` table BEFORE
 //! the daemon starts, so the policy evaluator sees an explicit (rather
 //! than implicit-`*`) identity. Backwards-compat is covered by the
 //! pre-existing M5–M9 mutation tests — they pass without any new config,
 //! demonstrating that an undeclared local identity retains full access.
 
 const std = @import("std");
-const organo = @import("organo");
-const init_mod = organo.init;
-const daemon_mod = organo.daemon;
-const policy_mod = organo.policy;
-const config_mod = organo.config;
-const vcs = organo.vcs;
+const stako = @import("stako");
+const init_mod = stako.init;
+const daemon_mod = stako.daemon;
+const policy_mod = stako.policy;
+const config_mod = stako.config;
+const vcs = stako.vcs;
 
 // ---------- harness ----------
 
@@ -30,7 +30,7 @@ const Scratch = struct {
         var ts_buf: [32]u8 = undefined;
         const ts = std.time.nanoTimestamp();
         const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{ts});
-        const path = try std.fs.path.join(allocator, &.{ tmp, "organo-test-authorization" });
+        const path = try std.fs.path.join(allocator, &.{ tmp, "stako-test-authorization" });
         defer allocator.free(path);
         try std.fs.cwd().makePath(path);
         const dir_name = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ name_hint, ts_str });
@@ -57,15 +57,15 @@ fn initNotesRoot(allocator: std.mem.Allocator, root: []const u8) !void {
     r.deinit();
 }
 
-/// Overwrite `.organo/config.toml` with an `[identity.local]` block whose
-/// `capabilities` array is taken verbatim. `organo init` writes BOTH
+/// Overwrite `.stako/config.toml` with an `[identity.local]` block whose
+/// `capabilities` array is taken verbatim. `stako init` writes BOTH
 /// `config.toml` and `config.local.toml` — and the local layer's
 /// pre-baked `[identity.local]` block (caps = `*`) would otherwise
 /// shadow whatever we put here per the layered-config semantics. So we
 /// truncate `config.local.toml` to keep our committed layer
 /// authoritative for the test.
 fn seedIdentityCapabilities(allocator: std.mem.Allocator, root: []const u8, caps_toml_array: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ root, ".organo", "config.toml" });
+    const path = try std.fs.path.join(allocator, &.{ root, ".stako", "config.toml" });
     defer allocator.free(path);
     const body = try std.fmt.allocPrint(allocator,
         \\[identity.local]
@@ -81,7 +81,7 @@ fn seedIdentityCapabilities(allocator: std.mem.Allocator, root: []const u8, caps
     }
     // Truncate `config.local.toml` so the stub `[identity.local]` block
     // init writes there does not shadow our committed layer above.
-    const local_path = try std.fs.path.join(allocator, &.{ root, ".organo", "config.local.toml" });
+    const local_path = try std.fs.path.join(allocator, &.{ root, ".stako", "config.local.toml" });
     defer allocator.free(local_path);
     var lf = try std.fs.cwd().createFile(local_path, .{ .truncate = true });
     defer lf.close();
@@ -170,7 +170,7 @@ fn buildPostNoAuth(allocator: std.mem.Allocator, path: []const u8, body: []const
 }
 
 fn readAuditLog(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    const path = try std.fs.path.join(allocator, &.{ root, ".organo", "audit.log" });
+    const path = try std.fs.path.join(allocator, &.{ root, ".stako", "audit.log" });
     defer allocator.free(path);
     var f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -372,14 +372,14 @@ test "authorization: undeclared identity retains M3-era full access" {
     // must keep open with implicit full access for milestone-3..9
     // single-token deployments that never wrote an identity block.
     {
-        const local_path = try std.fs.path.join(a, &.{ s.abs_path, ".organo", "config.local.toml" });
+        const local_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "config.local.toml" });
         defer a.free(local_path);
         var lf = try std.fs.cwd().createFile(local_path, .{ .truncate = true });
         defer lf.close();
         try lf.writeAll("# cleared so no identity.local is declared\n");
     }
     {
-        const path = try std.fs.path.join(a, &.{ s.abs_path, ".organo", "config.toml" });
+        const path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "config.toml" });
         defer a.free(path);
         var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer f.close();
@@ -528,7 +528,7 @@ fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
     defer allocator.free(git_path);
     std.fs.cwd().deleteTree(git_path) catch {};
     try vcs.ensureRealRepo(allocator, root);
-    const paths = [_][]const u8{ ".gitignore", "stacks", ".organo/config.toml" };
+    const paths = [_][]const u8{ ".gitignore", "stacks", ".stako/config.toml" };
     _ = vcs.commit(allocator, root, .{ .paths = &paths, .subject = "init: baseline" }) catch {};
 }
 
@@ -578,7 +578,7 @@ test "authorization: denied mutation leaves zero git activity" {
 
     // Re-commit the rewritten config so the baseline log is exactly one entry.
     _ = vcs.commit(a, s.abs_path, .{
-        .paths = &.{".organo/config.toml"},
+        .paths = &.{".stako/config.toml"},
         .subject = "test: seed identity",
     }) catch {};
 

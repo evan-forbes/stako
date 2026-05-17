@@ -1,4 +1,4 @@
-# .organo/config.local.toml — per-machine; gitignored.
+# .stako/config.local.toml — per-machine; gitignored.
 # Overrides values in config.toml at load time (last-write-wins).
 
 [daemon]

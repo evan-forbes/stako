@@ -1,7 +1,7 @@
 //! Codex CLI adapter (milestone 7).
 //!
 //! Parses the JSONL emitted by `codex exec --json <prompt>` and maps each
-//! event onto organo's normalized event schema (see `events.zig`).
+//! event onto stako's normalized event schema (see `events.zig`).
 //!
 //! Mapping table (codex → normalized):
 //!

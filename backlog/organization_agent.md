@@ -1,4 +1,4 @@
-# Organo Todo Index
+# Stako Todo Index
 
 This directory breaks the original `organization_agent.md` todo list into one file per workstream. Each todo file should accumulate the research, decisions, implementation notes, dependencies, and acceptance criteria needed before coding starts.
 
@@ -19,7 +19,7 @@ This directory breaks the original `organization_agent.md` todo list into one fi
 
 ## Cross-Cutting Requirements
 
-- Organo has one canonical notes repository.
+- Stako has one canonical notes repository.
 - Prompts, agent definitions, project plans, stacks, indexes, and tags live beside notes.
 - Auth, containers, sync, version control, indexing, model providers, and stack routing are first-class features.
 - Stack items must be routable to a specific agent, model, provider, or compatible-provider policy.

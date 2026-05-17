@@ -5,20 +5,20 @@
 //! never call out to a real provider CLI.
 
 const std = @import("std");
-const organo = @import("organo");
+const stako = @import("stako");
 const fake = @import("helpers/fake_harness.zig");
 
-const init_mod = organo.init;
-const daemon_mod = organo.daemon;
-const audit_mod = organo.audit;
-const sse_mod = organo.sse;
-const mutation_queue = organo.mutation_queue;
-const session_manager = organo.session_manager;
-const runtime_file = organo.runtime_file;
-const runtime_mod = organo.runtime;
-const events = organo.events;
-const adapter_mod = organo.adapter;
-const fake_adapter = organo.fake_adapter;
+const init_mod = stako.init;
+const daemon_mod = stako.daemon;
+const audit_mod = stako.audit;
+const sse_mod = stako.sse;
+const mutation_queue = stako.mutation_queue;
+const session_manager = stako.session_manager;
+const runtime_file = stako.runtime_file;
+const runtime_mod = stako.runtime;
+const events = stako.events;
+const adapter_mod = stako.adapter;
+const fake_adapter = stako.fake_adapter;
 
 // ---------- scratch + paths ----------
 
@@ -31,7 +31,7 @@ const Scratch = struct {
         var ts_buf: [40]u8 = undefined;
         const ts = std.time.nanoTimestamp();
         const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{ts});
-        const base = try std.fs.path.join(allocator, &.{ tmp, "organo-test-runtime" });
+        const base = try std.fs.path.join(allocator, &.{ tmp, "stako-test-runtime" });
         defer allocator.free(base);
         try std.fs.cwd().makePath(base);
         const dir_name = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ name_hint, ts_str });
@@ -124,7 +124,7 @@ fn factoryFake(allocator: std.mem.Allocator, harness: []const u8) anyerror!?adap
 fn buildCatArgvDispatch(
     allocator: std.mem.Allocator,
     harness: []const u8,
-    item: *const organo.item.Item,
+    item: *const stako.item.Item,
     item_dir_abs: []const u8,
 ) anyerror![][]u8 {
     _ = harness;
@@ -151,7 +151,7 @@ var GLOBAL_STUBBORN: ?*const StubbornScript = null;
 fn buildStubbornArgvDispatch(
     allocator: std.mem.Allocator,
     harness: []const u8,
-    item: *const organo.item.Item,
+    item: *const stako.item.Item,
     item_dir_abs: []const u8,
 ) anyerror![][]u8 {
     _ = harness;
@@ -246,10 +246,8 @@ test "runtime: end-to-end fake run produces transcript and completes item" {
     // Stand up audit + queue + supervisor.
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
     defer a.free(fixture);
@@ -264,7 +262,7 @@ test "runtime: end-to-end fake run produces transcript and completes item" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .hub = &hub,
         .dispatch = fakeDispatchCat(),
@@ -328,10 +326,8 @@ test "runtime: paused stack does NOT dispatch" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
     defer a.free(fixture);
@@ -343,7 +339,7 @@ test "runtime: paused stack does NOT dispatch" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = fakeDispatchCat(),
     });
@@ -390,10 +386,8 @@ test "runtime: two stacks dispatch independently" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
     defer a.free(fixture);
@@ -405,7 +399,7 @@ test "runtime: two stacks dispatch independently" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = fakeDispatchCat(),
     });
@@ -462,10 +456,8 @@ test "runtime: cancellation escalates SIGINT -> SIGTERM for a stubborn process" 
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const script = try absFixturePath(a, "harness/claude_ignores_sigint.sh");
     defer a.free(script);
@@ -475,7 +467,7 @@ test "runtime: cancellation escalates SIGINT -> SIGTERM for a stubborn process" 
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = fakeDispatchStubborn(),
     });
@@ -534,14 +526,12 @@ test "runtime: restart-orphan sweep marks running items failed" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
     });
@@ -613,14 +603,12 @@ test "runtime: routing preflight blocks on harness_denied when allowed_harnesses
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
     });
@@ -663,14 +651,12 @@ test "runtime: sleep item with elapsed `until` transitions to completed" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
     });
@@ -703,14 +689,12 @@ test "runtime: consumes with_running_item fixture for restart sweep" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
     });
@@ -728,8 +712,8 @@ test "runtime: consumes with_running_item fixture for restart sweep" {
     _ = try f.readAll(buf);
     try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"failed\"") != null);
 
-    // .organo/runtime/ is clean.
-    const rt_dir = try std.fs.path.join(a, &.{ s.abs_path, ".organo/runtime/demo" });
+    // .stako/runtime/ is clean.
+    const rt_dir = try std.fs.path.join(a, &.{ s.abs_path, ".stako/runtime/demo" });
     defer a.free(rt_dir);
     var dir = std.fs.openDirAbsolute(rt_dir, .{ .iterate = true }) catch return;
     defer dir.close();
@@ -793,10 +777,8 @@ test "runtime: global concurrency cap pauses spawns above the limit" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture = try absFixturePath(a, "harness/claude_hello.jsonl");
     defer a.free(fixture);
@@ -808,7 +790,7 @@ test "runtime: global concurrency cap pauses spawns above the limit" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .max_concurrent_total = 1,
         .dispatch = fakeDispatchCat(),
@@ -1160,14 +1142,12 @@ test "m8 routing: gemini-routed item blocks with harness_unavailable when prefli
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
         .enable_provider_preflight = true,
@@ -1233,10 +1213,8 @@ test "m8 routing: preflight disabled allows the fake-harness path to run as befo
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     // Note: fakeDispatch's factory returns a fake adapter for any
     // harness name, including "claude". With preflight OFF we should
@@ -1245,7 +1223,7 @@ test "m8 routing: preflight disabled allows the fake-harness path to run as befo
     // session_ended.completed).
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
         .enable_provider_preflight = false,
@@ -1378,14 +1356,12 @@ test "Supervisor.wakeAllWorkers: signal reaches every registered worker" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
     });
@@ -1484,14 +1460,12 @@ test "routingPreflight: compact item against a harness that cannot compact block
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
     });
@@ -1625,10 +1599,8 @@ test "[result] block: session_ended payload empty fields still produce a result 
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     // Use a fixture whose JSONL is empty (no session_started, no message).
     // We re-use the existing cat_jsonl helper but point it at an empty
@@ -1647,7 +1619,7 @@ test "[result] block: session_ended payload empty fields still produce a result 
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = fakeDispatchCat(),
     });
@@ -1696,10 +1668,8 @@ test "Manager.cancelAndEscalate: SIGTERM-resistant subprocess gets SIGKILLed" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const script = try absFixturePath(a, "harness/claude_ignores_sigterm.sh");
     defer a.free(script);
@@ -1709,7 +1679,7 @@ test "Manager.cancelAndEscalate: SIGTERM-resistant subprocess gets SIGKILLed" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = fakeDispatchStubborn(),
     });
@@ -1765,10 +1735,8 @@ test "runtime: daemon shutdown mid-session reaps the live subprocess and clears 
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const script = try absFixturePath(a, "harness/slow_sigint_ok.sh");
     defer a.free(script);
@@ -1778,7 +1746,7 @@ test "runtime: daemon shutdown mid-session reaps the live subprocess and clears 
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = fakeDispatchStubborn(),
     });
@@ -1832,14 +1800,12 @@ test "Worker: tear-down right after start cleanly joins the worker thread" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = runtime_mod.fakeDispatch(),
     });

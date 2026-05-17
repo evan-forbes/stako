@@ -16,7 +16,7 @@ Terminal statuses: `completed`, `failed`, `canceled`, `superseded`.
 
 | From | To | Trigger | Side effects |
 |---|---|---|---|
-| `queued` | `running` | runtime loop picks the item | spawn subprocess; write `.organo/runtime/<stack>/<id>.toml`; emit `session_started` |
+| `queued` | `running` | runtime loop picks the item | spawn subprocess; write `.stako/runtime/<stack>/<id>.toml`; emit `session_started` |
 | `queued` | `blocked` | routing preflight fails | write `meta.toml.blocked_reason`; commit; emit `item_status` |
 | `queued` | `canceled` | API call (user / agent) | commit |
 | `queued` | `superseded` | API call (user / agent) | commit; record `superseded_by` in `meta.toml` |
@@ -85,7 +85,7 @@ All reasons are short slug strings (machine-parseable) plus an optional `*_messa
 
 On daemon startup (see `design_execution_harness.md` and `design_runtime_loop.md`):
 
-1. Scan items with `status = "running"` and matching `.organo/runtime/<stack>/<id>.toml` files.
+1. Scan items with `status = "running"` and matching `.stako/runtime/<stack>/<id>.toml` files.
 2. If the runtime file records a live PID that matches the recorded `started_at`, mark the item `failed` with reason `daemon_restart_orphan`. (v1 simplification; recoverable reattach is a later milestone.)
 3. Delete the runtime file and commit terminal metadata.
 4. Resume the runtime loop normally.

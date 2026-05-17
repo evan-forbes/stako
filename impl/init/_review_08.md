@@ -76,7 +76,7 @@ Diff range: 22f26f6..f39f3f8
 
 ## Acceptance criteria
 
-- **`organo auth status` accurately reports Claude and Codex availability.**
+- **`stako auth status` accurately reports Claude and Codex availability.**
   MET — CLI test `cli: auth status renders header + every provider row`
   exercises the full path; daemon test
   `daemon: GET /providers/anthropic surfaces signed_in/signed_out fields`
@@ -152,13 +152,13 @@ Diff range: 22f26f6..f39f3f8
   - Test threads: existing daemon `Driver` shutdown path used unchanged;
     new tests use `sm.waitAll()` for runtime tests and rely on
     `Driver.deinit` for daemon tests. Deterministic.
-  - No /tmp/organo-* leftovers after a fresh `zig build test`; previous
+  - No /tmp/stako-* leftovers after a fresh `zig build test`; previous
     runs left empty dirs but no files.
 - **CLI surface vs. plan step 3**:
-  - `organo auth status` / `organo a st` — MET (parser test pins both).
-  - `organo auth <provider>` / `organo a <provider>` — MET (parser test
+  - `stako auth status` / `stako a st` — MET (parser test pins both).
+  - `stako auth <provider>` / `stako a <provider>` — MET (parser test
     pins shortcut; runtime test pins single-provider rendering).
-  - `organo auth signout <provider>` / `organo a out <provider>` — MET
+  - `stako auth signout <provider>` / `stako a out <provider>` — MET
     in surface terms (parser accepts both), but the runner stably emits
     "signout not supported in v1" with exit 1. Plan says "only where
     signout is safe and provider-supported" — v1 supports neither, so

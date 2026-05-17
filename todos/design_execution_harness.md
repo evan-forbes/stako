@@ -4,7 +4,7 @@
 
 The harness layer is what actually runs a `prompt` (or `review`) stack item: it takes a prompt, a working directory, a routed provider/model, and a tool surface, and drives a multi-turn loop where the model emits tool calls, the harness executes them, and feeds results back until the task is complete.
 
-This is the same job that Claude Code, Codex CLI, and Gemini CLI do. Organo's daemon owns the queue, the routing decision, session management, and event normalization; each underlying CLI owns its own model/tool loop. We wrap, we do not reimplement.
+This is the same job that Claude Code, Codex CLI, and Gemini CLI do. Stako's daemon owns the queue, the routing decision, session management, and event normalization; each underlying CLI owns its own model/tool loop. We wrap, we do not reimplement.
 
 ## Decided
 
@@ -14,8 +14,8 @@ This is the same job that Claude Code, Codex CLI, and Gemini CLI do. Organo's da
 - All emitted events flow into (a) a per-item JSONL transcript and (b) SSE to subscribed clients. Same event stream, two sinks.
 - A **session manager** inside the daemon tracks live subprocesses, owns the parent end of stdin/stdout pipes, and maps subprocess events to item IDs.
 - **Concurrency model**: independent per-stack worker loops; sequential within a stack by default; intra-stack parallelism is opt-in per stack via a stack-level flag; a daemon-level global slot limit prevents unbounded subprocess fanout.
-- Transcript files live inside the item directory by default. An item may opt out (e.g. for very noisy runs) and write to `<notes-root>/.organo/runs/<stack>/<id>/` instead.
-- Live PID/session state lives under `<notes-root>/.organo/runtime/<stack>/<id>.toml`, not in tracked item metadata. Terminal harness result metadata is copied into `meta.toml` under `[result]`.
+- Transcript files live inside the item directory by default. An item may opt out (e.g. for very noisy runs) and write to `<notes-root>/.stako/runs/<stack>/<id>/` instead.
+- Live PID/session state lives under `<notes-root>/.stako/runtime/<stack>/<id>.toml`, not in tracked item metadata. Terminal harness result metadata is copied into `meta.toml` under `[result]`.
 - Workdir allow-list comes from `workdir.allowlist` in `config.toml`; items requesting a workdir outside it are rejected before spawn.
 
 ## Supported Harnesses (concrete invocations)
@@ -46,7 +46,7 @@ Confirmed against current docs (May 2026). These are the exact flags v1 will use
 - **Sessions on disk**: not authoritatively documented; assume opaque.
 - **Quirks**: **important** — some shipped builds may not wire `--output-format`. The daemon runs a capability probe and disables the gemini adapter with a clear status message if the flag is missing. Routing an item to gemini in that state lands it in `blocked` with `harness_unavailable`. Gemini support does not block core Claude/Codex acceptance.
 
-> **M8 update (2026-05-10):** Gemini ended up *deferred* in v1, not just probe-gated. The `gemini` CLI was not present in the reference dev environment when M8 landed, and `--output-format stream-json` could not be empirically verified end-to-end. `harness_dispatch.factory("gemini")` deliberately returns `null` so a gemini-routed item lands in `blocked` with `harness_unavailable` (instead of failing inside a partial adapter). The `provider_status` surface returns the google/gemini record with `available=false` and a stable note ("structured stream-json mode unconfirmed; adapter deferred"). A future milestone can flip this by (a) writing a real `gemini_adapter.zig` that maps the streaming JSON to the normalized schema, (b) updating `harness_dispatch.factory()` to return it, and (c) flipping `available=true` in `provider_status.probeGemini` once a real capability probe passes. Until then, `organo auth status` (and `GET /providers`) is the canonical place users see that gemini is intentionally off.
+> **M8 update (2026-05-10):** Gemini ended up *deferred* in v1, not just probe-gated. The `gemini` CLI was not present in the reference dev environment when M8 landed, and `--output-format stream-json` could not be empirically verified end-to-end. `harness_dispatch.factory("gemini")` deliberately returns `null` so a gemini-routed item lands in `blocked` with `harness_unavailable` (instead of failing inside a partial adapter). The `provider_status` surface returns the google/gemini record with `available=false` and a stable note ("structured stream-json mode unconfirmed; adapter deferred"). A future milestone can flip this by (a) writing a real `gemini_adapter.zig` that maps the streaming JSON to the normalized schema, (b) updating `harness_dispatch.factory()` to return it, and (c) flipping `available=true` in `provider_status.probeGemini` once a real capability probe passes. Until then, `stako auth status` (and `GET /providers`) is the canonical place users see that gemini is intentionally off.
 
 ## Normalized Event Schema
 
@@ -131,7 +131,7 @@ get(stack, item_id) -> session?
 
 State on disk (so the daemon can recover after a restart):
 
-- Every item with `status = "running"` has a runtime file at `.organo/runtime/<stack>/<id>.toml` holding PID, harness, started_at, transcript path, and harness-side session ID if known.
+- Every item with `status = "running"` has a runtime file at `.stako/runtime/<stack>/<id>.toml` holding PID, harness, started_at, transcript path, and harness-side session ID if known.
 - On daemon startup, the session manager walks all running items and matching runtime files, then marks them `failed` with reason `daemon_restart_orphan`. Re-adoption is deliberately deferred.
 
 ## Concurrency Model
@@ -156,7 +156,7 @@ When `max_concurrent_total` is reached, stack loops leave newly eligible items i
 
 ## Session Continuity (compact / clear / resume)
 
-How organo's `compact`, `clear`, and follow-up items map onto the wrapped harnesses:
+How stako's `compact`, `clear`, and follow-up items map onto the wrapped harnesses:
 
 - **Within a stack, by default, items run independent subprocess sessions.** No automatic resume.
 - **A stack may set `continuity = "chain"`** in its config, meaning each item that targets the same harness resumes the prior session ID (recorded in the prior item's `[result]` table).
@@ -205,11 +205,11 @@ daemon
 
 ## Working Directory Model
 
-A stack declares a default `workdir`. An item may override. The daemon validates against `workdir.allowlist` before spawn. The subprocess inherits this as its `cwd`. Tool calls inside the subprocess are scoped by the underlying harness, not by organo.
+A stack declares a default `workdir`. An item may override. The daemon validates against `workdir.allowlist` before spawn. The subprocess inherits this as its `cwd`. Tool calls inside the subprocess are scoped by the underlying harness, not by stako.
 
 ## Credentials Injection
 
-- Per-provider credentials live under `<notes-root>/.organo/credentials/<provider>/`.
+- Per-provider credentials live under `<notes-root>/.stako/credentials/<provider>/`.
 - The session manager sets only the env vars the routed harness needs, scoped to the routed provider. No cross-pollination of provider tokens across subprocesses.
 - For claude: typically `ANTHROPIC_API_KEY`, subscription session token, or existing Claude Code CLI credentials, exact mechanism per `research_provider_sign_in.md`.
 - For codex: `OPENAI_API_KEY`, subscription session, or existing Codex CLI auth, exact mechanism per `research_provider_sign_in.md`.
@@ -228,7 +228,7 @@ A stack declares a default `workdir`. An item may override. The daemon validates
 1. Define the normalized event schema as Zig types; write JSON round-trip tests.
 2. Define the adapter interface and shared adapter helpers.
 3. Implement a fake adapter first so runtime behavior can be tested without provider CLIs.
-4. Build the session manager with one global concurrent slot first. Wire `.organo/runtime/<stack>/<id>.toml` writes/reads and terminal `[result]` metadata.
+4. Build the session manager with one global concurrent slot first. Wire `.stako/runtime/<stack>/<id>.toml` writes/reads and terminal `[result]` metadata.
 5. Implement independent per-stack worker loops that use the shared session manager.
 6. Wire SSE: session manager → SSE multiplexer → per-stack streams.
 7. Wire transcript JSONL writes.

@@ -1,6 +1,6 @@
-# Organo Design
+# Stako Design
 
-Organo is a stack runtime: a daemon that operates persistent queues of agent work, exposes them over a local API, and renders them as a web view. A CLI is the first client of that API.
+Stako is a stack runtime: a daemon that operates persistent queues of agent work, exposes them over a local API, and renders them as a web view. A CLI is the first client of that API.
 
 This document is intentionally narrow. Everything outside this scope (indexing, tags, calendar/sync, project structure, ligi extraction, Neovim plugin, public-internet exposure) lives in `backlog/`.
 
@@ -23,7 +23,7 @@ Each stack item is a directory on disk:
 
 The directory layout is the source of truth. HTML is a render target, not a storage format.
 
-Per-stack ID space (each stack counts from `0001` independently). Daemon state lives under a sibling `<notes-root>/.organo/` (config, credentials, PID, log) so the user-visible `stacks/` tree stays clean and version-controllable.
+Per-stack ID space (each stack counts from `0001` independently). Daemon state lives under a sibling `<notes-root>/.stako/` (config, credentials, PID, log) so the user-visible `stacks/` tree stays clean and version-controllable.
 
 The exact schema for `meta.toml` is defined in `todos/design_stack_item_format.md`. The on-disk layout decision lives in `todos/design_init_and_layout.md`. Per-stack settings (continuity, intra-stack concurrency, pause state) live in `<notes-root>/stacks/<name>/stack.toml` per `todos/design_stack_config.md`.
 
@@ -103,12 +103,12 @@ The daemon renders HTML directly. No separate frontend build step in v1. Pages c
 
 First non-browser client. Surfaces:
 
-- `organo init` — set up the notes repo / stack directory.
-- `organo auth status` / `organo auth <provider>` — provider status and login hints.
-- `organo daemon start|stop|status` — manage the daemon process.
-- `organo stack list|show <name>` — inspect.
-- `organo stack add <name> <kind> [...]` — append items.
-- `organo stack pause|resume <name>` — control execution.
+- `stako init` — set up the notes repo / stack directory.
+- `stako auth status` / `stako auth <provider>` — provider status and login hints.
+- `stako daemon start|stop|status` — manage the daemon process.
+- `stako stack list|show <name>` — inspect.
+- `stako stack add <name> <kind> [...]` — append items.
+- `stako stack pause|resume <name>` — control execution.
 
 The CLI is intentionally thin — it formats requests to the daemon's HTTP API and prints responses. It should remain ergonomic for casual daily use: common commands and flags need short aliases.
 
@@ -156,7 +156,7 @@ The daemon does not auto-commit arbitrary harness workdir changes in v1. Externa
 
 ## Out Of Scope (Backlog)
 
-The following ideas were part of earlier organo drafts and are explicitly out of scope for the current build. They remain in `backlog/` for later:
+The following ideas were part of earlier stako drafts and are explicitly out of scope for the current build. They remain in `backlog/` for later:
 
 - Indexing automation.
 - Tag syntax decisions.

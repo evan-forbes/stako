@@ -1,10 +1,10 @@
-# organo
-.organo/config.local.toml
-.organo/credentials/
-.organo/local_token
-.organo/runtime/
-.organo/runs/
-.organo/audit.log
-.organo/audit.log.*
-.organo/daemon.pid
-.organo/daemon.log
+# stako
+.stako/config.local.toml
+.stako/credentials/
+.stako/local_token
+.stako/runtime/
+.stako/runs/
+.stako/audit.log
+.stako/audit.log.*
+.stako/daemon.pid
+.stako/daemon.log

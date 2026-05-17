@@ -6,12 +6,12 @@
 //! pure-mock paths.
 
 const std = @import("std");
-const organo = @import("organo");
+const stako = @import("stako");
 
-pub const fake_adapter = organo.fake_adapter;
-pub const adapter_mod = organo.adapter;
-pub const runtime = organo.runtime;
-pub const events = organo.events;
+pub const fake_adapter = stako.fake_adapter;
+pub const adapter_mod = stako.adapter;
+pub const runtime = stako.runtime;
+pub const events = stako.events;
 
 /// Build an argv that runs `bash cat_jsonl.sh <fixture>` against
 /// `fixture_path_abs`. Caller owns; free via `freeArgv`.

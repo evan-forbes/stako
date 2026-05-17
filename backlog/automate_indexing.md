@@ -9,13 +9,13 @@
 
 ## Design Context
 
-Indexing should make the note graph navigable without constant manual maintenance. Organo should preserve manual indexing for explicit control, but automatic indexing should become the default path.
+Indexing should make the note graph navigable without constant manual maintenance. Stako should preserve manual indexing for explicit control, but automatic indexing should become the default path.
 
-The indexed output must remain portable Markdown. Source notation can be Organo-specific, but generated links should resolve as normal Markdown links.
+The indexed output must remain portable Markdown. Source notation can be Stako-specific, but generated links should resolve as normal Markdown links.
 
 ## Research Before Implementation
 
-- Identify every generated index artifact Organo needs: tag pages, backlinks, project indexes, note indexes, stack indexes, or search metadata.
+- Identify every generated index artifact Stako needs: tag pages, backlinks, project indexes, note indexes, stack indexes, or search metadata.
 - Determine whether indexing should be incremental, full-rebuild, or hybrid.
 - Benchmark expected repository sizes and acceptable indexing latency.
 - Decide whether generated index files are committed, cached, or both.

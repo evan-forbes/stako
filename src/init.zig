@@ -1,13 +1,13 @@
-//! `organo init` — bootstrap a notes-root layout.
+//! `stako init` — bootstrap a notes-root layout.
 //!
 //! On-disk contract: `todos/design_init_and_layout.md`.
 //!
 //! Idempotency:
 //!   - The directory layout is created if missing; existing dirs are left
 //!     alone.
-//!   - `.organo/config.toml` and `stacks/default/stack.toml` are NEVER
+//!   - `.stako/config.toml` and `stacks/default/stack.toml` are NEVER
 //!     overwritten if present.
-//!   - `.organo/local_token` is generated once and never rewritten.
+//!   - `.stako/local_token` is generated once and never rewritten.
 //!   - `.gitignore` lines are appended only if absent.
 //!
 //! Re-running on an initialized root reports zero changes.
@@ -38,7 +38,7 @@ pub const Options = struct {
 pub const Report = struct {
     /// True if the root was a brand-new git repo we just initialized.
     git_initialized: bool = false,
-    /// True if the root was already inside an existing git repo (organo
+    /// True if the root was already inside an existing git repo (stako
     /// layout will join that history, with a warning).
     inside_existing_git: bool = false,
     /// Items created on this run (paths relative to the notes root).
@@ -73,18 +73,18 @@ pub const InitError = error{
 
 /// The gitignore lines added by init. Order matches the design doc.
 pub const GITIGNORE_LINES = [_][]const u8{
-    ".organo/config.local.toml",
-    ".organo/credentials/",
-    ".organo/local_token",
-    ".organo/runtime/",
-    ".organo/runs/",
-    ".organo/audit.log",
-    ".organo/audit.log.*",
-    ".organo/daemon.pid",
-    ".organo/daemon.log",
+    ".stako/config.local.toml",
+    ".stako/credentials/",
+    ".stako/local_token",
+    ".stako/runtime/",
+    ".stako/runs/",
+    ".stako/audit.log",
+    ".stako/audit.log.*",
+    ".stako/daemon.pid",
+    ".stako/daemon.log",
 };
 
-/// Resolve `root` and run `organo init`. Caller owns the returned report.
+/// Resolve `root` and run `stako init`. Caller owns the returned report.
 pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
     // Open the notes root (must already exist as a directory).
     var root_dir = std.fs.cwd().openDir(opts.root, .{ .iterate = true }) catch |e| switch (e) {
@@ -120,12 +120,12 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
     // 2. Directory layout.
     try ensureDir(&root_dir, "stacks", &report, r_arena);
     try ensureDir(&root_dir, "stacks/default", &report, r_arena);
-    try ensureDir(&root_dir, ".organo", &report, r_arena);
-    try ensureDir(&root_dir, ".organo/credentials", &report, r_arena);
-    try ensureDir(&root_dir, ".organo/runtime", &report, r_arena);
+    try ensureDir(&root_dir, ".stako", &report, r_arena);
+    try ensureDir(&root_dir, ".stako/credentials", &report, r_arena);
+    try ensureDir(&root_dir, ".stako/runtime", &report, r_arena);
 
     // 3. Set restrictive perms on credential-bearing directories.
-    try chmodIfPosix(&root_dir, ".organo/credentials", 0o700);
+    try chmodIfPosix(&root_dir, ".stako/credentials", 0o700);
 
     // 4. stacks/default/stack.toml — write defaults if absent.
     {
@@ -144,32 +144,32 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
         );
     }
 
-    // 5. .organo/config.toml — committed defaults.
+    // 5. .stako/config.toml — committed defaults.
     try writeFileIfAbsent(
         &root_dir,
-        ".organo/config.toml",
+        ".stako/config.toml",
         &report,
         r_arena,
         .{ .config_committed = {} },
         null,
     );
 
-    // 6. .organo/config.local.toml — per-machine, gitignored.
+    // 6. .stako/config.local.toml — per-machine, gitignored.
     try writeFileIfAbsent(
         &root_dir,
-        ".organo/config.local.toml",
+        ".stako/config.local.toml",
         &report,
         r_arena,
         .{ .config_local = {} },
         null,
     );
 
-    // 7. .organo/local_token — generated once, perms 0600, gitignored.
+    // 7. .stako/local_token — generated once, perms 0600, gitignored.
     // Token bytes are produced lazily inside writeFileIfAbsent so we don't
     // burn kernel entropy on idempotent re-init runs.
     try writeFileIfAbsent(
         &root_dir,
-        ".organo/local_token",
+        ".stako/local_token",
         &report,
         r_arena,
         .{ .local_token = opts.rng_seed_override },
@@ -366,7 +366,7 @@ fn writeAtomic(root_dir: *std.fs.Dir, rel: []const u8, content: []const u8) !voi
         std.crypto.random.bytes(&rng_bytes);
         break :blk try std.fmt.bufPrint(
             &tmp_buf,
-            "{s}.organo-tmp-{x}{x}{x}{x}",
+            "{s}.stako-tmp-{x}{x}{x}{x}",
             .{ rel, rng_bytes[0], rng_bytes[1], rng_bytes[2], rng_bytes[3] },
         );
     };
@@ -384,7 +384,7 @@ fn writeAtomic(root_dir: *std.fs.Dir, rel: []const u8, content: []const u8) !voi
 
 fn writeConfigCommitted(w: anytype) !void {
     try w.writeAll(
-        \\# .organo/config.toml — committed: project-wide defaults.
+        \\# .stako/config.toml — committed: project-wide defaults.
         \\# Per-machine overrides live in config.local.toml (gitignored).
         \\# Schema: todos/design_init_and_layout.md
         \\
@@ -415,7 +415,7 @@ fn writeConfigCommitted(w: anytype) !void {
 
 fn writeConfigLocal(w: anytype) !void {
     try w.writeAll(
-        \\# .organo/config.local.toml — per-machine; gitignored.
+        \\# .stako/config.local.toml — per-machine; gitignored.
         \\# Overrides values in config.toml at load time (last-write-wins).
         \\
         \\[daemon]
@@ -477,9 +477,9 @@ fn appendGitignoreLines(
         // Add a blank-line separator if the file isn't empty AND doesn't
         // already end in a blank line — so manual edits are visually distinct.
         if (!endsWithBlankLine(existing)) try out.append(arena, '\n');
-        try out.appendSlice(arena, "# organo\n");
+        try out.appendSlice(arena, "# stako\n");
     } else {
-        try out.appendSlice(arena, "# organo\n");
+        try out.appendSlice(arena, "# stako\n");
     }
     for (missing.items) |line| {
         try out.appendSlice(arena, line);
@@ -561,10 +561,10 @@ fn formatIsoUtc(arena: std.mem.Allocator, ts: i64) ![]const u8 {
 // ---------- internal unit tests ----------
 
 test "gitignoreContainsLine matches exact lines" {
-    const existing = "node_modules/\n.organo/local_token\n# comment\n";
-    try std.testing.expect(gitignoreContainsLine(existing, ".organo/local_token"));
+    const existing = "node_modules/\n.stako/local_token\n# comment\n";
+    try std.testing.expect(gitignoreContainsLine(existing, ".stako/local_token"));
     try std.testing.expect(gitignoreContainsLine(existing, "node_modules/"));
-    try std.testing.expect(!gitignoreContainsLine(existing, ".organo/runtime/"));
+    try std.testing.expect(!gitignoreContainsLine(existing, ".stako/runtime/"));
     try std.testing.expect(!gitignoreContainsLine(existing, "# comment"));
 }
 

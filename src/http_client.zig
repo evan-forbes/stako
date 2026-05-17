@@ -12,9 +12,9 @@
 //!
 //! Port resolution order (highest priority first):
 //!   1. `Opts.port_override` (`--port/-p` on the CLI).
-//!   2. `ORGANO_PORT` environment variable.
-//!   3. `<root>/.organo/config.local.toml` daemon.port.
-//!   4. `<root>/.organo/config.toml` daemon.port.
+//!   2. `STAKO_PORT` environment variable.
+//!   3. `<root>/.stako/config.local.toml` daemon.port.
+//!   4. `<root>/.stako/config.toml` daemon.port.
 //!   5. Builtin default (7421, via Config defaults).
 
 const std = @import("std");
@@ -52,7 +52,7 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     host: []const u8,
     port: u16,
-    /// `null` when there's no `.organo/local_token` (e.g. user pointed
+    /// `null` when there's no `.stako/local_token` (e.g. user pointed
     /// `--root` at a non-initialized directory). Read endpoints don't require
     /// the token; we keep it loaded so milestone 5's mutation calls work
     /// without further plumbing.
@@ -81,7 +81,7 @@ pub const Response = struct {
 pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
     // Port resolution.
     var port: u16 = 7421;
-    // Missing `.organo/` is the common case (user invokes from outside an
+    // Missing `.stako/` is the common case (user invokes from outside an
     // initialized notes root and overrides everything via flags/env). Other
     // load errors — malformed TOML, wrong types, `PortOutOfRange` — must
     // surface; otherwise we silently downgrade to the default port and the
@@ -95,8 +95,8 @@ pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
         defer cfg.deinit();
         port = cfg.daemon.port;
     }
-    // ORGANO_PORT env override.
-    if (std.process.getEnvVarOwned(allocator, "ORGANO_PORT")) |val| {
+    // STAKO_PORT env override.
+    if (std.process.getEnvVarOwned(allocator, "STAKO_PORT")) |val| {
         defer allocator.free(val);
         if (std.fmt.parseInt(u16, val, 10)) |p| {
             port = p;
@@ -109,7 +109,7 @@ pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
     }
     if (opts.port_override) |p| port = p;
 
-    // Token (optional). If `.organo/local_token` exists, use it. Otherwise
+    // Token (optional). If `.stako/local_token` exists, use it. Otherwise
     // we proceed without one — read endpoints don't require it.
     var token_owned: ?[]u8 = null;
     if (loadTokenIfPresent(allocator, opts.root)) |t| {
@@ -130,7 +130,7 @@ fn loadTokenIfPresent(
     allocator: std.mem.Allocator,
     notes_root: []const u8,
 ) !?[]u8 {
-    const path = try std.fs.path.join(allocator, &.{ notes_root, ".organo", "local_token" });
+    const path = try std.fs.path.join(allocator, &.{ notes_root, ".stako", "local_token" });
     defer allocator.free(path);
     var f = std.fs.cwd().openFile(path, .{}) catch return null;
     defer f.close();

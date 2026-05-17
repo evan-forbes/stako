@@ -49,7 +49,7 @@ The 8-thread × 32-append stress test added for M5/B2 ran 10 consecutive iterati
 
 - **M3** — Bearer token storage tightened (0600 enforced on every load).
 - **M9** — XSS audit: 39 dynamic insertions across `renderIndex`/`renderStack`/`renderItem`/`renderTranscript`/the inline SSE bootstrap. All 39 escape; the hostile-token test directly exercises defense-in-depth. `_token` is hex-by-construction, escaped on render, never leaked into URLs or logs.
-- **M10** — Fail-closed analysis: every error branch in `policy.evaluate` returns deny. Implicit-`*` fallback (for backwards compat with un-declared `[identity.local]`) only engages when the bearer token is already verified; fresh `organo init` always writes the explicit block so new installs never use the shim. UAR scan (a relic of M4's prior bug pattern) explicitly performed in M4 audit — clean.
+- **M10** — Fail-closed analysis: every error branch in `policy.evaluate` returns deny. Implicit-`*` fallback (for backwards compat with un-declared `[identity.local]`) only engages when the bearer token is already verified; fresh `stako init` always writes the explicit block so new installs never use the shim. UAR scan (a relic of M4's prior bug pattern) explicitly performed in M4 audit — clean.
 
 ## Cross-milestone debt surfaced
 

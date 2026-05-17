@@ -3,7 +3,7 @@
 //! Each test renders one of the daemon's browser-facing pages against the
 //! `test/fixtures/stacks/smoke/` fixture, writes the output to a `.actual`
 //! file next to the committed `.expected` file, and asserts byte equality.
-//! Set `ORGANO_UPDATE_HTML_SNAPSHOTS=1` to regenerate the `.expected` files
+//! Set `STAKO_UPDATE_HTML_SNAPSHOTS=1` to regenerate the `.expected` files
 //! when the templates intentionally change.
 //!
 //! See `impl/09_html_rendering.md` and `impl/00_test_strategy.md`.
@@ -15,13 +15,13 @@
 //! test that checks daemon Accept-header negotiation end-to-end.
 
 const std = @import("std");
-const organo = @import("organo");
-const html = organo.html;
-const storage = organo.storage;
-const item_mod = organo.item;
-const stack_config_mod = organo.stack_config;
-const daemon_mod = organo.daemon;
-const init_mod = organo.init;
+const stako = @import("stako");
+const html = stako.html;
+const storage = stako.storage;
+const item_mod = stako.item;
+const stack_config_mod = stako.stack_config;
+const daemon_mod = stako.daemon;
+const init_mod = stako.init;
 
 const FIXTURE_ROOT = "test/fixtures/stacks/smoke";
 const EXPECTED_DIR = "test/fixtures/html";
@@ -30,7 +30,7 @@ const EXPECTED_DIR = "test/fixtures/html";
 
 /// Compare `actual` to the committed `expected_name` file. Always writes
 /// `<name>.actual` next to the expected file so a failure leaves a diffable
-/// artifact. When `ORGANO_UPDATE_HTML_SNAPSHOTS=1` is set, overwrite the
+/// artifact. When `STAKO_UPDATE_HTML_SNAPSHOTS=1` is set, overwrite the
 /// expected file instead.
 ///
 /// `.actual` files are intentionally truncated/regenerated on every run and
@@ -53,7 +53,7 @@ fn assertSnapshot(allocator: std.mem.Allocator, expected_name: []const u8, actua
         try f.writeAll(actual);
     }
 
-    const update_env = std.posix.getenv("ORGANO_UPDATE_HTML_SNAPSHOTS");
+    const update_env = std.posix.getenv("STAKO_UPDATE_HTML_SNAPSHOTS");
     const update = update_env != null and update_env.?.len > 0 and !std.mem.eql(u8, update_env.?, "0");
     if (update) {
         var f = try std.fs.cwd().createFile(expected_path, .{ .truncate = true });
@@ -64,7 +64,7 @@ fn assertSnapshot(allocator: std.mem.Allocator, expected_name: []const u8, actua
 
     var f = std.fs.cwd().openFile(expected_path, .{}) catch |e| {
         std.debug.print(
-            "html snapshot missing: {s}\n  actual written to: {s}\n  rerun with ORGANO_UPDATE_HTML_SNAPSHOTS=1 to create it\n",
+            "html snapshot missing: {s}\n  actual written to: {s}\n  rerun with STAKO_UPDATE_HTML_SNAPSHOTS=1 to create it\n",
             .{ expected_path, actual_path },
         );
         return e;
@@ -76,7 +76,7 @@ fn assertSnapshot(allocator: std.mem.Allocator, expected_name: []const u8, actua
     _ = try f.readAll(expected);
     if (!std.mem.eql(u8, expected, actual)) {
         std.debug.print(
-            "html snapshot mismatch: {s}\n  actual: {s}\n  set ORGANO_UPDATE_HTML_SNAPSHOTS=1 to overwrite\n",
+            "html snapshot mismatch: {s}\n  actual: {s}\n  set STAKO_UPDATE_HTML_SNAPSHOTS=1 to overwrite\n",
             .{ expected_path, actual_path },
         );
         return error.SnapshotMismatch;
@@ -93,7 +93,7 @@ const SmokeRoot = struct {
     abs_path: []u8,
 
     fn create(allocator: std.mem.Allocator, name_hint: []const u8) !SmokeRoot {
-        const tmp_base = "/tmp/organo-test-html";
+        const tmp_base = "/tmp/stako-test-html";
         try std.fs.cwd().makePath(tmp_base);
         var ts_buf: [32]u8 = undefined;
         const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.nanoTimestamp()});
@@ -361,7 +361,7 @@ test "daemon: GET / returns HTML index" {
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
     try std.testing.expect(std.mem.startsWith(u8, parsed.content_type, "text/html"));
-    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "<title>organo</title>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parsed.body, "<title>stako</title>") != null);
     // Smoke stack should be listed.
     try std.testing.expect(std.mem.indexOf(u8, parsed.body, "href=\"/stacks/smoke\"") != null);
 }

@@ -10,7 +10,7 @@
 
 ## Design Context
 
-Organo prefers using existing monthly subscriptions where the official CLI already supports them, while keeping pay-per-token API keys as a baseline fallback. Stack routing must be able to send individual items to a chosen provider, model, agent, or compatible-provider policy.
+Stako prefers using existing monthly subscriptions where the official CLI already supports them, while keeping pay-per-token API keys as a baseline fallback. Stack routing must be able to send individual items to a chosen provider, model, agent, or compatible-provider policy.
 
 The core target list is narrow:
 
@@ -30,7 +30,7 @@ Daemon-owned subscription auth is not required for v1. API-key auth remains a ba
   - Endpoint shape used by the official CLI / first-party client.
   - Rate limits and account-plan restrictions.
   - Terms-of-service constraints around third-party clients.
-- Study how `pi`, Claude Code, Codex CLI, and similar tools authenticate. Note which approaches are viable for organo and which are not.
+- Study how `pi`, Claude Code, Codex CLI, and similar tools authenticate. Note which approaches are viable for stako and which are not.
 - Decide where monthly-plan usage is technically and legally appropriate per provider. Document anything explicitly rejected.
 - Decide credential resolution strategy per provider (official CLI reuse first, API-key fallback, daemon-owned storage only if stable and cheap).
 - Define provider metadata needed for routing: provider id, account id, available models, context length, tool support, multimodal support, rate limits, estimated cost, auth state, and policy restrictions.

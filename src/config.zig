@@ -1,5 +1,5 @@
-//! Daemon Config: typed view over `.organo/config.toml` and
-//! `.organo/config.local.toml`.
+//! Daemon Config: typed view over `.stako/config.toml` and
+//! `.stako/config.local.toml`.
 //!
 //! Load order: `config.toml` first, then `config.local.toml` overlaid on top.
 //! Per `todos/design_init_and_layout.md`:
@@ -59,8 +59,8 @@ pub const LoadError = error{
 
 /// Load the daemon configuration from a notes root.
 ///
-/// Looks at `<notes_root>/.organo/config.toml` and (optionally)
-/// `<notes_root>/.organo/config.local.toml`. Missing files are tolerated:
+/// Looks at `<notes_root>/.stako/config.toml` and (optionally)
+/// `<notes_root>/.stako/config.local.toml`. Missing files are tolerated:
 /// load returns the defaults for any field not specified. This lets tests
 /// run against a temp dir that only has the bits they need.
 pub fn loadFromRoot(allocator: std.mem.Allocator, notes_root: []const u8) LoadError!Config {
@@ -76,11 +76,11 @@ pub fn loadFromRoot(allocator: std.mem.Allocator, notes_root: []const u8) LoadEr
     defer root.close();
 
     // Layer 1: config.toml.
-    if (try readOptional(arena, &root, ".organo/config.toml")) |bytes| {
+    if (try readOptional(arena, &root, ".stako/config.toml")) |bytes| {
         try applyLayer(arena, &cfg, bytes, .committed);
     }
     // Layer 2: config.local.toml (overrides).
-    if (try readOptional(arena, &root, ".organo/config.local.toml")) |bytes| {
+    if (try readOptional(arena, &root, ".stako/config.local.toml")) |bytes| {
         try applyLayer(arena, &cfg, bytes, .local);
     }
 
@@ -235,9 +235,9 @@ test "loadFromRoot: layered with config.toml + config.local.toml" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     {
-        var f = try tmp.dir.createFile(".organo/config.toml", .{ .truncate = true });
+        var f = try tmp.dir.createFile(".stako/config.toml", .{ .truncate = true });
         defer f.close();
         try f.writeAll(
             \\[daemon]
@@ -248,7 +248,7 @@ test "loadFromRoot: layered with config.toml + config.local.toml" {
         );
     }
     {
-        var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+        var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
         defer f.close();
         try f.writeAll(
             \\[daemon]
@@ -270,9 +270,9 @@ test "loadFromRoot: identity tables replace wholesale, not merge" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     {
-        var f = try tmp.dir.createFile(".organo/config.toml", .{ .truncate = true });
+        var f = try tmp.dir.createFile(".stako/config.toml", .{ .truncate = true });
         defer f.close();
         try f.writeAll(
             \\[identity.local]
@@ -287,7 +287,7 @@ test "loadFromRoot: identity tables replace wholesale, not merge" {
         );
     }
     {
-        var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+        var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
         defer f.close();
         // Only set capabilities; type/description must NOT carry over from
         // the committed file (full replacement semantics).
@@ -319,9 +319,9 @@ test "loadFromRoot: workdir.allowlist" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     {
-        var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+        var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
         defer f.close();
         try f.writeAll(
             \\[workdir]
@@ -344,8 +344,8 @@ test "loadFromRoot: invalid port rejected" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
-    var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+    try tmp.dir.makePath(".stako");
+    var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
     defer f.close();
     try f.writeAll("[daemon]\nport = 99999\n");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -357,7 +357,7 @@ test "loadFromRoot: config read errors are not treated as missing config" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo/config.toml");
+    try tmp.dir.makePath(".stako/config.toml");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
     try std.testing.expectError(error.IsDir, loadFromRoot(a, abs));
@@ -367,8 +367,8 @@ test "loadFromRoot: malformed TOML in config.local.toml surfaces error.Toml" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
-    var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+    try tmp.dir.makePath(".stako");
+    var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
     defer f.close();
     // Unterminated string ⇒ TOML parse failure.
     try f.writeAll("[daemon]\nport = \"oops\n");
@@ -381,8 +381,8 @@ test "loadFromRoot: wrong scalar type rejected with error.BadType" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
-    var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+    try tmp.dir.makePath(".stako");
+    var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
     defer f.close();
     // port is declared as a string instead of integer.
     try f.writeAll("[daemon]\nport = \"7421\"\n");
@@ -395,8 +395,8 @@ test "loadFromRoot: loopback_only wrong type rejected" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
-    var f = try tmp.dir.createFile(".organo/config.local.toml", .{ .truncate = true });
+    try tmp.dir.makePath(".stako");
+    var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
     defer f.close();
     try f.writeAll("[daemon]\nloopback_only = \"yes\"\n");
     var buf: [std.fs.max_path_bytes]u8 = undefined;

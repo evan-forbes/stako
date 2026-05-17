@@ -9,7 +9,7 @@
 
 ## Design Context
 
-Organo should provide a highly modular and minimal TUI harness similar to Codex or Claude Code, but with deeper customization for project-specific agents, stacks, and notes workflows. A TypeScript implementation may be faster to bootstrap from existing tools, but the current design treats dependency risk as a serious concern for company-critical usage.
+Stako should provide a highly modular and minimal TUI harness similar to Codex or Claude Code, but with deeper customization for project-specific agents, stacks, and notes workflows. A TypeScript implementation may be faster to bootstrap from existing tools, but the current design treats dependency risk as a serious concern for company-critical usage.
 
 Zig is the preferred candidate for the core harness and TUI if the ecosystem can support a smooth enough interface.
 
@@ -26,7 +26,7 @@ Zig is the preferred candidate for the core harness and TUI if the ecosystem can
 
 ## Planning Notes
 
-- The TUI does not need to own business logic. It should be a thin surface over core Organo services.
+- The TUI does not need to own business logic. It should be a thin surface over core Stako services.
 - The core should expose stable commands/events so a future non-TUI client can reuse the same behavior.
 - The TUI library decision should happen before committing to long-lived UI architecture, but it should not block documenting the stack, auth, indexing, or provider contracts.
 
@@ -36,14 +36,14 @@ Zig is the preferred candidate for the core harness and TUI if the ecosystem can
 - Build a small spike for the top one or two candidates.
 - Spike must render a transcript pane, queue pane, text input, status footer, and provider/model selector.
 - Test terminal resize, long text wrapping, keyboard shortcuts, streaming updates, and focus movement.
-- Decide whether the first Organo TUI should be Zig-native, TypeScript-first, or a CLI-only core with TUI delayed.
+- Decide whether the first Stako TUI should be Zig-native, TypeScript-first, or a CLI-only core with TUI delayed.
 - Record the decision in `high_level_implementation.md`.
 
 ## Acceptance Criteria
 
 - A selected TUI library or an explicit decision to defer the TUI library choice.
 - Documented rationale that accounts for performance, robustness, dependency risk, maintainability, and feature fit.
-- A minimal spike proving the selected option can support the expected Organo layout.
+- A minimal spike proving the selected option can support the expected Stako layout.
 - `high_level_implementation.md` updated with the decision.
 
 ## Dependencies

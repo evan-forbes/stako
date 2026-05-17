@@ -9,14 +9,14 @@
 
 ## Design Context
 
-Organo should borrow useful ideas from `pi` while avoiding a large TypeScript dependency graph as the long-term foundation. The desired result is a minimal, modular, customizable agent harness that supports specific agents with low overhead.
+Stako should borrow useful ideas from `pi` while avoiding a large TypeScript dependency graph as the long-term foundation. The desired result is a minimal, modular, customizable agent harness that supports specific agents with low overhead.
 
-Prompts and agent definitions should live in the notes repository with the rest of Organo state.
+Prompts and agent definitions should live in the notes repository with the rest of Stako state.
 
 ## Research Before Implementation
 
 - Inventory `pi` features by workflow: chat, agent definitions, provider selection, model selection, tools, prompt storage, sessions, context loading, file operations, and stack-like behavior.
-- Identify which features are essential for Organo and which are out of scope.
+- Identify which features are essential for Stako and which are out of scope.
 - Compare `pi` behavior with Codex and Claude Code style workflows.
 - Determine how prompts and agent definitions should be represented as Markdown files.
 - Identify required agent metadata: supported tools, preferred providers/models, context requirements, capability restrictions, budget/context limits, and routing hints.
@@ -33,7 +33,7 @@ Prompts and agent definitions should live in the notes repository with the rest 
 ## Implementation Plan Draft
 
 - Write a `pi` feature comparison document.
-- Define Organo's minimum viable agent harness.
+- Define Stako's minimum viable agent harness.
 - Define Markdown schemas for prompts, agents, sessions, and transcripts.
 - Define the provider/model/tool routing contract.
 - Implement a CLI-first harness before deep TUI polish if that reduces risk.
@@ -42,7 +42,7 @@ Prompts and agent definitions should live in the notes repository with the rest 
 
 ## Acceptance Criteria
 
-- Clear list of `pi`-level features Organo will support.
+- Clear list of `pi`-level features Stako will support.
 - Clear list of deferred or rejected `pi` features.
 - Agent and prompt file formats are documented.
 - Agent metadata supports stack routing.

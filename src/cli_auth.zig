@@ -1,4 +1,4 @@
-//! `organo auth ...` implementation (milestone 8).
+//! `stako auth ...` implementation (milestone 8).
 //!
 //! Wraps the daemon's `GET /providers` and `GET /providers/{name}` read
 //! endpoints. Mirrors `cli_stack.zig`'s "daemon JSON → human rendering"
@@ -24,7 +24,7 @@ pub fn run(
         .port_override = args.flags.port_override,
         .verbose = args.flags.verbose,
     }) catch |e| {
-        try stderr.print("organo auth: failed to prepare client: {s}\n", .{@errorName(e)});
+        try stderr.print("stako auth: failed to prepare client: {s}\n", .{@errorName(e)});
         return 1;
     };
     defer client.deinit();
@@ -96,14 +96,14 @@ fn runSignout(
     if (args.flags.json) {
         try stdout.print(
             "{{\"error\":\"not_supported\",\"action\":\"signout\",\"provider\":\"{s}\"," ++
-                "\"message\":\"organo does not own provider subscription tokens; sign out via the provider's own CLI or unset the API-key env var\"}}\n",
+                "\"message\":\"stako does not own provider subscription tokens; sign out via the provider's own CLI or unset the API-key env var\"}}\n",
             .{args.provider_name},
         );
         return 1;
     }
     try stderr.print(
-        "organo auth: signout not supported for `{s}` in v1.\n" ++
-            "  organo doesn't own provider subscription tokens; sign out via the\n" ++
+        "stako auth: signout not supported for `{s}` in v1.\n" ++
+            "  stako doesn't own provider subscription tokens; sign out via the\n" ++
             "  provider's own CLI (e.g. `claude logout`, `codex logout`) or unset\n" ++
             "  the API-key env var.\n",
         .{args.provider_name},
@@ -121,14 +121,14 @@ fn reportClientError(
 ) !u8 {
     switch (e) {
         error.DaemonNotRunning, error.ConnectionRefused => {
-            try stderr.writeAll("organo: daemon not started; try `organo daemon start`\n");
+            try stderr.writeAll("stako: daemon not started; try `stako daemon start`\n");
             if (client.verbose) {
                 try stderr.print("  attempted: http://{s}:{d}{s}\n", .{ client.host, client.port, path });
             }
             return 1;
         },
         else => {
-            try stderr.print("organo auth: request failed: {s}\n", .{@errorName(e)});
+            try stderr.print("stako auth: request failed: {s}\n", .{@errorName(e)});
             if (client.verbose) {
                 try stderr.print("  attempted: http://{s}:{d}{s}\n", .{ client.host, client.port, path });
             }
@@ -147,11 +147,11 @@ fn reportApiError(
     const code = findJsonStringField(body, "\"code\":\"");
     const message = findJsonStringField(body, "\"message\":\"");
     if (code) |c| {
-        try stderr.print("organo auth: HTTP {d} {s}", .{ status, c });
+        try stderr.print("stako auth: HTTP {d} {s}", .{ status, c });
         if (message) |m| try stderr.print(": {s}", .{m});
         try stderr.writeAll("\n");
     } else {
-        try stderr.print("organo auth: HTTP {d}\n", .{status});
+        try stderr.print("stako auth: HTTP {d}\n", .{status});
     }
     if (verbose) try stderr.print("  path: {s}\n", .{path});
     return 1;

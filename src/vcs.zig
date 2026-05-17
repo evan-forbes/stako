@@ -25,9 +25,9 @@ pub const CommitOptions = struct {
     /// Optional body. May be multi-line; included verbatim after a blank line.
     body: ?[]const u8 = null,
     /// Author / committer name (`-c user.name=...`).
-    author_name: []const u8 = "organo daemon",
+    author_name: []const u8 = "stako daemon",
     /// Author / committer email (`-c user.email=...`).
-    author_email: []const u8 = "organo@local",
+    author_email: []const u8 = "stako@local",
 };
 
 /// Return value of `commit`. `committed = false` means no changes were staged
@@ -134,7 +134,7 @@ pub fn commit(
     defer allocator.free(email_arg);
 
     // We pass the message via a file to avoid argv escaping pitfalls.
-    const msg_path = try std.fs.path.join(allocator, &.{ repo_root, ".git", "ORGANO_COMMIT_MSG" });
+    const msg_path = try std.fs.path.join(allocator, &.{ repo_root, ".git", "STAKO_COMMIT_MSG" });
     defer allocator.free(msg_path);
     {
         var f = std.fs.cwd().createFile(msg_path, .{ .truncate = true, .mode = 0o600 }) catch return error.GitFailed;
@@ -144,11 +144,11 @@ pub fn commit(
     defer std.fs.cwd().deleteFile(msg_path) catch {};
 
     // Note: we need the message path relative to the repo root because we cd
-    // into it. `.git/ORGANO_COMMIT_MSG` works.
+    // into it. `.git/STAKO_COMMIT_MSG` works.
     const commit_argv = [_][]const u8{
         "-c", name_arg,
         "-c", email_arg,
-        "commit", "--no-gpg-sign", "--allow-empty-message", "-F", ".git/ORGANO_COMMIT_MSG",
+        "commit", "--no-gpg-sign", "--allow-empty-message", "-F", ".git/STAKO_COMMIT_MSG",
     };
     const commit_out = try runGit(allocator, repo_root, &commit_argv, true);
     defer allocator.free(commit_out);
@@ -317,7 +317,7 @@ fn runGitFull(
 }
 
 /// Best-effort: initialise a real repo at `root` with `git init` so the
-/// daemon can commit into it. Used by tests; the production `organo init`
+/// daemon can commit into it. Used by tests; the production `stako init`
 /// produces the same layout via its bespoke writer.
 pub fn ensureRealRepo(allocator: std.mem.Allocator, repo_root: []const u8) Error!void {
     var dir = std.fs.openDirAbsolute(repo_root, .{}) catch return error.NotARepo;

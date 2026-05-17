@@ -2,7 +2,7 @@
 
 ## Scope
 
-The `organo` CLI is a thin shell over the daemon's HTTP API. It is the first non-browser client. It does not duplicate stack-runtime logic, does not read or write stack files directly, and does not embed provider integrations — all of that lives in the daemon.
+The `stako` CLI is a thin shell over the daemon's HTTP API. It is the first non-browser client. It does not duplicate stack-runtime logic, does not read or write stack files directly, and does not embed provider integrations — all of that lives in the daemon.
 
 ## Decided
 
@@ -14,41 +14,41 @@ The `organo` CLI is a thin shell over the daemon's HTTP API. It is the first non
 ## Commands (v1)
 
 ```
-organo init                          # create the notes/stack directory layout
-organo daemon start [--port N]
-organo daemon stop
-organo daemon status
-organo d start|stop|st               # short daemon aliases
+stako init                          # create the notes/stack directory layout
+stako daemon start [--port N]
+stako daemon stop
+stako daemon status
+stako d start|stop|st               # short daemon aliases
 
-organo stack list
-organo stack show <name>
-organo stack config <name>
-organo s ls                          # short stack list
-organo s sh <name>                   # short stack show
-organo s cfg <name>                  # short stack config
-organo stack add <name> <kind> [-t ...] [-f ...]
-organo stack insert <name> <ref> ...
-organo stack retry <name> <id>
-organo stack cancel <name> <id>
-organo stack supersede <name> <id> <replacement-id>
-organo stack pause <name>
-organo stack resume <name>
-organo s add|ins|rt|cx|sup|p|r|cfg ...
+stako stack list
+stako stack show <name>
+stako stack config <name>
+stako s ls                          # short stack list
+stako s sh <name>                   # short stack show
+stako s cfg <name>                  # short stack config
+stako stack add <name> <kind> [-t ...] [-f ...]
+stako stack insert <name> <ref> ...
+stako stack retry <name> <id>
+stako stack cancel <name> <id>
+stako stack supersede <name> <id> <replacement-id>
+stako stack pause <name>
+stako stack resume <name>
+stako s add|ins|rt|cx|sup|p|r|cfg ...
 
-organo auth <provider>               # provider login hint or official-CLI handoff
-organo auth status
-organo a <provider>
-organo a st
+stako auth <provider>               # provider login hint or official-CLI handoff
+stako auth status
+stako a <provider>
+stako a st
 ```
 
 ## To Decide
 
-- Whether `organo stack add` reads prompt body from stdin when `--prompt-file -` is passed.
+- Whether `stako stack add` reads prompt body from stdin when `--prompt-file -` is passed.
 
 ### Resolved (was: To Decide)
 
 - **Output format**: human-readable default; `--json` flag returns the daemon's JSON response unchanged.
-- **Daemon discovery**: read port from `config.local.toml` (falling back to `config.toml`); allow `ORGANO_PORT` env-var override. No daemon-discovery protocol; loopback + known port.
+- **Daemon discovery**: read port from `config.local.toml` (falling back to `config.toml`); allow `STAKO_PORT` env-var override. No daemon-discovery protocol; loopback + known port.
 - **Subcommand shape**: keep formal groups (`stack`, `daemon`, `auth`) and provide short aliases (`s`, `d`, `a`).
 - **Common short flags**: `--json/-j`, `--root/-r`, `--port/-p`, `--target/-t`, `--prompt-file/-f`, `--set/-s`, `--verbose/-v`.
 
@@ -69,7 +69,7 @@ organo a st
 - The CLI produces no output that the daemon's HTTP API didn't return (no parallel logic).
 - Scriptable: every command supports machine-readable output.
 - Ergonomic: common commands and flags have documented short forms.
-- `organo init` is idempotent.
+- `stako init` is idempotent.
 - Auth commands use daemon provider-status logic and never create a CLI-local credential store.
 
 ## Dependencies

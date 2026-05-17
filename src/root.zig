@@ -1,4 +1,4 @@
-//! organo public library surface.
+//! stako public library surface.
 //!
 //! Milestone 1 exposes the stack-item file-format primitives. Later
 //! milestones layer the daemon, runtime loop, and CLI on top.
@@ -21,6 +21,7 @@ pub const http_client = @import("http_client.zig");
 pub const audit = @import("audit.zig");
 pub const vcs = @import("vcs.zig");
 pub const mutations = @import("mutations.zig");
+pub const stack = @import("stack.zig");
 pub const mutation_queue = @import("mutation_queue.zig");
 pub const events = @import("events.zig");
 pub const adapter = @import("adapter.zig");

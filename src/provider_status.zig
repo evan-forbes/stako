@@ -2,7 +2,7 @@
 //!
 //! Owns the per-provider availability probe + a small JSON-rendering surface
 //! used by the daemon's `GET /providers` endpoint and the CLI's
-//! `organo auth status` subcommand.
+//! `stako auth status` subcommand.
 //!
 //! Per `todos/research_provider_sign_in.md` and the M8 plan:
 //!
@@ -211,7 +211,7 @@ fn probeGemini(binary_present: bool) Status {
             "gemini CLI present but structured stream-json mode unconfirmed; adapter deferred"
         else
             "gemini CLI not on PATH; adapter deferred",
-        .login_hint = "gemini auth   # (organo gemini adapter is deferred; see design_execution_harness.md)",
+        .login_hint = "gemini auth   # (stako gemini adapter is deferred; see design_execution_harness.md)",
         .credential_env = "GEMINI_API_KEY",
     };
 }
@@ -321,7 +321,7 @@ test "probeAll surfaces OOM cleanly" {
 
 test "binaryOnPath: /bin/sh always present" {
     try std.testing.expect(binaryOnPath("sh"));
-    try std.testing.expect(!binaryOnPath("definitely-not-a-real-binary-organo"));
+    try std.testing.expect(!binaryOnPath("definitely-not-a-real-binary-stako"));
 }
 
 test "probe gemini always marks available=false (deferred)" {

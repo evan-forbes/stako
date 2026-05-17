@@ -73,7 +73,7 @@ A global stream `/events` may also exist (see "To Decide") — same schema, just
 ## To Decide
 
 - Whether `/stacks/{name}/events` is the only SSE stream, or whether there is also a daemon-wide `/events`.
-- Static asset serving (single CSS file, maybe one JS file) — bundled into the daemon binary at compile time or served from `<notes-root>/.organo/static/`.
+- Static asset serving (single CSS file, maybe one JS file) — bundled into the daemon binary at compile time or served from `<notes-root>/.stako/static/`.
 
 ### Resolved (was: To Decide)
 

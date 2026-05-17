@@ -6,7 +6,7 @@
 //! invocation; routing decisions are made by the supervisor's existing
 //! preflight using `allowed_harnesses` + (per item) `target.provider`.
 //!
-//! Mapping of organo provider/harness names to CLI binaries:
+//! Mapping of stako provider/harness names to CLI binaries:
 //!
 //!   provider "anthropic"  ↔ harness "claude" ↔ binary `claude`
 //!   provider "openai"     ↔ harness "codex"  ↔ binary `codex`
@@ -299,7 +299,7 @@ test "buildArgv: pathological prompt.md contents pass through as one argv slot" 
     const tmp = std.posix.getenv("TMPDIR") orelse "/tmp";
     var ts_buf: [40]u8 = undefined;
     const ts = try std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.nanoTimestamp()});
-    const dir = try std.fs.path.join(a, &.{ tmp, "organo-test-m7-argv", ts });
+    const dir = try std.fs.path.join(a, &.{ tmp, "stako-test-m7-argv", ts });
     defer a.free(dir);
     try std.fs.cwd().makePath(dir);
     defer std.fs.cwd().deleteTree(dir) catch {};

@@ -1,14 +1,14 @@
-//! CLI subcommand routing for the `organo` binary.
+//! CLI subcommand routing for the `stako` binary.
 //!
 //! Milestones 2–3 added `init` and `daemon`. Milestone 4 wraps the daemon's
 //! read endpoints in user-facing subcommands plus short aliases. The shape
 //! mirrors `todos/implement_cli_client.md`:
 //!
-//!   organo init                              # local-only filesystem work
-//!   organo daemon start|stop|status          # process management
-//!   organo d start|stop|st                   # short daemon aliases
-//!   organo stack list|show|config            # API calls
-//!   organo s ls|sh|cfg                       # short stack aliases
+//!   stako init                              # local-only filesystem work
+//!   stako daemon start|stop|status          # process management
+//!   stako d start|stop|st                   # short daemon aliases
+//!   stako stack list|show|config            # API calls
+//!   stako s ls|sh|cfg                       # short stack aliases
 //!
 //! Every API command supports the same global flag set:
 //!
@@ -380,14 +380,14 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
 
 /// `auth` subcommand actions (milestone 8). The canonical shape is:
 ///
-///   organo auth status                  # GET /providers, summary view
-///   organo auth <provider>              # GET /providers/<name>, single view
-///   organo auth signout <provider>      # not implemented in v1 — see below
+///   stako auth status                  # GET /providers, summary view
+///   stako auth <provider>              # GET /providers/<name>, single view
+///   stako auth signout <provider>      # not implemented in v1 — see below
 ///
-/// Short aliases: `organo a st`, `organo a <provider>`, `organo a out <p>`.
+/// Short aliases: `stako a st`, `stako a <provider>`, `stako a out <p>`.
 ///
 /// `signout` is recognized by the parser but the runner emits a stable
-/// "not supported" message: organo doesn't own subscription tokens in v1
+/// "not supported" message: stako doesn't own subscription tokens in v1
 /// (see `todos/research_provider_sign_in.md`), so it has nothing to sign
 /// out. API-key callers should unset the relevant env var themselves.
 pub const AuthAction = enum {
@@ -412,7 +412,7 @@ pub const AuthArgs = struct {
 /// Parse `auth [status|<provider>|signout <provider>] [flags...]`.
 pub fn parseAuthArgs(args: []const []const u8) UsageError!AuthArgs {
     if (args.len == 0) {
-        // Bare `organo auth` defaults to status.
+        // Bare `stako auth` defaults to status.
         return .{ .action = .status };
     }
     var out: AuthArgs = .{ .action = .status };
@@ -459,7 +459,7 @@ pub fn parseAuthArgs(args: []const []const u8) UsageError!AuthArgs {
             if (AuthAction.fromString(a)) |act| {
                 out.action = act;
             } else {
-                // Treated as a provider name shortcut: `organo auth claude`.
+                // Treated as a provider name shortcut: `stako auth claude`.
                 out.action = .provider;
                 out.provider_name = a;
             }
@@ -496,7 +496,7 @@ pub fn dispatch(
     }
 
     const sub = Subcommand.fromString(argv[0]) orelse {
-        try stderr.print("organo: unknown subcommand `{s}`\n", .{argv[0]});
+        try stderr.print("stako: unknown subcommand `{s}`\n", .{argv[0]});
         try printUsage(stderr);
         return 2;
     };
@@ -517,7 +517,7 @@ fn runAuth(
     stderr: anytype,
 ) !u8 {
     const parsed = parseAuthArgs(args) catch |e| {
-        try stderr.print("organo auth: {s}\n", .{@errorName(e)});
+        try stderr.print("stako auth: {s}\n", .{@errorName(e)});
         try printAuthUsage(stderr);
         return 2;
     };
@@ -531,7 +531,7 @@ fn runDaemon(
     stderr: anytype,
 ) !u8 {
     const parsed = parseDaemonArgs(args) catch |e| {
-        try stderr.print("organo daemon: {s}\n", .{@errorName(e)});
+        try stderr.print("stako daemon: {s}\n", .{@errorName(e)});
         try printDaemonUsage(stderr);
         return 2;
     };
@@ -545,7 +545,7 @@ fn runDaemon(
                 .dispatch = harness_dispatch.dispatch(),
                 .enable_provider_preflight = true,
             }) catch |e| {
-                try stderr.print("organo daemon start: failed: {s}\n", .{@errorName(e)});
+                try stderr.print("stako daemon start: failed: {s}\n", .{@errorName(e)});
                 return 1;
             };
             defer d.deinit();
@@ -553,10 +553,10 @@ fn runDaemon(
             // `d` has a stable address (workers hold a pointer back to
             // the heap-allocated supervisor and the queue audit_writer).
             d.startWorker() catch |e| {
-                try stderr.print("organo daemon start: failed to start mutation worker: {s}\n", .{@errorName(e)});
+                try stderr.print("stako daemon start: failed to start mutation worker: {s}\n", .{@errorName(e)});
                 return 1;
             };
-            try stdout.print("organo daemon: listening on 127.0.0.1:{d}\n", .{d.bound_port});
+            try stdout.print("stako daemon: listening on 127.0.0.1:{d}\n", .{d.bound_port});
             try stdout.flush();
             try stderr.flush();
             // Foreground accept loop until SIGTERM.
@@ -565,7 +565,7 @@ fn runDaemon(
             installSignalHandlers();
             // Best-effort: serve until interrupted.
             daemon_mod.serveUntilShutdown(&d) catch |e| {
-                try stderr.print("organo daemon: serve loop ended: {s}\n", .{@errorName(e)});
+                try stderr.print("stako daemon: serve loop ended: {s}\n", .{@errorName(e)});
             };
             // Clean up PID file on graceful exit.
             if (d.pid_written) {
@@ -575,14 +575,14 @@ fn runDaemon(
         },
         .stop => {
             const result = daemon_mod.stop(allocator, parsed.root, 5) catch |e| {
-                try stderr.print("organo daemon stop: failed: {s}\n", .{@errorName(e)});
+                try stderr.print("stako daemon stop: failed: {s}\n", .{@errorName(e)});
                 return 1;
             };
             switch (result) {
-                .not_running => try stdout.writeAll("organo daemon: not running\n"),
-                .stopped => try stdout.writeAll("organo daemon: stopped\n"),
+                .not_running => try stdout.writeAll("stako daemon: not running\n"),
+                .stopped => try stdout.writeAll("stako daemon: stopped\n"),
                 .timeout => {
-                    try stdout.writeAll("organo daemon: process did not exit within grace; pid file left for inspection\n");
+                    try stdout.writeAll("stako daemon: process did not exit within grace; pid file left for inspection\n");
                     return 1;
                 },
             }
@@ -590,18 +590,18 @@ fn runDaemon(
         },
         .status => {
             const info = daemon_mod.readPidFile(allocator, parsed.root) catch |e| {
-                try stderr.print("organo daemon status: failed: {s}\n", .{@errorName(e)});
+                try stderr.print("stako daemon status: failed: {s}\n", .{@errorName(e)});
                 return 1;
             };
             if (info) |pi| {
                 if (daemon_mod.isProcessAlive(pi.pid)) {
                     const uptime = std.time.timestamp() - pi.started_at;
-                    try stdout.print("organo daemon: running (pid {d}, port {d}, uptime {d}s)\n", .{ pi.pid, pi.port, uptime });
+                    try stdout.print("stako daemon: running (pid {d}, port {d}, uptime {d}s)\n", .{ pi.pid, pi.port, uptime });
                 } else {
-                    try stdout.print("organo daemon: stale pid file (pid {d} not alive)\n", .{pi.pid});
+                    try stdout.print("stako daemon: stale pid file (pid {d} not alive)\n", .{pi.pid});
                 }
             } else {
-                try stdout.writeAll("organo daemon: stopped\n");
+                try stdout.writeAll("stako daemon: stopped\n");
             }
             return 0;
         },
@@ -615,7 +615,7 @@ fn runStack(
     stderr: anytype,
 ) !u8 {
     const parsed = parseStackArgs(args) catch |e| {
-        try stderr.print("organo stack: {s}\n", .{@errorName(e)});
+        try stderr.print("stako stack: {s}\n", .{@errorName(e)});
         try printStackUsage(stderr);
         return 2;
     };
@@ -647,7 +647,7 @@ fn runInit(
     stderr: anytype,
 ) !u8 {
     const parsed = parseInitArgs(args) catch |e| {
-        try stderr.print("organo init: {s}\n", .{@errorName(e)});
+        try stderr.print("stako init: {s}\n", .{@errorName(e)});
         try printInitUsage(stderr);
         return 2;
     };
@@ -659,7 +659,7 @@ fn runInit(
         .now_override = parsed.now_override,
         .rng_seed_override = parsed.rng_seed_override,
     }) catch |e| {
-        try stderr.print("organo init: failed: {s}\n", .{@errorName(e)});
+        try stderr.print("stako init: failed: {s}\n", .{@errorName(e)});
         return 1;
     };
     defer report.deinit();
@@ -670,10 +670,10 @@ fn runInit(
 
 fn printUsage(w: anytype) !void {
     try w.writeAll(
-        \\organo — local orchestrator for AI coding harnesses
+        \\stako — local orchestrator for AI coding harnesses
         \\
         \\Usage:
-        \\  organo <subcommand> [options]
+        \\  stako <subcommand> [options]
         \\
         \\Subcommands:
         \\  init                        Bootstrap a notes-root layout
@@ -681,20 +681,20 @@ fn printUsage(w: anytype) !void {
         \\  stack,  s  list|show|cfg    Read stacks via the daemon
         \\  auth,   a  status|<prov>    Report provider availability + auth state
         \\
-        \\Run `organo <subcommand>` with no further args for per-subcommand help.
+        \\Run `stako <subcommand>` with no further args for per-subcommand help.
         \\
     );
 }
 
 fn printAuthUsage(w: anytype) !void {
     try w.writeAll(
-        \\Usage: organo auth|a [status|st|<provider>|signout|out <provider>] [flags...]
+        \\Usage: stako auth|a [status|st|<provider>|signout|out <provider>] [flags...]
         \\
         \\Actions:
         \\  status, st                 Show all providers (default).
         \\  <provider>                 Show one provider (anthropic|openai|google
         \\                             or harness aliases claude|codex|gemini).
-        \\  signout, out <provider>    Always fails in v1 — organo doesn't own
+        \\  signout, out <provider>    Always fails in v1 — stako doesn't own
         \\                             provider subscription tokens. Local-only;
         \\                             never contacts the daemon. The --root,
         \\                             --port, and --verbose flags are accepted
@@ -705,7 +705,7 @@ fn printAuthUsage(w: anytype) !void {
         \\                        (signout emits a `{"error":"not_supported"}`
         \\                        envelope on stdout instead).
         \\  --root,    -r <path>  Notes root for local config/token discovery.
-        \\  --port,    -p <n>     Override the daemon port (also: ORGANO_PORT).
+        \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
         \\  --verbose, -v         Show request URL on errors.
         \\
     );
@@ -713,7 +713,7 @@ fn printAuthUsage(w: anytype) !void {
 
 fn printDaemonUsage(w: anytype) !void {
     try w.writeAll(
-        \\Usage: organo daemon|d <start|stop|status|st> [--root, -r <path>] [--port, -p <n>]
+        \\Usage: stako daemon|d <start|stop|status|st> [--root, -r <path>] [--port, -p <n>]
         \\
         \\Actions:
         \\  start         Bind loopback, serve HTTP read endpoints.
@@ -725,7 +725,7 @@ fn printDaemonUsage(w: anytype) !void {
 
 fn printInitUsage(w: anytype) !void {
     try w.writeAll(
-        \\Usage: organo init [--root, -r <path>] [--yes, -y] [--quiet, -q]
+        \\Usage: stako init [--root, -r <path>] [--yes, -y] [--quiet, -q]
         \\
         \\  --root, -r <path>   Path to the notes root (default: cwd).
         \\  --yes, -y           Skip prompts; auto-init git when needed.
@@ -736,7 +736,7 @@ fn printInitUsage(w: anytype) !void {
 
 fn printStackUsage(w: anytype) !void {
     try w.writeAll(
-        \\Usage: organo stack|s <list|show|config> [<name>] [flags...]
+        \\Usage: stako stack|s <list|show|config> [<name>] [flags...]
         \\
         \\Actions:
         \\  list,   ls            List known stacks.
@@ -746,7 +746,7 @@ fn printStackUsage(w: anytype) !void {
         \\Flags (common to every API subcommand):
         \\  --json,    -j         Pass the daemon JSON through unchanged.
         \\  --root,    -r <path>  Notes root for local config/token discovery.
-        \\  --port,    -p <n>     Override the daemon port (also: ORGANO_PORT).
+        \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
         \\  --verbose, -v         Show request URL on errors.
         \\
     );
@@ -755,18 +755,18 @@ fn printStackUsage(w: anytype) !void {
 fn printReport(w: anytype, r: *const init_mod.Report, quiet: bool) !void {
     if (r.inside_existing_git) {
         try w.writeAll("warning: notes root is inside an existing git repository;\n");
-        try w.writeAll("         the organo layout will join that repo's history.\n");
+        try w.writeAll("         the stako layout will join that repo's history.\n");
     }
     if (r.git_initialized) {
         try w.writeAll("initialized git repository (.git)\n");
     }
     if (r.created.items.len == 0) {
-        try w.writeAll("organo init: already initialized — no changes.\n");
+        try w.writeAll("stako init: already initialized — no changes.\n");
         return;
     }
     if (quiet) {
         try w.print(
-            "organo init: {d} created, {d} already present.\n",
+            "stako init: {d} created, {d} already present.\n",
             .{ r.created.items.len, r.already_present.items.len },
         );
         return;

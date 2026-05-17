@@ -151,7 +151,7 @@ None.
 
 5. **Provider/harness mapping is bidirectional and tested.** `providerToHarness` and `harnessToProvider` (harness_dispatch.zig:42-60) are both tested for round-trips (harness_dispatch.zig:179-192). Aliases (`"claude"` / `"anthropic"`) work without code duplication.
 
-6. **Real-credential tests are properly gated.** `realCredentialsEnabled` (adapter_tests.zig:788-798) reads `ORGANO_WITH_REAL_CREDENTIALS`, supports `"1"`, `"all"`, or a comma-separated list, and prints a `[skipped: …]` line on the unset path so CI logs read cleanly. The 30-second wall-clock cap (adapter_tests.zig:864) prevents a hung provider from blocking CI.
+6. **Real-credential tests are properly gated.** `realCredentialsEnabled` (adapter_tests.zig:788-798) reads `STAKO_WITH_REAL_CREDENTIALS`, supports `"1"`, `"all"`, or a comma-separated list, and prints a `[skipped: …]` line on the unset path so CI logs read cleanly. The 30-second wall-clock cap (adapter_tests.zig:864) prevents a hung provider from blocking CI.
 
 7. **Memory ownership is clean.** Every `emit*` helper builds an `ArrayList(u8)`, runs `toOwnedSlice`, and stores the slice as both `data_json` and `storage` so a single `freeOwned` cleanup frees the right bytes. `errdefer` chains in `parseLine` correctly free already-appended events on a mid-line error (claude_adapter.zig:171-174). The `State` struct's `deinit` frees `session_id`/`model`/`session_file` precisely once each.
 

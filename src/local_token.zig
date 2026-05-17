@@ -1,14 +1,14 @@
-//! Local mutation token: ensure `.organo/local_token` exists, load it into
+//! Local mutation token: ensure `.stako/local_token` exists, load it into
 //! memory, and provide a constant-time verifier used by mutation endpoints
 //! once they land (milestone 5).
 //!
-//! On disk shape (created by `organo init` in milestone 2):
+//! On disk shape (created by `stako init` in milestone 2):
 //!   - 64 lowercase hex characters + a trailing newline.
 //!   - File mode 0600.
 //!   - Gitignored.
 //!
 //! In milestone 3 the daemon only generates the token if absent (e.g. when
-//! a user spins up the daemon against a directory that predates organo's
+//! a user spins up the daemon against a directory that predates stako's
 //! init flow) and exposes a verifier for the future mutation path.
 
 const std = @import("std");
@@ -28,7 +28,7 @@ pub const Token = struct {
     }
 };
 
-/// Resolve `<notes_root>/.organo/local_token`. If absent, generate one with
+/// Resolve `<notes_root>/.stako/local_token`. If absent, generate one with
 /// 0600 perms; otherwise leave the file untouched. Returns the in-memory
 /// token, owned by `allocator`.
 pub fn ensureAndLoad(
@@ -39,20 +39,20 @@ pub fn ensureAndLoad(
     defer root.close();
 
     // Try open-for-read first.
-    if (root.openFile(".organo/local_token", .{})) |f| {
+    if (root.openFile(".stako/local_token", .{})) |f| {
         defer f.close();
         // Re-tighten perms in case the file was created or chmod'd with
-        // looser permissions by something outside organo. The token must
+        // looser permissions by something outside stako. The token must
         // stay 0600; verified on every load to keep the contract.
         std.posix.fchmod(f.handle, 0o600) catch {};
         return try readToken(allocator, f);
     } else |open_err| switch (open_err) {
         error.FileNotFound => {
             // Generate.
-            try root.makePath(".organo");
+            try root.makePath(".stako");
             const fresh = try generateHex(allocator);
             errdefer allocator.free(fresh);
-            var f = try root.createFile(".organo/local_token", .{ .truncate = true, .mode = 0o600 });
+            var f = try root.createFile(".stako/local_token", .{ .truncate = true, .mode = 0o600 });
             defer f.close();
             try f.writeAll(fresh);
             try f.writeAll("\n");
@@ -112,8 +112,8 @@ test "ensureAndLoad: existing token read verbatim" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
-    var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true });
+    try tmp.dir.makePath(".stako");
+    var f = try tmp.dir.createFile(".stako/local_token", .{ .truncate = true });
     try f.writeAll("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n");
     f.close();
 
@@ -139,15 +139,15 @@ test "ensureAndLoad: absent token generated with hex shape" {
         try std.testing.expect(ok);
     }
     // File now exists.
-    try tmp.dir.access(".organo/local_token", .{});
+    try tmp.dir.access(".stako/local_token", .{});
 }
 
 test "ensureAndLoad: rejects malformed token file" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
-    var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true });
+    try tmp.dir.makePath(".stako");
+    var f = try tmp.dir.createFile(".stako/local_token", .{ .truncate = true });
     try f.writeAll("not hex!\n");
     f.close();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -160,8 +160,8 @@ test "ensureAndLoad: rejects short uppercase and overlong token files" {
     inline for (.{ "0123456789abcdef\n", "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef\n", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef00\n" }) |contents| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        try tmp.dir.makePath(".organo");
-        var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true });
+        try tmp.dir.makePath(".stako");
+        var f = try tmp.dir.createFile(".stako/local_token", .{ .truncate = true });
         try f.writeAll(contents);
         f.close();
         var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -174,8 +174,8 @@ test "ensureAndLoad: rejects empty token file" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
-    var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true });
+    try tmp.dir.makePath(".stako");
+    var f = try tmp.dir.createFile(".stako/local_token", .{ .truncate = true });
     f.close();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
@@ -192,7 +192,7 @@ test "ensureAndLoad: generated token file has 0600 perms" {
     const tok = try ensureAndLoad(a, abs);
     defer a.free(tok.bytes);
 
-    var f = try tmp.dir.openFile(".organo/local_token", .{});
+    var f = try tmp.dir.openFile(".stako/local_token", .{});
     defer f.close();
     const stat = try f.stat();
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);
@@ -202,9 +202,9 @@ test "ensureAndLoad: re-tightens perms on a previously widened token file" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     {
-        var f = try tmp.dir.createFile(".organo/local_token", .{ .truncate = true, .mode = 0o644 });
+        var f = try tmp.dir.createFile(".stako/local_token", .{ .truncate = true, .mode = 0o644 });
         try f.writeAll("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n");
         f.close();
     }
@@ -213,7 +213,7 @@ test "ensureAndLoad: re-tightens perms on a previously widened token file" {
     const tok = try ensureAndLoad(a, abs);
     defer a.free(tok.bytes);
 
-    var f = try tmp.dir.openFile(".organo/local_token", .{});
+    var f = try tmp.dir.openFile(".stako/local_token", .{});
     defer f.close();
     const stat = try f.stat();
     try std.testing.expectEqual(@as(std.fs.File.Mode, 0o600), stat.mode & 0o777);

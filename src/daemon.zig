@@ -33,7 +33,7 @@ const stack_config = @import("stack_config.zig");
 const audit = @import("audit.zig");
 const vcs = @import("vcs.zig");
 const mutations_mod = @import("mutations.zig");
-const mutation_queue = @import("mutation_queue.zig");
+const stack_mod = @import("stack.zig");
 const sse_mod = @import("sse.zig");
 const runtime_mod = @import("runtime.zig");
 const provider_status = @import("provider_status.zig");
@@ -49,7 +49,7 @@ pub const StartOptions = struct {
     host: []const u8 = "127.0.0.1",
     /// When true, do not write daemon.pid / daemon.log (used by tests).
     ephemeral: bool = false,
-    /// When false, the mutation queue runs without invoking git. Tests use
+    /// When false, stack mutations run without invoking git. Tests use
     /// this to skip subprocess overhead; production leaves it true.
     enable_git: bool = true,
     /// When true, daemon startup runs `vcs.assertNoMergeConflicts`. Tests
@@ -101,7 +101,7 @@ pub fn isLoopbackHost(host: []const u8) bool {
 pub const Daemon = struct {
     allocator: std.mem.Allocator,
     config: Config,
-    reader: storage.Reader,
+    stack_registry: stack_mod.StackRegistry,
     token: local_token.Token,
     server: std.net.Server,
     /// Bound port (after listen — useful when port 0 was requested).
@@ -112,13 +112,10 @@ pub const Daemon = struct {
     notes_root_abs: []u8,
     /// True if daemon.pid was created by this instance (cleaned up on stop).
     pid_written: bool = false,
-    /// Open append-only handle to `.organo/daemon.log`. Null in ephemeral mode.
+    /// Open append-only handle to `.stako/daemon.log`. Null in ephemeral mode.
     log_file: ?std.fs.File = null,
     /// Audit-log writer (milestone 5). Owns the audit.log file descriptor.
     audit_writer: audit.Writer,
-    /// Single-writer mutation queue + worker thread. All POST mutation
-    /// endpoints push requests here.
-    queue: mutation_queue.Queue,
     /// Cached config flag from start.
     enable_git: bool = true,
     /// SSE hub. Optional: set up only when the runtime supervisor is wired
@@ -148,19 +145,17 @@ pub const Daemon = struct {
     pub fn deinit(self: *Daemon) void {
         // Tear-down order matters:
         //   1. Supervisor (joins worker threads and the session manager;
-        //      sessions submit terminal transitions through the queue so
-        //      the queue must still be alive at this point).
-        //   2. Mutation queue (joins its worker thread).
-        //   3. SSE connection threads (the hub still publishes through the
+        //      sessions submit terminal transitions through the stack API so
+        //      the registry must still be alive at this point).
+        //   2. SSE connection threads (the hub still publishes through the
         //      session manager, so we wait until after step 1 to close
         //      their sockets).
-        //   4. Hub, then audit writer, server, etc.
+        //   3. Hub, then stack registry, audit writer, server, etc.
         if (self.supervisor) |sup| {
             sup.deinit();
             self.allocator.destroy(sup);
             self.supervisor = null;
         }
-        self.queue.deinit();
         // Force-close every live SSE connection so its worker thread
         // returns from `stream.read`, then drain.
         self.sse_threads_mu.lock();
@@ -190,10 +185,10 @@ pub const Daemon = struct {
             .target = "daemon",
             .outcome = .allowed,
         }) catch {};
+        self.stack_registry.deinit();
         self.audit_writer.deinit();
         self.server.deinit();
         self.allocator.free(self.token.bytes);
-        self.reader.deinit();
         self.config.deinit();
         if (self.log_file) |*f| f.close();
         // Remove daemon.pid if this instance wrote it. The supervised stop
@@ -240,20 +235,18 @@ pub const Daemon = struct {
         self.sse_threads_mu.unlock();
     }
 
-    /// Start the mutation-queue worker thread and emit the daemon_started
-    /// audit event. Must be called AFTER the caller has stored the returned
-    /// `Daemon` at its final address — the queue worker holds a pointer to
-    /// `daemon.audit_writer`, so moving the Daemon after this point is UB.
+    /// Start runtime workers and emit the daemon_started audit event. Must
+    /// be called AFTER the caller has stored the returned `Daemon` at its
+    /// final address because runtime workers borrow daemon-owned objects.
     ///
     /// When `enable_runtime` was requested at `start()` time, this also
     /// constructs the runtime `Supervisor`, runs the restart-orphan sweep,
     /// owns a fresh SSE `Hub`, and starts one `Worker` thread per stack
     /// discovered under `<notes-root>/stacks/`. The supervisor borrows the
-    /// daemon's audit writer + queue, so it depends on this same
+    /// daemon's audit writer + stack registry, so it depends on this same
     /// final-address contract.
     pub fn startWorker(self: *Daemon) !void {
-        self.queue.audit_writer = &self.audit_writer;
-        try self.queue.start();
+        self.stack_registry.setAuditWriter(&self.audit_writer);
         if (self.runtime_enabled) {
             // Own an SSE Hub the supervisor + handlers share.
             const hub_p = try self.allocator.create(sse_mod.Hub);
@@ -271,7 +264,7 @@ pub const Daemon = struct {
             const sup_p = try self.allocator.create(runtime_mod.Supervisor);
             sup_p.* = runtime_mod.Supervisor.init(self.allocator, .{
                 .notes_root_abs = self.notes_root_abs,
-                .queue = &self.queue,
+                .stack_registry = &self.stack_registry,
                 .audit_writer = &self.audit_writer,
                 .hub = hub_p,
                 .dispatch = dispatch,
@@ -290,8 +283,7 @@ pub const Daemon = struct {
             // of waiting up to one poll interval (100 ms by default). Must
             // run before the worker threads start so the first dispatched
             // tick can rely on the wake-after-append semantics.
-            self.queue.post_commit_ctx = @ptrCast(sup_p);
-            self.queue.post_commit_fn = queuePostCommitWake;
+            self.stack_registry.setPostCommitHook(@ptrCast(sup_p), stackPostCommitWake);
             // Restart-sweep before any worker thread starts so we never
             // race with the supervisor's own ticking over a stale runtime
             // file (per design step 10).
@@ -357,12 +349,8 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
     }
     errdefer if (log_file) |*f| f.close();
 
-    // Storage reader.
-    var reader = try storage.Reader.init(allocator, abs_owned);
-    errdefer reader.deinit();
-
     // Conflict check on the notes repo (gated). We only run this if a real
-    // `.git` is present — `organo init` from milestone 2 produces a stub
+    // `.git` is present — `stako init` from milestone 2 produces a stub
     // .git layout without an actual repo, so we can't blindly invoke git.
     if (opts.check_repo_conflicts and hasRealGit(abs_owned)) {
         vcs.assertNoMergeConflicts(allocator, abs_owned) catch |e| switch (e) {
@@ -376,14 +364,14 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
     var audit_writer = try audit.Writer.init(allocator, abs_owned);
     errdefer audit_writer.deinit();
 
-    // Mutation queue.
-    var queue = mutation_queue.Queue.init(allocator, abs_owned, null);
-    queue.enable_git = opts.enable_git;
+    // Stack registry.
+    var stack_registry = try stack_mod.StackRegistry.init(allocator, abs_owned, null, opts.enable_git);
+    errdefer stack_registry.deinit();
 
     var d: Daemon = .{
         .allocator = allocator,
         .config = cfg,
-        .reader = reader,
+        .stack_registry = stack_registry,
         .token = token,
         .server = server,
         .bound_port = bound_port,
@@ -391,7 +379,6 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
         .pid_written = pid_written,
         .log_file = log_file,
         .audit_writer = audit_writer,
-        .queue = queue,
         .enable_git = opts.enable_git,
         .runtime_enabled = opts.enable_runtime,
         .runtime_dispatch = opts.dispatch,
@@ -405,7 +392,7 @@ pub fn start(allocator: std.mem.Allocator, opts: StartOptions) StartError!Daemon
 pub const ErrorExt = error{MergeConflictsPresent};
 
 fn hasRealGit(notes_root_abs: []const u8) bool {
-    // A real git repo has `.git/HEAD` + `.git/objects/`. The `organo init`
+    // A real git repo has `.git/HEAD` + `.git/objects/`. The `stako init`
     // stub layout has both, so additionally check for `.git/config` whose
     // content includes `[core]`. Cheap and good enough for v1.
     var d = std.fs.openDirAbsolute(notes_root_abs, .{}) catch return false;
@@ -420,7 +407,7 @@ fn openLogFile(
     allocator: std.mem.Allocator,
     notes_root_abs: []const u8,
 ) !std.fs.File {
-    const dir_path = try std.fs.path.join(allocator, &.{ notes_root_abs, ".organo" });
+    const dir_path = try std.fs.path.join(allocator, &.{ notes_root_abs, ".stako" });
     defer allocator.free(dir_path);
     std.fs.cwd().makePath(dir_path) catch {};
     const log_path = try std.fs.path.join(allocator, &.{ dir_path, "daemon.log" });
@@ -459,7 +446,7 @@ pub fn serveUntilShutdown(self: *Daemon) !void {
         var owned: bool = true;
         defer if (owned) conn.stream.close();
         handleConnection(self, conn, &owned) catch |e| {
-            std.log.warn("organo: request failed: {s}", .{@errorName(e)});
+            std.log.warn("stako: request failed: {s}", .{@errorName(e)});
         };
     }
 }
@@ -904,12 +891,12 @@ fn hexNibble(c: u8) ?u8 {
     };
 }
 
-/// Mutation-queue post-commit hook: wake every supervisor worker so a
+/// Stack post-commit hook: wake every supervisor worker so a
 /// freshly-queued item (or a transition that may unblock waiting items)
 /// is dispatched without waiting for the 100 ms poll interval. Called
-/// once per successful mutation, outside the queue mutex.
-fn queuePostCommitWake(ctx: ?*anyopaque, req: *const mutation_queue.Request) void {
-    _ = req;
+/// once per successful mutation, outside the stack mutex.
+fn stackPostCommitWake(ctx: ?*anyopaque, stack_name: []const u8) void {
+    _ = stack_name;
     const ctx_p = ctx orelse return;
     const sup: *runtime_mod.Supervisor = @ptrCast(@alignCast(ctx_p));
     sup.wakeAllWorkers();
@@ -1044,12 +1031,17 @@ fn respondError(
 
 // ---------- endpoint handlers ----------
 
+fn localClient(self: *Daemon, api_path: []const u8) stack_mod.StackClient {
+    return self.stack_registry.localClient("local", api_path);
+}
+
 fn respondStacksList(self: *Daemon, req: *std.http.Server.Request) !void {
-    const names = self.reader.listStacks() catch {
+    const client = localClient(self, "GET /stacks");
+    const names = client.listStacks() catch {
         try respondError(req, .internal, "failed to list stacks", &.{});
         return;
     };
-    defer self.reader.freeStackList(names);
+    defer client.freeStackList(names);
 
     var buf = std.ArrayList(u8){};
     defer buf.deinit(self.allocator);
@@ -1072,7 +1064,8 @@ fn respondStackGet(self: *Daemon, req: *std.http.Server.Request, name: []const u
         });
         return;
     }
-    var cfg = self.reader.readStackConfig(name) catch |e| switch (e) {
+    const client = localClient(self, "GET /stacks/{name}");
+    var cfg = client.readStackConfig(name) catch |e| switch (e) {
         error.NotFound => {
             try respondError(req, .not_found, "stack not found", &.{
                 .{ .key = "stack", .value = name },
@@ -1086,11 +1079,11 @@ fn respondStackGet(self: *Daemon, req: *std.http.Server.Request, name: []const u
     };
     defer cfg.deinit();
 
-    const items = self.reader.listItems(name) catch |e| {
+    const items = client.listItems(name) catch |e| {
         try respondError(req, .internal, @errorName(e), &.{});
         return;
     };
-    defer self.reader.freeItemList(items);
+    defer client.freeItemList(items);
 
     var buf = std.ArrayList(u8){};
     defer buf.deinit(self.allocator);
@@ -1112,7 +1105,8 @@ fn respondStackConfigGet(self: *Daemon, req: *std.http.Server.Request, name: []c
         });
         return;
     }
-    var cfg = self.reader.readStackConfig(name) catch |e| switch (e) {
+    const client = localClient(self, "GET /stacks/{name}/config");
+    var cfg = client.readStackConfig(name) catch |e| switch (e) {
         error.NotFound => {
             try respondError(req, .not_found, "stack not found", &.{
                 .{ .key = "stack", .value = name },
@@ -1140,7 +1134,8 @@ fn respondStackItemsList(self: *Daemon, req: *std.http.Server.Request, name: []c
         });
         return;
     }
-    const items = self.reader.listItems(name) catch |e| switch (e) {
+    const client = localClient(self, "GET /stacks/{name}/items");
+    const items = client.listItems(name) catch |e| switch (e) {
         error.NotFound => {
             try respondError(req, .not_found, "stack not found", &.{
                 .{ .key = "stack", .value = name },
@@ -1152,7 +1147,7 @@ fn respondStackItemsList(self: *Daemon, req: *std.http.Server.Request, name: []c
             return;
         },
     };
-    defer self.reader.freeItemList(items);
+    defer client.freeItemList(items);
 
     var buf = std.ArrayList(u8){};
     defer buf.deinit(self.allocator);
@@ -1179,7 +1174,8 @@ fn respondStackItemGet(
         });
         return;
     }
-    var it = self.reader.readItem(name, id) catch |e| switch (e) {
+    const client = localClient(self, "GET /stacks/{name}/items/{id}");
+    var it = client.readItem(name, id) catch |e| switch (e) {
         error.NotFound => {
             try respondError(req, .not_found, "item not found", &.{
                 .{ .key = "stack", .value = name },
@@ -1259,11 +1255,12 @@ fn respondStyleCss(req: *std.http.Server.Request) !void {
 }
 
 fn respondIndexHtml(self: *Daemon, req: *std.http.Server.Request) !void {
-    const names = self.reader.listStacks() catch {
+    const client = localClient(self, "GET /");
+    const names = client.listStacks() catch {
         try respondError(req, .internal, "failed to list stacks", &.{});
         return;
     };
-    defer self.reader.freeStackList(names);
+    defer client.freeStackList(names);
 
     var buf = std.ArrayList(u8){};
     defer buf.deinit(self.allocator);
@@ -1281,7 +1278,8 @@ fn respondStackHtml(self: *Daemon, req: *std.http.Server.Request, name: []const 
         });
         return;
     }
-    var cfg = self.reader.readStackConfig(name) catch |e| switch (e) {
+    const client = localClient(self, "GET /stacks/{name}");
+    var cfg = client.readStackConfig(name) catch |e| switch (e) {
         error.NotFound => {
             try respondError(req, .not_found, "stack not found", &.{
                 .{ .key = "stack", .value = name },
@@ -1294,11 +1292,11 @@ fn respondStackHtml(self: *Daemon, req: *std.http.Server.Request, name: []const 
         },
     };
     defer cfg.deinit();
-    const items = self.reader.listItems(name) catch |e| {
+    const items = client.listItems(name) catch |e| {
         try respondError(req, .internal, @errorName(e), &.{});
         return;
     };
-    defer self.reader.freeItemList(items);
+    defer client.freeItemList(items);
 
     // Count items currently in `running` status as a cheap snapshot.
     var running_count: usize = 0;
@@ -1341,7 +1339,8 @@ fn respondItemHtml(
         });
         return;
     }
-    var it = self.reader.readItem(name, id) catch |e| switch (e) {
+    const client = localClient(self, "GET /stacks/{name}/items/{id}");
+    var it = client.readItem(name, id) catch |e| switch (e) {
         error.NotFound => {
             try respondError(req, .not_found, "item not found", &.{
                 .{ .key = "stack", .value = name },
@@ -1578,7 +1577,7 @@ fn readRequestBody(self: *Daemon, req: *std.http.Server.Request) ![]u8 {
 /// Map a mutation failure to an HTTP error code + message and respond.
 fn respondMutationError(
     req: *std.http.Server.Request,
-    kind: mutation_queue.MutationFailureKind,
+    kind: stack_mod.MutationFailureKind,
     stack: []const u8,
     item: []const u8,
 ) !void {
@@ -1626,30 +1625,28 @@ fn respondMutationError(
 
 /// Common write step after a mutation succeeds: emit JSON status + the
 /// commit short SHA.
-fn respondMutationOk(req: *std.http.Server.Request, allocator: std.mem.Allocator, request: *const mutation_queue.Request) !void {
+fn respondMutationOk(req: *std.http.Server.Request, allocator: std.mem.Allocator, result: *const stack_mod.StackResult) !void {
     var buf = std.ArrayList(u8){};
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try w.writeAll("{\"ok\":true");
-    if (request.commit_short_sha_len > 0) {
-        const sha = request.commit_short_sha[0..request.commit_short_sha_len];
+    if (result.commit_short_sha_len > 0) {
+        const sha = result.commit_short_sha[0..result.commit_short_sha_len];
         try w.writeAll(",\"commit\":\"");
         try errors.writeJsonString(w, sha);
         try w.writeAll("\"");
     }
-    if (request.output) |*o| {
-        if (o.audit_details.len > 0) {
-            try w.writeAll(",\"details\":{");
-            for (o.audit_details, 0..) |d, i| {
-                if (i != 0) try w.writeAll(",");
-                try w.writeAll("\"");
-                try errors.writeJsonString(w, d.key);
-                try w.writeAll("\":\"");
-                try errors.writeJsonString(w, d.value);
-                try w.writeAll("\"");
-            }
-            try w.writeAll("}");
+    if (result.output.audit_details.len > 0) {
+        try w.writeAll(",\"details\":{");
+        for (result.output.audit_details, 0..) |d, i| {
+            if (i != 0) try w.writeAll(",");
+            try w.writeAll("\"");
+            try errors.writeJsonString(w, d.key);
+            try w.writeAll("\":\"");
+            try errors.writeJsonString(w, d.value);
+            try w.writeAll("\"");
         }
+        try w.writeAll("}");
     }
     try w.writeAll("}");
     try req.respond(buf.items, .{
@@ -1658,6 +1655,23 @@ fn respondMutationOk(req: *std.http.Server.Request, allocator: std.mem.Allocator
             .{ .name = "content-type", .value = "application/json" },
         },
     });
+}
+
+fn respondMutationResult(
+    req: *std.http.Server.Request,
+    allocator: std.mem.Allocator,
+    result: stack_mod.MutationResult,
+    stack: []const u8,
+    item: []const u8,
+) !void {
+    switch (result) {
+        .err => |k| try respondMutationError(req, k, stack, item),
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+            try respondMutationOk(req, allocator, &ok);
+        },
+    }
 }
 
 /// Handle POST /stacks. Body: {"name":"...","config":{...}}.
@@ -1708,17 +1722,8 @@ fn handleCreateStack(self: *Daemon, req: *std.http.Server.Request) !void {
         }
     }
 
-    var request = mutation_queue.Request{
-        .kind = .{ .create_stack = input },
-        .ident = .{ .api_path = "POST /stacks" },
-    };
-    self.queue.submitAndWait(&request);
-    if (request.err) |k| {
-        try respondMutationError(req, k, name, "");
-        return;
-    }
-    defer if (request.output) |*o| o.deinit();
-    try respondMutationOk(req, self.allocator, &request);
+    const client = localClient(self, "POST /stacks");
+    try respondMutationResult(req, self.allocator, client.createStack(input), name, "");
 }
 
 fn handleAppendItem(self: *Daemon, req: *std.http.Server.Request, stack: []const u8) !void {
@@ -1778,17 +1783,8 @@ fn handleAppendItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
         input.sleep_until = v.string;
     };
 
-    var request = mutation_queue.Request{
-        .kind = .{ .append_item = input },
-        .ident = .{ .api_path = "POST /stacks/{name}/items" },
-    };
-    self.queue.submitAndWait(&request);
-    if (request.err) |k| {
-        try respondMutationError(req, k, stack, "");
-        return;
-    }
-    defer if (request.output) |*o| o.deinit();
-    try respondMutationOk(req, self.allocator, &request);
+    const client = localClient(self, "POST /stacks/{name}/items");
+    try respondMutationResult(req, self.allocator, client.appendItem(stack, input), stack, "");
 }
 
 fn handleInsertItem(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, ref: []const u8) !void {
@@ -1841,17 +1837,8 @@ fn handleInsertItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
         };
     };
 
-    var request = mutation_queue.Request{
-        .kind = .{ .insert_item = input },
-        .ident = .{ .api_path = "POST /stacks/{name}/items/{id}/insert" },
-    };
-    self.queue.submitAndWait(&request);
-    if (request.err) |k| {
-        try respondMutationError(req, k, stack, ref);
-        return;
-    }
-    defer if (request.output) |*o| o.deinit();
-    try respondMutationOk(req, self.allocator, &request);
+    const client = localClient(self, "POST /stacks/{name}/items/{id}/insert");
+    try respondMutationResult(req, self.allocator, client.insertItem(stack, input), stack, ref);
 }
 
 fn handleTransition(
@@ -1902,17 +1889,8 @@ fn handleTransition(
         .retry => "POST /stacks/{name}/items/{id}/retry",
         .supersede => "POST /stacks/{name}/items/{id}/supersede",
     };
-    var request = mutation_queue.Request{
-        .kind = .{ .transition = input },
-        .ident = .{ .api_path = api_path },
-    };
-    self.queue.submitAndWait(&request);
-    if (request.err) |k| {
-        try respondMutationError(req, k, stack, id);
-        return;
-    }
-    defer if (request.output) |*o| o.deinit();
-    try respondMutationOk(req, self.allocator, &request);
+    const client = localClient(self, api_path);
+    try respondMutationResult(req, self.allocator, client.transitionItem(stack, input), stack, id);
 }
 
 fn handlePauseResume(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, paused: bool) !void {
@@ -1920,17 +1898,9 @@ fn handlePauseResume(self: *Daemon, req: *std.http.Server.Request, stack: []cons
     const body = readRequestBody(self, req) catch "";
     if (body.len > 0) self.allocator.free(body);
 
-    var request = mutation_queue.Request{
-        .kind = if (paused) .{ .pause_stack = .{ .stack = stack } } else .{ .resume_stack = .{ .stack = stack } },
-        .ident = .{ .api_path = if (paused) "POST /stacks/{name}/pause" else "POST /stacks/{name}/resume" },
-    };
-    self.queue.submitAndWait(&request);
-    if (request.err) |k| {
-        try respondMutationError(req, k, stack, "");
-        return;
-    }
-    defer if (request.output) |*o| o.deinit();
-    try respondMutationOk(req, self.allocator, &request);
+    const api_path = if (paused) "POST /stacks/{name}/pause" else "POST /stacks/{name}/resume";
+    const client = localClient(self, api_path);
+    try respondMutationResult(req, self.allocator, client.setPaused(stack, paused), stack, "");
 }
 
 /// Pause/resume entry point invoked when the browser-form auth path
@@ -1938,17 +1908,9 @@ fn handlePauseResume(self: *Daemon, req: *std.http.Server.Request, stack: []cons
 /// only ever carries `_token`, so there's nothing to re-parse — we just
 /// submit the mutation.
 fn handlePauseResumeFormPath(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, paused: bool) !void {
-    var request = mutation_queue.Request{
-        .kind = if (paused) .{ .pause_stack = .{ .stack = stack } } else .{ .resume_stack = .{ .stack = stack } },
-        .ident = .{ .api_path = if (paused) "POST /stacks/{name}/pause" else "POST /stacks/{name}/resume" },
-    };
-    self.queue.submitAndWait(&request);
-    if (request.err) |k| {
-        try respondMutationError(req, k, stack, "");
-        return;
-    }
-    defer if (request.output) |*o| o.deinit();
-    try respondMutationOk(req, self.allocator, &request);
+    const api_path = if (paused) "POST /stacks/{name}/pause" else "POST /stacks/{name}/resume";
+    const client = localClient(self, api_path);
+    try respondMutationResult(req, self.allocator, client.setPaused(stack, paused), stack, "");
 }
 
 /// Cancel/retry/supersede entry point for the browser-form auth path. The
@@ -1974,21 +1936,12 @@ fn handleTransitionFormPath(
         .retry => "POST /stacks/{name}/items/{id}/retry",
         .supersede => unreachable,
     };
-    var request = mutation_queue.Request{
-        .kind = .{ .transition = .{
-            .stack = stack,
-            .id = id,
-            .transition = t,
-        } },
-        .ident = .{ .api_path = api_path },
-    };
-    self.queue.submitAndWait(&request);
-    if (request.err) |k| {
-        try respondMutationError(req, k, stack, id);
-        return;
-    }
-    defer if (request.output) |*o| o.deinit();
-    try respondMutationOk(req, self.allocator, &request);
+    const client = localClient(self, api_path);
+    try respondMutationResult(req, self.allocator, client.transitionItem(stack, .{
+        .stack = stack,
+        .id = id,
+        .transition = t,
+    }), stack, id);
 }
 
 fn handleConfigPost(self: *Daemon, req: *std.http.Server.Request, stack: []const u8) !void {
@@ -2041,17 +1994,8 @@ fn handleConfigPost(self: *Daemon, req: *std.http.Server.Request, stack: []const
         return;
     }
 
-    var request = mutation_queue.Request{
-        .kind = .{ .config_patch = .{ .stack = stack, .patches = patches.items } },
-        .ident = .{ .api_path = "POST /stacks/{name}/config" },
-    };
-    self.queue.submitAndWait(&request);
-    if (request.err) |k| {
-        try respondMutationError(req, k, stack, "");
-        return;
-    }
-    defer if (request.output) |*o| o.deinit();
-    try respondMutationOk(req, self.allocator, &request);
+    const client = localClient(self, "POST /stacks/{name}/config");
+    try respondMutationResult(req, self.allocator, client.patchConfig(stack, patches.items), stack, "");
 }
 
 // ---------- SSE (milestone 6) ----------
@@ -2178,7 +2122,7 @@ pub const PidInfo = struct {
 };
 
 pub fn readPidFile(allocator: std.mem.Allocator, notes_root: []const u8) !?PidInfo {
-    const path = try std.fs.path.join(allocator, &.{ notes_root, ".organo", "daemon.pid" });
+    const path = try std.fs.path.join(allocator, &.{ notes_root, ".stako", "daemon.pid" });
     defer allocator.free(path);
     var f = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
         error.FileNotFound => return null,
@@ -2209,7 +2153,7 @@ fn writePidFile(
     notes_root_abs: []const u8,
     port: u16,
 ) StartError!bool {
-    const dir_path = try std.fs.path.join(allocator, &.{ notes_root_abs, ".organo" });
+    const dir_path = try std.fs.path.join(allocator, &.{ notes_root_abs, ".stako" });
     defer allocator.free(dir_path);
     std.fs.cwd().makePath(dir_path) catch {};
     const pid_path = try std.fs.path.join(allocator, &.{ dir_path, "daemon.pid" });
@@ -2239,7 +2183,7 @@ fn writePidFile(
 
 /// Remove `daemon.pid`, ignoring missing files.
 pub fn removePidFile(allocator: std.mem.Allocator, notes_root: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ notes_root, ".organo", "daemon.pid" });
+    const path = try std.fs.path.join(allocator, &.{ notes_root, ".stako", "daemon.pid" });
     defer allocator.free(path);
     std.fs.cwd().deleteFile(path) catch |e| switch (e) {
         error.FileNotFound => {},
@@ -2353,7 +2297,7 @@ test "start: rejects non-loopback host" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
     try std.testing.expectError(error.NotLoopbackHost, start(a, .{

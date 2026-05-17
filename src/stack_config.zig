@@ -2,7 +2,7 @@
 //!
 //! See `todos/design_stack_config.md` for the canonical schema and field
 //! semantics. Milestone 2 only needs the defaults writer plus a reader that
-//! accepts an empty-or-defaults file, so the layout produced by `organo init`
+//! accepts an empty-or-defaults file, so the layout produced by `stako init`
 //! round-trips cleanly. Wiring (`paused`, `continuity`, `allowed_harnesses`,
 //! etc.) into runtime behavior lands in later milestones.
 
@@ -102,11 +102,11 @@ pub fn parseSlice(allocator: std.mem.Allocator, source: []const u8) ParseError!S
     return cfg;
 }
 
-/// Write the canonical "all defaults" stack.toml. Used by `organo init` for
+/// Write the canonical "all defaults" stack.toml. Used by `stako init` for
 /// `stacks/default/stack.toml` and as the baseline for any new stack.
 pub fn writeDefaults(w: anytype, created_at: []const u8) !void {
     // Keep this output byte-stable; tests snapshot it.
-    try w.writeAll("# stacks/default/stack.toml — created by `organo init`.\n");
+    try w.writeAll("# stacks/default/stack.toml — created by `stako init`.\n");
     try w.writeAll("# All fields below are at their documented defaults. Edit freely;\n");
     try w.writeAll("# see todos/design_stack_config.md for field semantics.\n");
     try w.writeAll("\n");

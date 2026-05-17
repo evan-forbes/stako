@@ -61,7 +61,7 @@ MCP errors map onto the MCP spec's tool-result error shape. The daemon distingui
        {
          "type": "resource",
          "resource": {
-           "uri": "organo://errors/capability_denied",
+           "uri": "stako://errors/capability_denied",
            "mimeType": "application/json",
            "text": "{\"code\":\"capability_denied\",\"identity\":\"codex-local\",\"capability\":\"stack.default.append\"}"
          }
@@ -120,7 +120,7 @@ When an item lands in `blocked` rather than failing the API call, the same code 
 
 ## Audit Log
 
-Path: `<notes-root>/.organo/audit.log`.
+Path: `<notes-root>/.stako/audit.log`.
 
 Format: append-only NDJSON, one line per event:
 

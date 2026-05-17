@@ -31,7 +31,7 @@ Prove the daemon runtime without real provider CLIs: independent per-stack loops
 4. Implement the session manager:
    - Shared across the daemon; owns live subprocess registry, stdout/stderr pumps, transcript file handles, and global concurrency slots.
    - One item maps to one subprocess.
-   - Writes `.organo/runtime/<stack>/<id>.toml` while running.
+   - Writes `.stako/runtime/<stack>/<id>.toml` while running.
    - Streams normalized events to `transcript.jsonl` and SSE.
    - On exit, deletes the runtime file, writes terminal `[result]` metadata, transitions to terminal status, then asks the state writer to commit tracked artifacts.
 5. Clarify writer ownership in code:
@@ -57,13 +57,13 @@ Prove the daemon runtime without real provider CLIs: independent per-stack loops
    - No replay buffer in v1; subscribers see events from connection time.
 10. Restart and shutdown:
     - On daemon startup, running items with runtime files are failed with `daemon_restart_orphan`; runtime files are deleted.
-    - `organo daemon stop` asks the session manager to cleanly stop every live subprocess before the daemon exits.
+    - `stako daemon stop` asks the session manager to cleanly stop every live subprocess before the daemon exits.
 11. Tests:
     - Fake adapter transcripts match expected normalized JSONL exactly.
     - Two stacks run independently: pausing one does not block the other.
     - Global and per-stack concurrency limits are honored.
     - Cancellation and daemon shutdown terminate subprocesses and land the correct status.
-    - Restart with stale runtime files fails orphans deterministically and leaves `.organo/runtime/` clean.
+    - Restart with stale runtime files fails orphans deterministically and leaves `.stako/runtime/` clean.
 
 ## Acceptance
 

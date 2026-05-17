@@ -1,12 +1,12 @@
 ---
 name: Expose Daemon To Public Internet
-description: Backlog placeholder for safely exposing the organo daemon beyond the local machine.
+description: Backlog placeholder for safely exposing the stako daemon beyond the local machine.
 type: backlog
 ---
 
 # Expose Daemon To Public Internet
 
-The first iteration of the organo daemon binds locally only. Public exposure is deferred.
+The first iteration of the stako daemon binds locally only. Public exposure is deferred.
 
 ## What this includes
 

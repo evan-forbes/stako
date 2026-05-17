@@ -34,7 +34,7 @@ Diff range: 2259238..6f9af37
 
 3. **Native session-file path captured in `meta.toml[result]` — partially correct.** True that `claude -p` does not print the encoded-cwd path; both adapters capture `session_file` only if it appears in the stream (rare). The plan accepts "when available" so the rare-capture stance is plan-conformant. But the path that *is* available (the adapter state) is still never copied into `meta.toml[result].session_file` because the broader `[result]`-population wiring is missing (Blocking #1). So the "we can't always get the path" claim is true, while the "when we do get it, we record it" claim is currently false.
 
-4. **`ORGANO_WITH_REAL_CREDENTIALS` env var vs `--with-real-credentials` CLI flag — minor deviation from 00_test_strategy.md.** The strategy doc specifies `zig build test -- --with-real-credentials[=...]` and lists `helpers/capability_flag.zig` as the parser. The implementation uses an env var (`test/adapter_tests.zig:587-597`). Behaviorally equivalent for skip/run, but the mechanism diverges. Acceptable as v1 expedient if 00_test_strategy.md is updated; otherwise should be aligned in M8.
+4. **`STAKO_WITH_REAL_CREDENTIALS` env var vs `--with-real-credentials` CLI flag — minor deviation from 00_test_strategy.md.** The strategy doc specifies `zig build test -- --with-real-credentials[=...]` and lists `helpers/capability_flag.zig` as the parser. The implementation uses an env var (`test/adapter_tests.zig:587-597`). Behaviorally equivalent for skip/run, but the mechanism diverges. Acceptable as v1 expedient if 00_test_strategy.md is updated; otherwise should be aligned in M8.
 
 ## Acceptance criteria
 

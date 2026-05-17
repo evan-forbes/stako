@@ -40,7 +40,7 @@ Every dynamic value that reaches HTML is enumerated below. Format:
 `file:line — value — escaped?`.
 
 ### `renderIndex` (src/html.zig:120)
-- `src/html.zig:126` — title `"organo"` (static literal). Static, escape unnecessary but `writeHeader` runs `escape` anyway.
+- `src/html.zig:126` — title `"stako"` (static literal). Static, escape unnecessary but `writeHeader` runs `escape` anyway.
 - `src/html.zig:135` — stack name into `href` attribute → `escape(w, name)`. **Escaped.**
 - `src/html.zig:137` — stack name into anchor text → `escape(w, name)`. **Escaped.**
 
@@ -130,7 +130,7 @@ This is a Blocking-class concern by audit policy if any unescaped insertion is f
 - Behavior per call:
   1. `makePath(EXPECTED_DIR)` — `test/fixtures/html/`.
   2. **Always** write `<name>.actual` next to the expected file so a failure leaves a diffable artifact (`test/html_tests.zig:46`).
-  3. If `ORGANO_UPDATE_HTML_SNAPSHOTS` env var is set and non-empty / non-`"0"`, overwrite `<name>` and return (regeneration mode).
+  3. If `STAKO_UPDATE_HTML_SNAPSHOTS` env var is set and non-empty / non-`"0"`, overwrite `<name>` and return (regeneration mode).
   4. Otherwise read `<name>` and `expectEqualStrings` (byte-equality). On miss, prints the paths and returns `error.SnapshotMismatch`.
 - `.actual` files persist after the test run by design (so the dev can diff them).
 - **`.gitignore` covers them**: `.gitignore` line 5 is `test/fixtures/html/*.actual`. Verified `git status` would not see them.
@@ -189,7 +189,7 @@ _None._ The original M9 reviewer's concern about missing mutation forms is resol
 4. **CSS is one long Zig multi-line string literal** (`src/html.zig:56–104`).
    For v1 hand-written stylesheet this is the right call. Future iteration could move it to a `.css` file embedded via `@embedFile`, which would let `:hover`/`@media` blocks live in a real CSS editor. Not a defect, just a tomorrow-marker.
 
-5. **`writeFooter` literal `"organo daemon"` is escaping-safe but inconsistent with `writeHeader`'s escaping discipline**.
+5. **`writeFooter` literal `"stako daemon"` is escaping-safe but inconsistent with `writeHeader`'s escaping discipline**.
    The string is a static literal, so escape isn't needed; calling it out only because every other dynamic site here is escaped through the helper. Pure consistency note.
 
 6. **`acceptHeaderWantsHtml` uses `parseQThousand` returning `u16` 0..1000 stored as `q`**. The bias `if (s[0] == '0')` followed by digit-scan handles `0`, `0.x`, `0.xx`, `0.xxx` but the test case `q=0.500` parses to exactly 500. Looks correct; coverage at lines 667–671 in html.zig matches. Not a finding.
@@ -224,7 +224,7 @@ _None._ The original M9 reviewer's concern about missing mutation forms is resol
 
 4. **Token-rejection symmetry**: the daemon-level tests at `test/html_tests.zig:606` and `:632` form a true positive/negative pair on the form-token auth path. Plus the round-trip test at `:664` confirms what's rendered is exactly what verifies — no escaping drift.
 
-5. **Snapshot mechanism is unambiguous**: writes `.actual` regardless of pass/fail, supports `ORGANO_UPDATE_HTML_SNAPSHOTS=1` for regen, gitignored. Easy to live with.
+5. **Snapshot mechanism is unambiguous**: writes `.actual` regardless of pass/fail, supports `STAKO_UPDATE_HTML_SNAPSHOTS=1` for regen, gitignored. Easy to live with.
 
 6. **Truth-table alignment with mutation layer is explicit**: `src/html.zig:264` cross-references `mutations.applyTransition`, and the diverging-from-plan case (no cancel for running) is called out in a test comment (`test/html_tests.zig:550`). The "why we ignore the plan here" decision is fossilized in code, not just memory.
 

@@ -109,7 +109,7 @@ Diff range: fd9a4a4..558535f
   in `matchRoute` and the two prefixes are disjoint. A stack literally
   named `static` would live at `/stacks/static`, not `/static/...`, so
   there is no collision.
-- No `/home/...` paths leak into committed HTML. The `/tmp/organo-smoke-
+- No `/home/...` paths leak into committed HTML. The `/tmp/stako-smoke-
   workdir` string visible in `stack.html` is a deterministic literal from
   the committed `stack.toml`, not a machine path.
 - `.actual` snapshot artifacts are listed in `.gitignore`
@@ -124,5 +124,5 @@ Diff range: fd9a4a4..558535f
   `src/mutation_queue.zig`, or `src/audit.zig`. M9 is correctly read-only
   on the server side.
 - Test cleanup: `SmokeRoot.deinit` deletes its per-test subdir under
-  `/tmp/organo-test-html`. The base dir is left empty between runs, which
+  `/tmp/stako-test-html`. The base dir is left empty between runs, which
   matches the pattern used by prior milestones.

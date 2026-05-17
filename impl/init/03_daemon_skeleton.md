@@ -15,14 +15,14 @@ Stand up the daemon process: loopback bind on a single port, `/healthz`, read en
 1. Pick the Zig HTTP server approach: vendor an existing one or build minimally on `std.http`. Record the decision in `design_daemon.md`.
 2. **Config loader**: read `config.toml` first, then layer `config.local.toml` on top per `design_init_and_layout.md`. Last-write-wins per leaf key for scalars; the `[identity.*]` tables are replaced wholesale (not merged) so a local identity entry shadows rather than partially overrides. Surface a typed `Config` struct to the rest of the daemon.
 3. **Local request token**:
-   - Generate `.organo/local_token` on init or daemon start if absent, perms 0600.
+   - Generate `.stako/local_token` on init or daemon start if absent, perms 0600.
    - CLI reads it and sends `Authorization: Bearer <token>` for every non-GET request once mutation endpoints exist.
    - Browser mutation forms later embed a per-page token derived from the same local secret; read-only GETs remain open on loopback.
    - Milestone 3 only creates/loads the token and exposes an internal verifier; milestone 5 enforces it on mutations.
 4. **HTTP error responder helper**: a single function that takes `(code_slug, message, details?)` and returns the canonical body `{error: {code, message, details}}` plus the right HTTP status from the mapping table in `design_errors_and_audit.md`. Every endpoint uses it; ad-hoc error bodies are not allowed. Include the slug → status table as a compile-time map.
-5. Implement `organo daemon start`: load config via step 2, bind loopback on the configured port, write `daemon.pid`, redirect logs to `daemon.log`. Refuse to start if PID file points to a live process.
-6. Implement `organo daemon stop`: read PID, send SIGTERM, wait, remove PID file on confirmed exit. (Subprocess-cleanup semantics land in milestone 6; for milestone 3 the daemon has no children.)
-7. Implement `organo daemon status`: report running/stopped, port, uptime.
+5. Implement `stako daemon start`: load config via step 2, bind loopback on the configured port, write `daemon.pid`, redirect logs to `daemon.log`. Refuse to start if PID file points to a live process.
+6. Implement `stako daemon stop`: read PID, send SIGTERM, wait, remove PID file on confirmed exit. (Subprocess-cleanup semantics land in milestone 6; for milestone 3 the daemon has no children.)
+7. Implement `stako daemon status`: report running/stopped, port, uptime.
 8. `GET /healthz` — plain text "ok".
 9. Implement the storage reader: list stacks (scan only `<notes-root>/stacks/`), list items per stack, read one item.
 10. Add JSON read endpoints:
@@ -40,7 +40,7 @@ Stand up the daemon process: loopback bind on a single port, `/healthz`, read en
 - Daemon starts on a clean init'd directory and serves `/healthz`.
 - All read endpoints return well-formed JSON for fixture data.
 - A `config.local.toml` value (e.g. `port`) overrides the `config.toml` value; an `[identity.local]` table in `config.local.toml` fully replaces the same-named identity from `config.toml` rather than merging fields.
-- `.organo/local_token` exists with perms 0600, is stable across restarts, and the daemon can validate it for future mutation requests.
+- `.stako/local_token` exists with perms 0600, is stable across restarts, and the daemon can validate it for future mutation requests.
 - A `GET /stacks/does-not-exist` returns the canonical error body with `code = "not_found"` and HTTP 404.
 - `daemon.pid` and `daemon.log` behave per the design doc across start/stop/restart.
 - Attempt to bind a non-loopback host fails fast with a clear error using the same error body shape.

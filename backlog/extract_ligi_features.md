@@ -2,18 +2,18 @@
 
 ## Original Todo
 
-- Identify the `ligi` features Organo should keep.
+- Identify the `ligi` features Stako should keep.
 - Keep indexing, tags, inbox behavior if useful, and short CLI flags where they fit.
 - Remove or avoid unnecessary commands.
-- Avoid a user-facing `init` command if Organo can initialize automatically.
+- Avoid a user-facing `init` command if Stako can initialize automatically.
 - Enforce a single canonical notes repository instead of scattered art directories.
 - Design an abstraction path for reusing `ligi` functionality without importing its bloat.
 
 ## Design Context
 
-`ligi` was a useful first attempt, especially around tags, indexing, and inbox behavior. Organo should preserve those good ideas while avoiding the accumulated command surface and scattered directory model.
+`ligi` was a useful first attempt, especially around tags, indexing, and inbox behavior. Stako should preserve those good ideas while avoiding the accumulated command surface and scattered directory model.
 
-Organo assumes one canonical notes repository. Initialization should usually be automatic once the repository path is known.
+Stako assumes one canonical notes repository. Initialization should usually be automatic once the repository path is known.
 
 ## Research Before Implementation
 
@@ -36,7 +36,7 @@ Organo assumes one canonical notes repository. Initialization should usually be 
 
 - Write a `ligi` feature inventory document.
 - Extract or recreate the indexing data model first.
-- Define a minimal Organo CLI surface around indexing and repository detection.
+- Define a minimal Stako CLI surface around indexing and repository detection.
 - Add compatibility tests using sample notes from `ligi`.
 - Remove dependencies on scattered art directories.
 - Design migration behavior for existing `ligi` users if needed.
@@ -45,7 +45,7 @@ Organo assumes one canonical notes repository. Initialization should usually be 
 ## Acceptance Criteria
 
 - Clear keep/replace/defer/discard decision for every relevant `ligi` feature.
-- Minimal Organo indexing path works against a single notes repository.
+- Minimal Stako indexing path works against a single notes repository.
 - Manual indexing command exists.
 - No required scattered notes or art directories.
 - Initialization can happen automatically in the normal workflow.

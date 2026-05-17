@@ -19,7 +19,7 @@ Make stacks useful before real harness execution lands: create stacks, append/in
 1. Implement the single-writer queue inside the daemon. Every mutation endpoint pushes a request; one worker drains it. Per-stack runtime loops wake from committed mutation events, but all disk writes still serialize through this worker.
 2. Enforce the milestone-3 local bearer token on every non-GET HTTP endpoint. Missing or wrong token returns `identity_required` / `capability_denied` shape as appropriate; full per-identity policy waits until milestone 10.
 3. Add the git wrapper for the notes repo only. Shelling out to `git` is fine for v1.
-4. Add the audit log writer: append-only NDJSON to `.organo/audit.log`, perms 0600, no rotation in v1. Log allowed mutations and daemon lifecycle events. Denied authorization entries land in milestone 10.
+4. Add the audit log writer: append-only NDJSON to `.stako/audit.log`, perms 0600, no rotation in v1. Log allowed mutations and daemon lifecycle events. Denied authorization entries land in milestone 10.
 5. Implement mutation endpoints, each wired to the queue:
    - `POST /stacks`
    - `POST /stacks/{name}/items`
@@ -43,14 +43,14 @@ Make stacks useful before real harness execution lands: create stacks, append/in
    - Refuse daemon startup if the notes repo has merge conflicts.
    - Reject a mutation if a targeted stack file has uncommitted user edits.
 10. Add CLI mutation commands with short forms:
-    - `organo stack new <name>` / `organo s new <name>`
-    - `organo stack add <name> <kind> -t ... [-f ...]` / `organo s add ...`
-    - `organo stack insert <name> <ref> ...` / `organo s ins ...`
-    - `organo stack retry <name> <id>` / `organo s rt ...`
-    - `organo stack cancel <name> <id>` / `organo s cx ...`
-    - `organo stack supersede <name> <id> <replacement-id>` / `organo s sup ...`
-    - `organo stack pause|resume <name>` / `organo s p|r <name>`
-    - `organo stack config <name> --set key=value` / `organo s cfg <name> -s key=value`
+    - `stako stack new <name>` / `stako s new <name>`
+    - `stako stack add <name> <kind> -t ... [-f ...]` / `stako s add ...`
+    - `stako stack insert <name> <ref> ...` / `stako s ins ...`
+    - `stako stack retry <name> <id>` / `stako s rt ...`
+    - `stako stack cancel <name> <id>` / `stako s cx ...`
+    - `stako stack supersede <name> <id> <replacement-id>` / `stako s sup ...`
+    - `stako stack pause|resume <name>` / `stako s p|r <name>`
+    - `stako stack config <name> --set key=value` / `stako s cfg <name> -s key=value`
 11. Tests:
     - One mutation -> exactly one commit + one audit-log line.
     - Two simultaneous mutation requests -> serialized; both succeed; commit/audit order matches queue order.
@@ -63,7 +63,7 @@ Make stacks useful before real harness execution lands: create stacks, append/in
 
 - All v1 mutation endpoints work end-to-end through the CLI.
 - Every non-GET endpoint requires the local token.
-- `.organo/audit.log` records one NDJSON line per successful mutation with the schema from `design_errors_and_audit.md`.
+- `.stako/audit.log` records one NDJSON line per successful mutation with the schema from `design_errors_and_audit.md`.
 - Commit grouping matches one user-visible mutation per commit.
 - Half-failed mutations leave the repo clean: no staged changes, no partial commits, no audit-log line.
 - The daemon never auto-commits arbitrary harness workdir changes.

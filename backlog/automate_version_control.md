@@ -12,7 +12,7 @@ Version control should be automatic around meaningful note operations. Index reg
 
 ## Research Before Implementation
 
-- Define which Organo operations should create commits automatically.
+- Define which Stako operations should create commits automatically.
 - Define which operations should never auto-commit without explicit confirmation.
 - Decide how to group related file changes into a unit of work.
 - Determine how to avoid committing unrelated user changes in a dirty working tree.
@@ -42,7 +42,7 @@ Version control should be automatic around meaningful note operations. Index reg
 - Indexing can trigger an automated commit only when index files changed.
 - Stack creation and stack edits can trigger coherent commits.
 - Unrelated working-tree changes are not committed.
-- Commit messages identify the Organo operation.
+- Commit messages identify the Stako operation.
 - Failures leave the working tree understandable and recoverable.
 
 ## Dependencies

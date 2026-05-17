@@ -24,10 +24,10 @@
 //! ## Identity model
 //!
 //! Identities are declared as `[identity.<name>]` tables in
-//! `.organo/config.toml` (or `config.local.toml`). The `capabilities`
+//! `.stako/config.toml` (or `config.local.toml`). The `capabilities`
 //! array is the only field that matters for the policy evaluator.
 //!
-//! The local mutation token (`.organo/local_token`) always resolves to
+//! The local mutation token (`.stako/local_token`) always resolves to
 //! the `local` identity. If the user has not declared `[identity.local]`
 //! in their config files, the policy defaults to full access (`*`) so
 //! the v1 single-user flow keeps working without ceremony. Once a user
@@ -218,8 +218,8 @@ const testing = std.testing;
 fn cfgFromToml(allocator: std.mem.Allocator, src: []const u8) !config_mod.Config {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".organo");
-    var f = try tmp.dir.createFile(".organo/config.toml", .{ .truncate = true });
+    try tmp.dir.makePath(".stako");
+    var f = try tmp.dir.createFile(".stako/config.toml", .{ .truncate = true });
     defer f.close();
     try f.writeAll(src);
     var buf: [std.fs.max_path_bytes]u8 = undefined;

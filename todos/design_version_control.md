@@ -9,7 +9,7 @@ The daemon commits stack mutations and harness-produced stack artifacts to the n
 - Stack directories live under the notes git repository (`<notes-root>/stacks/<name>/...`). They commit alongside everything else.
 - The daemon is the only automated writer of stack files. Hand-edits by the user remain possible through normal editor flows.
 - Each API mutation call → one commit. Multi-step daemon-internal operations group into a single commit when they exist; review follow-up grouping is deferred until MCP follow-ups exist.
-- Daemon state under `<notes-root>/.organo/` is gitignored except for `config.toml`.
+- Daemon state under `<notes-root>/.stako/` is gitignored except for `config.toml`.
 
 ## Commit Grouping Rules
 
@@ -27,7 +27,7 @@ If an API call fails partway through, the daemon rolls back staged changes; no h
 
 ### Runtime state is not tracked
 
-Live PID/session state lives under `.organo/runtime/`, which is gitignored. Runtime files are daemon state, not notes history. Tracked `meta.toml` receives only stable terminal metadata under `[result]` after a run completes or fails.
+Live PID/session state lives under `.stako/runtime/`, which is gitignored. Runtime files are daemon state, not notes history. Tracked `meta.toml` receives only stable terminal metadata under `[result]` after a run completes or fails.
 
 This avoids dirtying the notes repo for every running item and keeps conflict checks simple: targeted stack files are either clean or intentionally changed by the state writer.
 
@@ -62,7 +62,7 @@ identity: harness:claude
 api: harness-run
 ```
 
-Scope vocabulary: `stack` for queue-shape mutations, `item` for content/status changes inside an existing item, `auth` for credential changes (under `.organo/config.toml` if those get committed at all).
+Scope vocabulary: `stack` for queue-shape mutations, `item` for content/status changes inside an existing item, `auth` for credential changes (under `.stako/config.toml` if those get committed at all).
 
 ## Hand-Edit Reconciliation
 

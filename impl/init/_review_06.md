@@ -4,7 +4,7 @@ Diff range: 2c4c4d0..e12ac69
 
 ## Blocking
 
-- `src/daemon.zig:106-130` — Daemon does not own or start a `runtime.Supervisor`. `Worker.start()`/`Supervisor.ensureWorker` exist but no production code path constructs a Supervisor, calls `ensureWorker`, runs the worker thread, or invokes `reconcileOrphans` on startup. Plan step 6 (independent per-stack runtime loops) and step 10 (restart sweep before first tick) explicitly require this; plan acceptance criteria "Prompt items can run end-to-end through the fake adapter" and "Per-stack loops operate independently" are only demonstrated by tests that call `tickStack` directly. Without daemon-side wiring, milestone 7's real adapters will land into a runtime that nothing drives, and `organo daemon stop` cannot cleanly stop live subprocesses (no Supervisor → no `requestShutdown` chain → no SIGINT to children). The plan's "Restart and shutdown" step 10 is unfulfilled in production code.
+- `src/daemon.zig:106-130` — Daemon does not own or start a `runtime.Supervisor`. `Worker.start()`/`Supervisor.ensureWorker` exist but no production code path constructs a Supervisor, calls `ensureWorker`, runs the worker thread, or invokes `reconcileOrphans` on startup. Plan step 6 (independent per-stack runtime loops) and step 10 (restart sweep before first tick) explicitly require this; plan acceptance criteria "Prompt items can run end-to-end through the fake adapter" and "Per-stack loops operate independently" are only demonstrated by tests that call `tickStack` directly. Without daemon-side wiring, milestone 7's real adapters will land into a runtime that nothing drives, and `stako daemon stop` cannot cleanly stop live subprocesses (no Supervisor → no `requestShutdown` chain → no SIGINT to children). The plan's "Restart and shutdown" step 10 is unfulfilled in production code.
 
 ## Non-blocking
 
@@ -13,7 +13,7 @@ Diff range: 2c4c4d0..e12ac69
 - `src/session_manager.zig:338-364` — `cancelAndEscalate` has no production-default grace timings (every caller in the codebase is a test). Design says 5s SIGINT grace; once the daemon wires the Supervisor, real values need to be plumbed (default constants or config keys).
 - `src/session_manager.zig:346-364` — Small TOCTOU window between `isAlive` and `sendSigterm`/`sendSigkill`. If the reaped child's PID is recycled by the kernel after `child.wait()` returns and before we signal, we could signal a wrong process. Acceptable for v1; document the assumption.
 - `src/runtime.zig:188-221` — sleep-elapsed transitions `queued → running → completed` because `state.zig` does not list `queued → completed` as valid. Functional but creates a spurious commit-skipped `running` flip and the audit/dispatch_harness log line, even though no subprocess actually runs. Cleaner: extend the state machine to allow `queued → completed` for sleep items, or special-case the sleep path.
-- `/tmp/organo-test-*` directories from prior milestones still accumulate (CLI, daemon, mutation test scratches). The milestone-6 `organo-test-runtime/` scratch IS cleaned. Pre-existing; not introduced by M6 but worth noting since the test-strategy doc says no leftovers.
+- `/tmp/stako-test-*` directories from prior milestones still accumulate (CLI, daemon, mutation test scratches). The milestone-6 `stako-test-runtime/` scratch IS cleaned. Pre-existing; not introduced by M6 but worth noting since the test-strategy doc says no leftovers.
 
 ## Deferred-confirmed
 
@@ -25,7 +25,7 @@ Diff range: 2c4c4d0..e12ac69
 
 - Prompt items can run end-to-end through the fake adapter and produce normalized `transcript.jsonl` — MET via test `runtime: end-to-end fake run produces transcript and completes item`. Algorithmically correct, but only when test code calls `tickStack` directly.
 - Per-stack loops operate independently while respecting the daemon's global session limit — PARTIALLY MET. Tests show `tickStack` per-stack independence and `max_concurrent_total = 1` semaphore behavior. NOT MET as an end-to-end daemon property because the daemon doesn't own a Supervisor.
-- Runtime files are gitignored daemon state, not tracked `meta.toml` — MET. `runtime_file.zig` writes under `.organo/runtime/` and the M2 init step already gitignores `.organo/`.
+- Runtime files are gitignored daemon state, not tracked `meta.toml` — MET. `runtime_file.zig` writes under `.stako/runtime/` and the M2 init step already gitignores `.stako/`.
 - Terminal tracked artifacts commit as one harness-completion commit per item — MET. `mutation_queue.zig:292-300` skips commits for runtime `→ running`; terminal transitions commit normally. The `dispatch_harness` audit action is reused for terminal transitions (non-blocking nit above).
 - SSE receives the same normalized event schema as transcripts — MET (same `events.writeEvent`). Missing `event:` lane is a non-blocking deviation.
 - A paused stack does not dispatch new work, and other stacks continue — MET via tests `runtime: paused stack does NOT dispatch` and `runtime: two stacks dispatch independently`.

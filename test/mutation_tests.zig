@@ -6,13 +6,13 @@
 //! HTTP → queue → mutations → vcs commit → audit log.
 
 const std = @import("std");
-const organo = @import("organo");
-const init_mod = organo.init;
-const daemon_mod = organo.daemon;
-const vcs = organo.vcs;
-const audit_mod = organo.audit;
-const mutations_mod = organo.mutations;
-const mutation_queue = organo.mutation_queue;
+const stako = @import("stako");
+const init_mod = stako.init;
+const daemon_mod = stako.daemon;
+const vcs = stako.vcs;
+const audit_mod = stako.audit;
+const mutations_mod = stako.mutations;
+const mutation_queue = stako.mutation_queue;
 
 // ---------- harness ----------
 
@@ -25,7 +25,7 @@ const Scratch = struct {
         var ts_buf: [32]u8 = undefined;
         const ts = std.time.nanoTimestamp();
         const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{ts});
-        const path = try std.fs.path.join(allocator, &.{ tmp, "organo-test-mutation" });
+        const path = try std.fs.path.join(allocator, &.{ tmp, "stako-test-mutation" });
         defer allocator.free(path);
         try std.fs.cwd().makePath(path);
 
@@ -53,7 +53,7 @@ fn initNotesRoot(allocator: std.mem.Allocator, root: []const u8) !void {
     r.deinit();
 }
 
-/// Replace the stub `.git/` produced by `organo init` with a real repo so
+/// Replace the stub `.git/` produced by `stako init` with a real repo so
 /// the vcs layer's git invocations work.
 fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
     // Remove the stub .git directory first; ensureRealRepo will re-init.
@@ -63,7 +63,7 @@ fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
     try vcs.ensureRealRepo(allocator, root);
 
     // Stage and commit the init layout so the working tree is clean.
-    const paths = [_][]const u8{ ".gitignore", "stacks", ".organo/config.toml" };
+    const paths = [_][]const u8{ ".gitignore", "stacks", ".stako/config.toml" };
     _ = vcs.commit(allocator, root, .{
         .paths = &paths,
         .subject = "init: baseline",
@@ -192,9 +192,9 @@ fn buildGetRequest(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         .{path});
 }
 
-/// Count lines in audit.log under <root>/.organo/audit.log; returns 0 if absent.
+/// Count lines in audit.log under <root>/.stako/audit.log; returns 0 if absent.
 fn auditLineCount(allocator: std.mem.Allocator, root: []const u8) !usize {
-    const path = try std.fs.path.join(allocator, &.{ root, ".organo", "audit.log" });
+    const path = try std.fs.path.join(allocator, &.{ root, ".stako", "audit.log" });
     defer allocator.free(path);
     var f = std.fs.cwd().openFile(path, .{}) catch return 0;
     defer f.close();
@@ -460,7 +460,7 @@ test "mutation: two concurrent requests serialize and both succeed" {
     // Audit log contains at least 2 mutation entries; their order matches
     // queue arrival (we can't predict order between the threads, but
     // exactly-one of each is guaranteed by the single-writer queue).
-    const log_path = try std.fs.path.join(a, &.{ s.abs_path, ".organo", "audit.log" });
+    const log_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "audit.log" });
     defer a.free(log_path);
     var lf = try std.fs.cwd().openFile(log_path, .{});
     defer lf.close();

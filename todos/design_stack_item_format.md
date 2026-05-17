@@ -27,7 +27,7 @@ Define the on-disk layout for stack items. The daemon, CLI, and web view depend 
 Live runtime state is not stored in tracked `meta.toml`. While an item is running, the daemon writes a gitignored runtime file at:
 
 ```
-<notes-root>/.organo/runtime/<stack>/<item-id>.toml
+<notes-root>/.stako/runtime/<stack>/<item-id>.toml
 ```
 
 That file holds the live subprocess handle: PID, harness, started-at timestamp, harness-side session ID, and transcript path. It is atomic-replaced by the daemon and deleted when the item reaches a terminal status.

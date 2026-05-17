@@ -11,20 +11,20 @@
 //! `@integration:provider:<name>` tag so they can be selected/excluded.
 
 const std = @import("std");
-const organo = @import("organo");
+const stako = @import("stako");
 const fake = @import("helpers/fake_harness.zig");
 
-const init_mod = organo.init;
-const audit_mod = organo.audit;
-const sse_mod = organo.sse;
-const mutation_queue = organo.mutation_queue;
-const runtime_mod = organo.runtime;
-const runtime_file = organo.runtime_file;
-const events = organo.events;
-const adapter_mod = organo.adapter;
-const claude_adapter = organo.claude_adapter;
-const codex_adapter = organo.codex_adapter;
-const harness_dispatch = organo.harness_dispatch;
+const init_mod = stako.init;
+const audit_mod = stako.audit;
+const sse_mod = stako.sse;
+const mutation_queue = stako.mutation_queue;
+const runtime_mod = stako.runtime;
+const runtime_file = stako.runtime_file;
+const events = stako.events;
+const adapter_mod = stako.adapter;
+const claude_adapter = stako.claude_adapter;
+const codex_adapter = stako.codex_adapter;
+const harness_dispatch = stako.harness_dispatch;
 
 // ---------- scratch + paths ----------
 
@@ -37,7 +37,7 @@ const Scratch = struct {
         var ts_buf: [40]u8 = undefined;
         const ts = std.time.nanoTimestamp();
         const ts_str = try std.fmt.bufPrint(&ts_buf, "{d}", .{ts});
-        const base = try std.fs.path.join(allocator, &.{ tmp, "organo-test-m7" });
+        const base = try std.fs.path.join(allocator, &.{ tmp, "stako-test-m7" });
         defer allocator.free(base);
         try std.fs.cwd().makePath(base);
         const dir_name = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ name_hint, ts_str });
@@ -138,7 +138,7 @@ fn factoryProd(allocator: std.mem.Allocator, harness: []const u8) anyerror!?adap
 fn buildScriptedArgv(
     allocator: std.mem.Allocator,
     harness: []const u8,
-    item: *const organo.item.Item,
+    item: *const stako.item.Item,
     item_dir_abs: []const u8,
 ) anyerror![][]u8 {
     _ = item;
@@ -252,10 +252,8 @@ test "m7 runtime: claude adapter end-to-end against scripted fixture" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture_claude = try absFixturePath(a, "harness/claude_stream.jsonl");
     const fixture_codex = try absFixturePath(a, "harness/codex_stream.jsonl");
@@ -278,7 +276,7 @@ test "m7 runtime: claude adapter end-to-end against scripted fixture" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .hub = &hub,
         .dispatch = scriptedDispatch(),
@@ -332,10 +330,8 @@ test "m7 runtime: codex adapter end-to-end against scripted fixture" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture_claude = try absFixturePath(a, "harness/claude_stream.jsonl");
     const fixture_codex = try absFixturePath(a, "harness/codex_stream.jsonl");
@@ -355,7 +351,7 @@ test "m7 runtime: codex adapter end-to-end against scripted fixture" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = scriptedDispatch(),
     });
@@ -408,10 +404,8 @@ test "m7 result block: claude scripted run records session_id + harness in meta.
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture_claude = try absFixturePath(a, "harness/claude_stream.jsonl");
     const fixture_codex = try absFixturePath(a, "harness/codex_stream.jsonl");
@@ -431,7 +425,7 @@ test "m7 result block: claude scripted run records session_id + harness in meta.
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = scriptedDispatch(),
     });
@@ -483,10 +477,8 @@ test "m7 result block: codex scripted run records session_id + harness in meta.t
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture_claude = try absFixturePath(a, "harness/claude_stream.jsonl");
     const fixture_codex = try absFixturePath(a, "harness/codex_stream.jsonl");
@@ -506,7 +498,7 @@ test "m7 result block: codex scripted run records session_id + harness in meta.t
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = scriptedDispatch(),
     });
@@ -555,10 +547,8 @@ test "m7 routing: item.target.provider=anthropic picks claude when allowed" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture_claude = try absFixturePath(a, "harness/claude_stream.jsonl");
     const fixture_codex = try absFixturePath(a, "harness/codex_stream.jsonl");
@@ -578,7 +568,7 @@ test "m7 routing: item.target.provider=anthropic picks claude when allowed" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = scriptedDispatch(),
     });
@@ -617,14 +607,12 @@ test "m7 routing: item.target.provider denied when stack excludes the mapped har
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = harness_dispatch.dispatch(),
     });
@@ -670,14 +658,12 @@ test "m7 routing: clear item blocks when routed harness lacks clear capability" 
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = scriptedDispatch(),
     });
@@ -717,10 +703,8 @@ test "m7 review item routes the same way as prompt (fresh session)" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     const fixture_claude = try absFixturePath(a, "harness/claude_stream.jsonl");
     const fixture_codex = try absFixturePath(a, "harness/codex_stream.jsonl");
@@ -740,7 +724,7 @@ test "m7 review item routes the same way as prompt (fresh session)" {
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = scriptedDispatch(),
     });
@@ -786,7 +770,7 @@ test "m7 claude adapter: each malformed line yields exactly one recoverable erro
 // ---------- gated real-provider smoke tests ----------
 
 fn realCredentialsEnabled(provider: []const u8) bool {
-    const env = std.posix.getenv("ORGANO_WITH_REAL_CREDENTIALS") orelse return false;
+    const env = std.posix.getenv("STAKO_WITH_REAL_CREDENTIALS") orelse return false;
     if (env.len == 0) return false;
     if (std.mem.eql(u8, env, "1") or std.mem.eql(u8, env, "all")) return true;
     // Comma-separated list of providers.
@@ -847,14 +831,12 @@ test "real claude smoke @integration:provider:anthropic" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = harness_dispatch.dispatch(),
     });
@@ -913,14 +895,12 @@ test "real codex smoke @integration:provider:openai" {
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
-    var q = mutation_queue.Queue.init(a, s.abs_path, &aw);
-    q.enable_git = false;
-    defer q.deinit();
-    try q.start();
+    var reg = try stako.stack.StackRegistry.init(a, s.abs_path, &aw, false);
+    defer reg.deinit();
 
     var sup = runtime_mod.Supervisor.init(a, .{
         .notes_root_abs = s.abs_path,
-        .queue = &q,
+        .stack_registry = &reg,
         .audit_writer = &aw,
         .dispatch = harness_dispatch.dispatch(),
     });

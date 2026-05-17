@@ -8,7 +8,7 @@
 
 ## Design Context
 
-Each stack item should be able to declare its execution target. The target may be a specific agent, a specific model, a specific provider, or a policy that lets Organo choose among compatible providers.
+Each stack item should be able to declare its execution target. The target may be a specific agent, a specific model, a specific provider, or a policy that lets Stako choose among compatible providers.
 
 Routing is a cross-cutting feature. It depends on stack files, provider integrations, agent definitions, authorization, container policy, and the CLI/web surfaces that let a user inspect or override routing. TUI routing inspection is deferred.
 
@@ -41,7 +41,7 @@ Routing is a cross-cutting feature. It depends on stack files, provider integrat
 
 ## Planning Notes
 
-- The router should fail closed. If Organo cannot prove a target is allowed and available, the item should not run.
+- The router should fail closed. If Stako cannot prove a target is allowed and available, the item should not run.
 - Routing validation should happen before expensive context assembly.
 - In v1, local-token callers use a full-access local identity, so provider availability can be checked during preflight. Once milestone-10 identities exist, capability denial should happen before revealing provider-specific credential details.
 - A stack item routed to an agent still needs final model/provider resolution unless the agent definition fully specifies it.

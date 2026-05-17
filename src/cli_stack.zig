@@ -1,4 +1,4 @@
-//! `organo stack ...` implementation. The CLI is a thin shell over the
+//! `stako stack ...` implementation. The CLI is a thin shell over the
 //! daemon's HTTP API per `todos/implement_cli_client.md`:
 //!
 //!   - All rendering data comes from the daemon JSON response. No CLI-local
@@ -6,7 +6,7 @@
 //!   - `--json/-j` writes the response body verbatim; non-JSON mode renders
 //!     a human-friendly table/listing.
 //!   - On connection failure we emit the canonical
-//!     "daemon not started; try `organo daemon start`" message.
+//!     "daemon not started; try `stako daemon start`" message.
 
 const std = @import("std");
 const cli = @import("cli.zig");
@@ -25,7 +25,7 @@ pub fn run(
         .port_override = args.flags.port_override,
         .verbose = args.flags.verbose,
     }) catch |e| {
-        try stderr.print("organo stack: failed to prepare client: {s}\n", .{@errorName(e)});
+        try stderr.print("stako stack: failed to prepare client: {s}\n", .{@errorName(e)});
         return 1;
     };
     defer client.deinit();
@@ -147,21 +147,21 @@ fn reportClientError(
 ) !u8 {
     switch (e) {
         error.DaemonNotRunning, error.ConnectionRefused => {
-            try stderr.writeAll("organo: daemon not started; try `organo daemon start`\n");
+            try stderr.writeAll("stako: daemon not started; try `stako daemon start`\n");
             if (client.verbose) {
                 try stderr.print("  attempted: http://{s}:{d}{s}\n", .{ client.host, client.port, path });
             }
             return 1;
         },
         error.TransportTimeout => {
-            try stderr.writeAll("organo: daemon did not respond in time\n");
+            try stderr.writeAll("stako: daemon did not respond in time\n");
             if (client.verbose) {
                 try stderr.print("  attempted: http://{s}:{d}{s}\n", .{ client.host, client.port, path });
             }
             return 1;
         },
         else => {
-            try stderr.print("organo: request failed: {s}\n", .{@errorName(e)});
+            try stderr.print("stako: request failed: {s}\n", .{@errorName(e)});
             if (client.verbose) {
                 try stderr.print("  attempted: http://{s}:{d}{s}\n", .{ client.host, client.port, path });
             }
@@ -184,11 +184,11 @@ fn reportApiError(
     const message = findJsonStringField(body, "\"message\":\"");
 
     if (code) |c| {
-        try stderr.print("organo: HTTP {d} {s}", .{ status, c });
+        try stderr.print("stako: HTTP {d} {s}", .{ status, c });
         if (message) |m| try stderr.print(": {s}", .{m});
         try stderr.writeAll("\n");
     } else {
-        try stderr.print("organo: HTTP {d}\n", .{status});
+        try stderr.print("stako: HTTP {d}\n", .{status});
     }
     if (verbose) try stderr.print("  path: {s}\n", .{path});
     // Map status to exit code: 1 for runtime/4xx, 1 also for 5xx (CLI just
@@ -227,14 +227,14 @@ fn renderStackList(
     // any future sibling object whose key is also `name`. Walk the actual
     // JSON instead.
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        try stderr.writeAll("organo: malformed daemon response\n");
+        try stderr.writeAll("stako: malformed daemon response\n");
         return;
     };
     defer parsed.deinit();
 
     const root = parsed.value;
     if (root != .object) {
-        try stderr.writeAll("organo: malformed daemon response\n");
+        try stderr.writeAll("stako: malformed daemon response\n");
         return;
     }
     const stacks = root.object.get("stacks") orelse {
@@ -458,7 +458,7 @@ fn buildItemBody(allocator: std.mem.Allocator, args: cli.StackArgs, stderr: anyt
     defer if (prompt_buf) |p| allocator.free(p);
     if (args.prompt_file.len > 0) {
         prompt_buf = readPromptFile(allocator, args.prompt_file) catch |e| {
-            try stderr.print("organo: failed to read --prompt-file: {s}\n", .{@errorName(e)});
+            try stderr.print("stako: failed to read --prompt-file: {s}\n", .{@errorName(e)});
             return error.PromptFileReadFailed;
         };
     }
@@ -553,7 +553,7 @@ fn runConfigSet(
     while (i < args.set_count) : (i += 1) {
         const pair = args.set_pairs[i];
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
-            try stderr.writeAll("organo: --set must be key=value\n");
+            try stderr.writeAll("stako: --set must be key=value\n");
             return 2;
         };
         if (!first) try w.writeAll(",");
@@ -590,9 +590,9 @@ fn postAndReport(
     }
     // Human view: print "ok" plus the commit SHA if present.
     if (findJsonStringField(resp.body, "\"commit\":\"")) |sha| {
-        try stdout.print("organo: ok (commit {s})\n", .{sha});
+        try stdout.print("stako: ok (commit {s})\n", .{sha});
     } else {
-        try stdout.writeAll("organo: ok\n");
+        try stdout.writeAll("stako: ok\n");
     }
     return 0;
 }

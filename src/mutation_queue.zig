@@ -442,7 +442,7 @@ test "Queue: serial submission processes in order" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.makePath("stacks");
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
 
@@ -480,7 +480,7 @@ test "Queue: duplicate stack rejected with already_exists" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.makePath("stacks/dup");
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
 
@@ -505,7 +505,7 @@ test "Queue: runtime_transition to=running skips both commit and audit (G4)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.makePath("stacks/demo/0001-hi");
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     {
         var f = try tmp.dir.createFile("stacks/demo/0001-hi/meta.toml", .{ .truncate = true });
         defer f.close();
@@ -542,7 +542,7 @@ test "Queue: runtime_transition to=running skips both commit and audit (G4)" {
     if (r.output) |*o| o.deinit();
 
     // No audit line should have been written (the file might not even exist).
-    const audit_path = std.fs.path.join(a, &.{ abs, ".organo", "audit.log" }) catch unreachable;
+    const audit_path = std.fs.path.join(a, &.{ abs, ".stako", "audit.log" }) catch unreachable;
     defer a.free(audit_path);
     if (std.fs.cwd().openFile(audit_path, .{})) |f| {
         defer f.close();
@@ -556,7 +556,7 @@ test "Queue: applyTransition rejects mid-run cancel with state_conflict (G8)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.makePath("stacks/demo/0001-hi");
-    try tmp.dir.makePath(".organo");
+    try tmp.dir.makePath(".stako");
     {
         var f = try tmp.dir.createFile("stacks/demo/0001-hi/meta.toml", .{ .truncate = true });
         defer f.close();

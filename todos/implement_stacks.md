@@ -2,7 +2,7 @@
 
 ## Scope
 
-A stack is a persisted, ordered queue of agent work, owned and operated by the organo daemon. Stack items are stored as per-item directories on disk. The daemon is the only writer; core clients (CLI and web view) mutate stacks through its HTTP API. MCP and Python wrapper clients are follow-ups that must use the same API.
+A stack is a persisted, ordered queue of agent work, owned and operated by the stako daemon. Stack items are stored as per-item directories on disk. The daemon is the only writer; core clients (CLI and web view) mutate stacks through its HTTP API. MCP and Python wrapper clients are follow-ups that must use the same API.
 
 Detailed sub-todos:
 

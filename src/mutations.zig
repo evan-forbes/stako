@@ -76,7 +76,7 @@ pub const IdentityCtx = struct {
 // ---------- name validation ----------
 
 const RESERVED_STACK_NAMES = [_][]const u8{
-    ".organo", "stacks", ".git",
+    ".stako", "stacks", ".git",
 };
 
 pub fn validateNewStackName(name: []const u8) Error!void {
@@ -1140,7 +1140,7 @@ test "validateNewStackName: ok and reject" {
     try validateNewStackName("foo-bar");
     try std.testing.expectError(error.InvalidName, validateNewStackName("Foo"));
     try std.testing.expectError(error.InvalidName, validateNewStackName(""));
-    try std.testing.expectError(error.NameReserved, validateNewStackName(".organo"));
+    try std.testing.expectError(error.NameReserved, validateNewStackName(".stako"));
     try std.testing.expectError(error.NameReserved, validateNewStackName("stacks"));
 }
 

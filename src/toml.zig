@@ -1,4 +1,4 @@
-//! Minimal TOML reader/writer tailored to organo's meta.toml schema.
+//! Minimal TOML reader/writer tailored to stako's meta.toml schema.
 //!
 //! This is deliberately a small, hand-rolled implementation rather than a
 //! vendored full TOML parser. The supported subset:

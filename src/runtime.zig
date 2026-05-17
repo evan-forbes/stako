@@ -6,12 +6,11 @@
 //! state, sleep-timer wheel, and lowest-id-first dequeue.
 
 const std = @import("std");
-const storage = @import("storage.zig");
 const item_mod = @import("item.zig");
 const stack_config = @import("stack_config.zig");
 const state = @import("state.zig");
 const session_manager = @import("session_manager.zig");
-const mutation_queue = @import("mutation_queue.zig");
+const stack_mod = @import("stack.zig");
 const audit = @import("audit.zig");
 const sse_mod = @import("sse.zig");
 const adapter_mod = @import("adapter.zig");
@@ -38,7 +37,7 @@ pub const Dispatch = struct {
 
 pub const Options = struct {
     notes_root_abs: []const u8,
-    queue: *mutation_queue.Queue,
+    stack_registry: *stack_mod.StackRegistry,
     audit_writer: *audit.Writer,
     hub: ?*sse_mod.Hub = null,
     /// Global concurrency cap. Default 8 (matches design default).
@@ -90,7 +89,7 @@ pub const Supervisor = struct {
     status_cache: std.AutoHashMapUnmanaged(provider_status.Provider, provider_status.Status) = .{},
 
     pub fn init(allocator: std.mem.Allocator, opts: Options) Supervisor {
-        var sm = session_manager.Manager.init(allocator, opts.notes_root_abs, opts.hub, opts.audit_writer, opts.queue);
+        var sm = session_manager.Manager.init(allocator, opts.notes_root_abs, opts.hub, opts.audit_writer, opts.stack_registry);
         sm.max_concurrent = opts.max_concurrent_total;
         return .{ .allocator = allocator, .opts = opts, .sm = sm };
     }
@@ -134,19 +133,15 @@ pub const Supervisor = struct {
     pub fn reconcileOrphans(self: *Supervisor) !void {
         const orphans = try runtime_file.listAll(self.allocator, self.opts.notes_root_abs);
         defer runtime_file.freeOrphans(self.allocator, orphans);
+        const client = self.systemClient("runtime/restart-sweep");
         for (orphans) |o| {
             // Try to apply the running→failed transition; ignore errors.
-            var req = mutation_queue.Request{
-                .kind = .{ .runtime_transition = .{
-                    .stack = o.stack,
-                    .id = o.id,
-                    .to = .failed,
-                    .failed_reason = "daemon_restart_orphan",
-                } },
-                .ident = .{ .identity = "system", .api_path = "runtime/restart-sweep" },
-            };
-            self.opts.queue.submitAndWait(&req);
-            if (req.output) |*out| out.deinit();
+            deinitMutationIfOk(client.runtimeTransitionItem(o.stack, .{
+                .stack = o.stack,
+                .id = o.id,
+                .to = .failed,
+                .failed_reason = "daemon_restart_orphan",
+            }));
             // Delete the runtime file regardless of transition success.
             runtime_file.deleteFor(self.allocator, self.opts.notes_root_abs, o.stack, o.id) catch {};
         }
@@ -171,12 +166,11 @@ pub const Supervisor = struct {
     /// Discover every stack under `<notes_root>/stacks/` and start a
     /// worker thread for each. Idempotent. Used by the daemon at startup
     /// to bring the runtime online after the audit writer + mutation
-    /// queue have stable addresses.
+    /// registry have stable addresses.
     pub fn startAllWorkers(self: *Supervisor) !void {
-        var reader = try storage.Reader.init(self.allocator, self.opts.notes_root_abs);
-        defer reader.deinit();
-        const names = try reader.listStacks();
-        defer reader.freeStackList(names);
+        const client = self.systemClient("runtime/start");
+        const names = try client.listStacks();
+        defer client.freeStackList(names);
         for (names) |n| {
             const w = try self.ensureWorker(n);
             try w.start();
@@ -199,16 +193,15 @@ pub const Supervisor = struct {
     /// applies routing preflight, and dispatches eligible items through
     /// the session manager.
     pub fn tickStack(self: *Supervisor, stack_name: []const u8) !void {
-        var reader = try storage.Reader.init(self.allocator, self.opts.notes_root_abs);
-        defer reader.deinit();
+        const client = self.systemClient("runtime/tick");
 
-        var cfg = reader.readStackConfig(stack_name) catch return;
+        var cfg = client.readStackConfig(stack_name) catch return;
         defer cfg.deinit();
 
         if (cfg.paused) return;
 
-        const items = reader.listItems(stack_name) catch return;
-        defer reader.freeItemList(items);
+        const items = client.listItems(stack_name) catch return;
+        defer client.freeItemList(items);
 
         var running_in_stack: usize = 0;
         for (items) |it| {
@@ -220,7 +213,7 @@ pub const Supervisor = struct {
             if (running_in_stack >= per_stack_limit) break;
             if (!std.mem.eql(u8, it.status, "queued")) continue;
             // Fetch full item.
-            var item = reader.readItem(stack_name, it.id) catch continue;
+            var item = client.readItem(stack_name, it.id) catch continue;
             defer item.deinit();
 
             // Sleep semantics first.
@@ -233,17 +226,13 @@ pub const Supervisor = struct {
             const decision = try self.routingPreflight(&cfg, &item);
             switch (decision) {
                 .blocked => |reason| {
-                    var req = mutation_queue.Request{
-                        .kind = .{ .runtime_transition = .{
-                            .stack = stack_name,
-                            .id = it.id,
-                            .to = .blocked,
-                            .blocked_reason = reason,
-                        } },
-                        .ident = .{ .identity = "system", .api_path = "runtime/preflight" },
-                    };
-                    self.opts.queue.submitAndWait(&req);
-                    if (req.output) |*o| o.deinit();
+                    const transition_client = self.systemClient("runtime/preflight");
+                    deinitMutationIfOk(transition_client.runtimeTransitionItem(stack_name, .{
+                        .stack = stack_name,
+                        .id = it.id,
+                        .to = .blocked,
+                        .blocked_reason = reason,
+                    }));
                 },
                 .proceed => |proceed| {
                     var owned_proceed = proceed;
@@ -263,27 +252,17 @@ pub const Supervisor = struct {
         // completed; otherwise leave queued (a real timer wheel lands in M9
         // backlog work).
         if (until_unix <= now_unix) {
-            var req = mutation_queue.Request{
-                .kind = .{ .runtime_transition = .{
-                    .stack = stack_name,
-                    .id = item.id,
-                    .to = .running,
-                } },
-                .ident = .{ .identity = "system", .api_path = "runtime/sleep" },
-            };
-            self.opts.queue.submitAndWait(&req);
-            if (req.output) |*o| o.deinit();
-
-            var req2 = mutation_queue.Request{
-                .kind = .{ .runtime_transition = .{
-                    .stack = stack_name,
-                    .id = item.id,
-                    .to = .completed,
-                } },
-                .ident = .{ .identity = "system", .api_path = "runtime/sleep" },
-            };
-            self.opts.queue.submitAndWait(&req2);
-            if (req2.output) |*o| o.deinit();
+            const client = self.systemClient("runtime/sleep");
+            deinitMutationIfOk(client.runtimeTransitionItem(stack_name, .{
+                .stack = stack_name,
+                .id = item.id,
+                .to = .running,
+            }));
+            deinitMutationIfOk(client.runtimeTransitionItem(stack_name, .{
+                .stack = stack_name,
+                .id = item.id,
+                .to = .completed,
+            }));
         }
         // Future-dated sleep items remain queued; the loop will re-evaluate
         // on the next tick. (Per design, paused-with-timer is the eventual
@@ -490,21 +469,31 @@ pub const Supervisor = struct {
             .adapter = adapter,
         }) catch |e| {
             // Spawn failed → record as failed.
-            var req = mutation_queue.Request{
-                .kind = .{ .runtime_transition = .{
-                    .stack = stack_name,
-                    .id = item.id,
-                    .to = .failed,
-                    .failed_reason = "spawn_failed",
-                } },
-                .ident = .{ .identity = "system", .api_path = "runtime/spawn" },
-            };
-            self.opts.queue.submitAndWait(&req);
-            if (req.output) |*o| o.deinit();
+            const client = self.systemClient("runtime/spawn");
+            deinitMutationIfOk(client.runtimeTransitionItem(stack_name, .{
+                .stack = stack_name,
+                .id = item.id,
+                .to = .failed,
+                .failed_reason = "spawn_failed",
+            }));
             return e;
         };
     }
+
+    fn systemClient(self: *Supervisor, api_path: []const u8) stack_mod.StackClient {
+        return self.opts.stack_registry.localClient("system", api_path);
+    }
 };
+
+fn deinitMutationIfOk(result: stack_mod.MutationResult) void {
+    switch (result) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            ok.deinit();
+        },
+        .err => {},
+    }
+}
 
 fn requiredCapability(kind: item_mod.Kind) ?adapter_mod.Capability {
     return switch (kind) {
@@ -559,9 +548,8 @@ pub const Worker = struct {
     shutdown: bool = false,
     thread: ?std.Thread = null,
     /// Poll interval when idle. The worker re-ticks at this cadence so
-    /// items appended via the mutation queue (which doesn't yet wake
-    /// workers explicitly) make forward progress. Tests can override by
-    /// calling `wake()` to drive a tick immediately.
+    /// items still make forward progress if a wake signal is missed. Tests
+    /// can override by calling `wake()` to drive a tick immediately.
     poll_interval_ns: u64 = 100 * std.time.ns_per_ms,
 
     pub fn deinit(self: *Worker) void {
@@ -600,8 +588,7 @@ pub const Worker = struct {
             self.mutex.lock();
             // Wait until either: shutdown, a wake, or the poll interval
             // elapses. The timed wait keeps the worker live for items
-            // added via the mutation queue (which doesn't yet wake us
-            // directly).
+            // added even if a wake signal is missed.
             while (!self.wake_pending and !self.shutdown) {
                 self.cv.timedWait(&self.mutex, self.poll_interval_ns) catch break;
             }
