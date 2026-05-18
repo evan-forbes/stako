@@ -384,37 +384,9 @@ test "runtime: end-to-end fake run produces transcript and completes item" {
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"kind\":\"session_ended\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"terminal_status\":\"completed\"") != null);
 
-    const summary_path = try std.fs.path.join(a, &.{ item_dir, "output/summary.md" });
-    defer a.free(summary_path);
-    {
-        var f = try std.fs.cwd().openFile(summary_path, .{});
-        defer f.close();
-        const stat = try f.stat();
-        const buf = try a.alloc(u8, stat.size);
-        defer a.free(buf);
-        _ = try f.readAll(buf);
-        try std.testing.expect(std.mem.indexOf(u8, buf, "Hello, world!") != null);
-    }
-    const manifest_path = try std.fs.path.join(a, &.{ item_dir, "output/manifest.toml" });
-    defer a.free(manifest_path);
-    {
-        var f = try std.fs.cwd().openFile(manifest_path, .{});
-        defer f.close();
-        const stat = try f.stat();
-        const buf = try a.alloc(u8, stat.size);
-        defer a.free(buf);
-        _ = try f.readAll(buf);
-        try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"completed\"") != null);
-        try std.testing.expect(std.mem.indexOf(u8, buf, "transcript_path = \"../transcript.jsonl\"") != null);
-    }
-    const changed_path = try std.fs.path.join(a, &.{ item_dir, "output/changed_paths.txt" });
-    defer a.free(changed_path);
-    {
-        var f = try std.fs.cwd().openFile(changed_path, .{});
-        defer f.close();
-        const stat = try f.stat();
-        try std.testing.expect(stat.size > 0);
-    }
+    const output_dir = try std.fs.path.join(a, &.{ item_dir, "output" });
+    defer a.free(output_dir);
+    try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(output_dir, .{}));
 
     // Runtime file was deleted.
     const rp = try runtime_file.read(a, s.abs_path, "demo", "0001");
@@ -1008,7 +980,7 @@ test "runtime: target provider merge order is item then thread then stack defaul
     }
 }
 
-test "runtime: fake resume carries session into output manifest and advances thread on completion" {
+test "runtime: fake resume carries session into item commit and advances thread on completion" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "thread-resume");
     defer s.deinit();
@@ -1065,17 +1037,15 @@ test "runtime: fake resume carries session into output manifest and advances thr
     try std.testing.expect(std.mem.indexOf(u8, thread, "last_item_id = \"0002\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, thread, "last_session_id = \"sess-old\"") != null);
 
-    const manifest_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0002-resume/output/manifest.toml" });
-    defer a.free(manifest_path);
-    const manifest = try readFileAlloc(a, manifest_path);
-    defer a.free(manifest);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "[thread]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "name = \"admin\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "mode = \"resume\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, manifest, "resume_session_id = \"sess-old\"") != null);
+    const meta_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0002-resume/meta.toml" });
+    defer a.free(meta_path);
+    const meta = try readFileAlloc(a, meta_path);
+    defer a.free(meta);
+    try std.testing.expect(std.mem.indexOf(u8, meta, "status = \"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, meta, "session_id = \"sess-old\"") != null);
 }
 
-test "runtime: input item summary materializes rendered prompt before dispatch" {
+test "runtime: input item materializes commit context before dispatch" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "prompt-input-item");
     defer s.deinit();
@@ -1093,16 +1063,6 @@ test "runtime: input item summary materializes rendered prompt before dispatch" 
         \\match = "any"
         \\
     );
-    const output_dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-plan/output" });
-    defer a.free(output_dir);
-    try std.fs.cwd().makePath(output_dir);
-    {
-        const summary_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-plan/output/summary.md" });
-        defer a.free(summary_path);
-        var f = try std.fs.cwd().createFile(summary_path, .{ .truncate = true });
-        defer f.close();
-        try f.writeAll("prior item summary\n");
-    }
     try seedItem(a, s.abs_path, "demo", "0002", "next",
         \\id = "0002"
         \\slug = "next"
@@ -1160,8 +1120,8 @@ test "runtime: input item summary materializes rendered prompt before dispatch" 
     _ = try f.readAll(buf);
     try std.testing.expect(std.mem.indexOf(u8, buf, "## Stako I/O Contract") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "base prompt\n\n---\n\n## Registered Inputs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf, "Source: stacks/demo/0001-plan/output/summary.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf, "prior item summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "Source: stacks/demo/0001-plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "commits touching `stacks/demo/0001-plan`") != null);
 }
 
 test "runtime: rendered prompt is not written for later preflight block" {
@@ -1182,16 +1142,6 @@ test "runtime: rendered prompt is not written for later preflight block" {
         \\match = "any"
         \\
     );
-    const output_dir = try std.fs.path.join(a, &.{ s.abs_path, "stacks/demo/0001-plan/output" });
-    defer a.free(output_dir);
-    try std.fs.cwd().makePath(output_dir);
-    {
-        const summary_path = try std.fs.path.join(a, &.{ output_dir, "summary.md" });
-        defer a.free(summary_path);
-        var f = try std.fs.cwd().createFile(summary_path, .{ .truncate = true });
-        defer f.close();
-        try f.writeAll("prior item summary\n");
-    }
     try seedItem(a, s.abs_path, "demo", "0002", "next",
         \\id = "0002"
         \\slug = "next"
@@ -1426,8 +1376,8 @@ test "runtime: consumes with_running_item fixture for restart sweep" {
     _ = try f.readAll(buf);
     try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"failed\"") != null);
 
-    // .stako/runtime/ is clean.
-    const rt_dir = try std.fs.path.join(a, &.{ s.abs_path, ".stako/runtime/demo" });
+    // state/runtime/ is clean.
+    const rt_dir = try std.fs.path.join(a, &.{ s.abs_path, "state/runtime/demo" });
     defer a.free(rt_dir);
     var dir = std.fs.openDirAbsolute(rt_dir, .{ .iterate = true }) catch return;
     defer dir.close();
@@ -2544,7 +2494,7 @@ test "Worker: tear-down right after start cleanly joins the worker thread" {
 // item's denial does not break the supervisor's tick over its siblings.
 
 fn writeIdentityCaps(a: std.mem.Allocator, root: []const u8, caps_toml_array: []const u8) !void {
-    const path = try std.fs.path.join(a, &.{ root, ".stako", "config.toml" });
+    const path = try std.fs.path.join(a, &.{ root, "config.toml" });
     defer a.free(path);
     const body = try std.fmt.allocPrint(a,
         \\[identity.local]
@@ -2556,15 +2506,10 @@ fn writeIdentityCaps(a: std.mem.Allocator, root: []const u8, caps_toml_array: []
     var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer f.close();
     try f.writeAll(body);
-    const local_path = try std.fs.path.join(a, &.{ root, ".stako", "config.local.toml" });
-    defer a.free(local_path);
-    var lf = try std.fs.cwd().createFile(local_path, .{ .truncate = true });
-    defer lf.close();
-    try lf.writeAll("# cleared so config.toml is authoritative for the test\n");
 }
 
 fn readAuditLogF1(a: std.mem.Allocator, root: []const u8) ![]u8 {
-    const path = try std.fs.path.join(a, &.{ root, ".stako", "audit.log" });
+    const path = try std.fs.path.join(a, &.{ root, "state", "audit.log" });
     defer a.free(path);
     var f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -3014,9 +2959,7 @@ fn getItemHtmlWithRuntime(
 
     const path = try std.fmt.allocPrint(a, "/stacks/{s}/items/{s}", .{ stack, item_id });
     defer a.free(path);
-    const req = try std.fmt.allocPrint(a,
-        "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept: text/html\r\n\r\n",
-        .{path});
+    const req = try std.fmt.allocPrint(a, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept: text/html\r\n\r\n", .{path});
     defer a.free(req);
     // Suppress unused-var warning when slug is only for the meta filename.
     _ = slug;

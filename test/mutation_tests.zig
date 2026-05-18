@@ -63,7 +63,7 @@ fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
     try vcs.ensureRealRepo(allocator, root);
 
     // Stage and commit the init layout so the working tree is clean.
-    const paths = [_][]const u8{ ".gitignore", "stacks", ".stako/config.toml" };
+    const paths = [_][]const u8{ ".gitignore", "stacks", "routines" };
     _ = vcs.commit(allocator, root, .{
         .paths = &paths,
         .subject = "init: baseline",
@@ -186,9 +186,9 @@ fn buildGetRequest(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", .{path});
 }
 
-/// Count lines in audit.log under <root>/.stako/audit.log; returns 0 if absent.
+/// Count lines in audit.log under <root>/state/audit.log; returns 0 if absent.
 fn auditLineCount(allocator: std.mem.Allocator, root: []const u8) !usize {
-    const path = try std.fs.path.join(allocator, &.{ root, ".stako", "audit.log" });
+    const path = try std.fs.path.join(allocator, &.{ root, "state", "audit.log" });
     defer allocator.free(path);
     var f = std.fs.cwd().openFile(path, .{}) catch return 0;
     defer f.close();
@@ -481,7 +481,7 @@ test "mutation: two concurrent requests serialize and both succeed" {
     // Audit log contains at least 2 mutation entries; their order matches
     // queue arrival (we can't predict order between the threads, but
     // exactly-one of each is guaranteed by the single-writer queue).
-    const log_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "audit.log" });
+    const log_path = try std.fs.path.join(a, &.{ s.abs_path, "state", "audit.log" });
     defer a.free(log_path);
     var lf = try std.fs.cwd().openFile(log_path, .{});
     defer lf.close();
@@ -780,8 +780,11 @@ test "mutation: append routine writes ordinary items in one commit and one wake"
 
     const routines = try client.listRoutines();
     defer client.freeRoutineList(routines);
-    try std.testing.expectEqual(@as(usize, 1), routines.len);
-    try std.testing.expectEqualStrings("planning", routines[0].name);
+    var found_planning = false;
+    for (routines) |r| {
+        if (std.mem.eql(u8, r.name, "planning")) found_planning = true;
+    }
+    try std.testing.expect(found_planning);
 
     var routine = try client.readRoutine("planning");
     defer routine.deinit();
@@ -821,7 +824,7 @@ test "mutation: append routine writes ordinary items in one commit and one wake"
     try std.testing.expectEqualStrings(item1.id, item2.parents.?[0]);
     try std.testing.expectEqualStrings(item1.id, item2.inputs.?.items.?[0]);
 
-    const log_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "audit.log" });
+    const log_path = try std.fs.path.join(a, &.{ s.abs_path, "state", "audit.log" });
     defer a.free(log_path);
     const log = try readFileAlloc(a, log_path);
     defer a.free(log);

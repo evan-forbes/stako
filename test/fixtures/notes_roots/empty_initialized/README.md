@@ -9,8 +9,8 @@ them when the fixture is committed:
 | In a real notes root            | In this fixture                       |
 |---------------------------------|---------------------------------------|
 | `.gitignore`                    | `dot_gitignore`                       |
-| `.stako/local_token`           | `.stako/local_token.expected`        |
-| `.stako/config.local.toml`     | `.stako/config.local.toml.expected`  |
+| `config.toml`                   | `config.toml.expected`                |
+| `state/local_token`             | `state/local_token.expected`          |
 
 Tests consume the rename map via `FIXTURE_FILES` in `test/init_tests.zig`.
 

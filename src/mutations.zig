@@ -82,7 +82,7 @@ pub const IdentityCtx = struct {
 // ---------- name validation ----------
 
 const RESERVED_STACK_NAMES = [_][]const u8{
-    ".stako", "stacks", ".git",
+    "stacks", "state", ".git",
 };
 
 pub fn validateNewStackName(name: []const u8) Error!void {
@@ -766,23 +766,16 @@ pub fn applyRuntimeTransition(
 
     if (terminal) {
         if (try prompt_materializer.renderedPromptExists(allocator, notes_root_abs, input.stack, item_dir_name)) {
-            try paths_list.append(allocator, try prompt_materializer.renderedPromptRel(allocator, input.stack, item_dir_name));
+            try appendPathUnique(allocator, &paths_list, try prompt_materializer.renderedPromptRel(allocator, input.stack, item_dir_name));
         }
-        const fallback_packet: output_packet.PacketInput = .{
-            .stack = input.stack,
-            .item_id = input.id,
-            .status = target_status.toString(),
-            .completed_at = input.result_completed_at,
-            .result = if (item.result) |r| r else .{},
-        };
-        const packet = input.output_packet orelse fallback_packet;
-        const output_paths = try output_packet.writePacket(allocator, notes_root_abs, input.stack, item_dir_name, packet);
-        defer allocator.free(output_paths);
-        for (output_paths) |p| try paths_list.append(allocator, p);
+        try appendTranscriptPathIfPresent(allocator, notes_root_abs, input.stack, item_dir_name, input.result_transcript_path, &paths_list);
+        if (input.output_packet) |packet| {
+            try appendNotesRootWorkdirPaths(allocator, notes_root_abs, packet, &paths_list);
+        }
         if (target_status == .completed) {
             if (item.thread) |thread_ref| {
                 const thread_rel = try updateThreadFromItemResult(allocator, notes_root_abs, input.stack, item_dir_name, thread_ref.name, input, item.result);
-                try paths_list.append(allocator, thread_rel);
+                try appendPathUnique(allocator, &paths_list, thread_rel);
             }
         }
     }
@@ -1305,6 +1298,55 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+fn appendPathUnique(allocator: std.mem.Allocator, paths: *std.ArrayList([]u8), owned_path: []u8) !void {
+    for (paths.items) |p| {
+        if (std.mem.eql(u8, p, owned_path)) {
+            allocator.free(owned_path);
+            return;
+        }
+    }
+    try paths.append(allocator, owned_path);
+}
+
+fn appendTranscriptPathIfPresent(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    stack: []const u8,
+    item_dir_name: []const u8,
+    result_transcript_path: ?[]const u8,
+    paths: *std.ArrayList([]u8),
+) !void {
+    _ = result_transcript_path;
+    const rel = try std.fmt.allocPrint(allocator, "stacks/{s}/{s}/transcript.jsonl", .{ stack, item_dir_name });
+    errdefer allocator.free(rel);
+    const abs = try std.fs.path.join(allocator, &.{ notes_root_abs, rel });
+    defer allocator.free(abs);
+    if (!fileExists(abs)) {
+        allocator.free(rel);
+        return;
+    }
+    try appendPathUnique(allocator, paths, rel);
+}
+
+fn appendNotesRootWorkdirPaths(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    packet: output_packet.PacketInput,
+    paths: *std.ArrayList([]u8),
+) !void {
+    const after = packet.workdir_after orelse return;
+    const root = after.root orelse return;
+    if (!std.mem.eql(u8, root, notes_root_abs)) return;
+    for (packet.changed_paths) |p| {
+        if (std.fs.path.isAbsolute(p) or !item_mod.isValidInputFilePath(p) or isInternalGitPath(p)) continue;
+        try appendPathUnique(allocator, paths, try allocator.dupe(u8, p));
+    }
+}
+
+fn isInternalGitPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, ".git") or std.mem.startsWith(u8, path, ".git/");
+}
+
 fn mapStepRefsToIds(
     allocator: std.mem.Allocator,
     steps: []const routine_mod.Step,
@@ -1822,7 +1864,7 @@ fn isKeyLine(trimmed: []const u8, key: []const u8) bool {
     return i < trimmed.len and trimmed[i] == '=';
 }
 
-test "applyRuntimeTransition: terminal transition writes output packet paths" {
+test "applyRuntimeTransition: terminal transition records commit output paths" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1845,6 +1887,22 @@ test "applyRuntimeTransition: terminal transition writes output packet paths" {
             \\
         );
     }
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-hello/transcript.jsonl", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("{\"kind\":\"message\"}\n");
+    }
+    try tmp.dir.makePath("notes");
+    {
+        var f = try tmp.dir.createFile("notes/decision.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("done\n");
+    }
+    var snap = output_packet.WorkdirSnapshot{
+        .allocator = a,
+        .kind = .git,
+        .root = @constCast(root),
+    };
 
     var out = try applyRuntimeTransition(a, root, .{ .identity = "system", .api_path = "test" }, .{
         .stack = "demo",
@@ -1853,22 +1911,21 @@ test "applyRuntimeTransition: terminal transition writes output packet paths" {
         .result_harness = "fake",
         .result_transcript_path = "../transcript.jsonl",
         .result_completed_at = "2026-05-17T12:00:00.000Z",
+        .output_packet = .{
+            .stack = "demo",
+            .item_id = "0001",
+            .status = "completed",
+            .changed_paths = &.{"notes/decision.md"},
+            .workdir_after = &snap,
+        },
     });
     defer out.deinit();
 
-    try std.testing.expectEqual(@as(usize, 4), out.paths.len);
+    try std.testing.expectEqual(@as(usize, 3), out.paths.len);
     try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/meta.toml"));
-    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/output/summary.md"));
-    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/output/manifest.toml"));
-    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/output/changed_paths.txt"));
-
-    var f = try tmp.dir.openFile("stacks/demo/0001-hello/output/summary.md", .{});
-    defer f.close();
-    const stat = try f.stat();
-    const buf = try a.alloc(u8, stat.size);
-    defer a.free(buf);
-    _ = try f.readAll(buf);
-    try std.testing.expect(std.mem.indexOf(u8, buf, "Item completed without a final assistant summary.") != null);
+    try std.testing.expect(pathListContains(out.paths, "stacks/demo/0001-hello/transcript.jsonl"));
+    try std.testing.expect(pathListContains(out.paths, "notes/decision.md"));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("stacks/demo/0001-hello/output", .{}));
 }
 
 test "applyRuntimeTransition: terminal transition includes rendered prompt path when present" {
@@ -2040,8 +2097,9 @@ test "validateNewStackName: ok and reject" {
     try validateNewStackName("foo-bar");
     try std.testing.expectError(error.InvalidName, validateNewStackName("Foo"));
     try std.testing.expectError(error.InvalidName, validateNewStackName(""));
-    try std.testing.expectError(error.NameReserved, validateNewStackName(".stako"));
+    try std.testing.expectError(error.InvalidName, validateNewStackName(".stako"));
     try std.testing.expectError(error.NameReserved, validateNewStackName("stacks"));
+    try std.testing.expectError(error.NameReserved, validateNewStackName("state"));
 }
 
 test "applyCreateStack: writes stack.toml" {

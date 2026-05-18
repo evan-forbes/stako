@@ -1,8 +1,9 @@
-//! File-backed terminal item output packets.
+//! Legacy output-packet readers plus workdir snapshot helpers.
 //!
-//! These helpers deliberately stay independent from stack VCS. Workdir
-//! snapshots use git only inside the target workdir and never stage, commit,
-//! clean, or rewrite anything there.
+//! New terminal item output is the stack commit itself. The remaining packet
+//! helpers support old item directories and keep workdir snapshot logic
+//! independent from stack VCS. Workdir snapshots use git only inside the
+//! target workdir and never stage, commit, clean, or rewrite anything there.
 
 const std = @import("std");
 const events = @import("events.zig");

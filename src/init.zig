@@ -1,13 +1,18 @@
 //! `stako init` — bootstrap a notes-root layout.
 //!
-//! On-disk contract: `todos/design_init_and_layout.md`.
+//! Layout (created under `<root>/`):
+//!   - `stacks/default/stack.toml`
+//!   - `config.toml`            (gitignored)
+//!   - `state/local_token`      (gitignored, perms 0600)
+//!   - `state/runtime/`         (gitignored)
+//!   - `.gitignore`             (entries appended; existing lines preserved)
 //!
 //! Idempotency:
 //!   - The directory layout is created if missing; existing dirs are left
 //!     alone.
-//!   - `.stako/config.toml` and `stacks/default/stack.toml` are NEVER
-//!     overwritten if present.
-//!   - `.stako/local_token` is generated once and never rewritten.
+//!   - `config.toml` and `stacks/default/stack.toml` are NEVER overwritten
+//!     if present.
+//!   - `state/local_token` is generated once and never rewritten.
 //!   - `.gitignore` lines are appended only if absent.
 //!
 //! Re-running on an initialized root reports zero changes.
@@ -71,17 +76,10 @@ pub const InitError = error{
     PathTypeMismatch,
 };
 
-/// The gitignore lines added by init. Order matches the design doc.
+/// The gitignore lines added by init.
 pub const GITIGNORE_LINES = [_][]const u8{
-    ".stako/config.local.toml",
-    ".stako/credentials/",
-    ".stako/local_token",
-    ".stako/runtime/",
-    ".stako/runs/",
-    ".stako/audit.log",
-    ".stako/audit.log.*",
-    ".stako/daemon.pid",
-    ".stako/daemon.log",
+    "config.toml",
+    "state/",
 };
 
 /// Resolve `root` and run `stako init`. Caller owns the returned report.
@@ -125,14 +123,12 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
     // 2. Directory layout.
     try ensureDir(&root_dir, "stacks", &report, r_arena);
     try ensureDir(&root_dir, "stacks/default", &report, r_arena);
-    try ensureDir(&root_dir, ".stako", &report, r_arena);
-    try ensureDir(&root_dir, ".stako/credentials", &report, r_arena);
-    try ensureDir(&root_dir, ".stako/runtime", &report, r_arena);
+    try ensureDir(&root_dir, "routines", &report, r_arena);
+    try ensureDir(&root_dir, "routines/admin-review", &report, r_arena);
+    try ensureDir(&root_dir, "state", &report, r_arena);
+    try ensureDir(&root_dir, "state/runtime", &report, r_arena);
 
-    // 3. Set restrictive perms on credential-bearing directories.
-    try chmodIfPosix(&root_dir, ".stako/credentials", 0o700);
-
-    // 4. stacks/default/stack.toml — write defaults if absent.
+    // 3. stacks/default/stack.toml — write defaults if absent.
     {
         const now = opts.now_override orelse blk: {
             const ts = std.time.timestamp();
@@ -149,39 +145,47 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
         );
     }
 
-    // 5. .stako/config.toml — committed defaults.
+    // 4. Built-in admin routine and prompt assets.
     try writeFileIfAbsent(
         &root_dir,
-        ".stako/config.toml",
+        "routines/admin-review.toml",
         &report,
         r_arena,
-        .{ .config_committed = {} },
+        .{ .admin_routine = {} },
+        null,
+    );
+    try writeFileIfAbsent(
+        &root_dir,
+        "routines/admin-review/evaluate.md",
+        &report,
+        r_arena,
+        .{ .admin_prompt = {} },
         null,
     );
 
-    // 6. .stako/config.local.toml — per-machine, gitignored.
+    // 5. config.toml — single per-root config file, gitignored.
     try writeFileIfAbsent(
         &root_dir,
-        ".stako/config.local.toml",
+        "config.toml",
         &report,
         r_arena,
-        .{ .config_local = {} },
+        .{ .config = {} },
         null,
     );
 
-    // 7. .stako/local_token — generated once, perms 0600, gitignored.
+    // 6. state/local_token — generated once, perms 0600, gitignored.
     // Token bytes are produced lazily inside writeFileIfAbsent so we don't
     // burn kernel entropy on idempotent re-init runs.
     try writeFileIfAbsent(
         &root_dir,
-        ".stako/local_token",
+        "state/local_token",
         &report,
         r_arena,
         .{ .local_token = opts.rng_seed_override },
         0o600,
     );
 
-    // 8. .gitignore — append missing lines.
+    // 7. .gitignore — append missing lines.
     try appendGitignoreLines(&root_dir, &report, r_arena);
 
     return report;
@@ -310,8 +314,9 @@ fn chmodIfPosix(root_dir: *std.fs.Dir, rel: []const u8, mode: u32) !void {
 
 const FileSpec = union(enum) {
     stack_defaults: struct { created_at: []const u8 },
-    config_committed,
-    config_local,
+    admin_routine,
+    admin_prompt,
+    config,
     /// Generated lazily inside `writeFileIfAbsent` to avoid wasted entropy
     /// when the file already exists.
     local_token: ?u64,
@@ -337,8 +342,9 @@ fn writeFileIfAbsent(
     const w = buf.writer(arena);
     switch (spec) {
         .stack_defaults => |sd| try stack_config.writeDefaults(w, sd.created_at),
-        .config_committed => try writeConfigCommitted(w),
-        .config_local => try writeConfigLocal(w),
+        .admin_routine => try writeAdminRoutine(w),
+        .admin_prompt => try writeAdminPrompt(w),
+        .config => try writeConfig(w),
         .local_token => |seed| {
             const token = try generateLocalToken(arena, seed);
             try w.writeAll(token);
@@ -387,18 +393,59 @@ fn writeAtomic(root_dir: *std.fs.Dir, rel: []const u8, content: []const u8) !voi
     };
 }
 
-fn writeConfigCommitted(w: anytype) !void {
+fn writeAdminRoutine(w: anytype) !void {
     try w.writeAll(
-        \\# .stako/config.toml — committed: project-wide defaults.
-        \\# Per-machine overrides live in config.local.toml (gitignored).
-        \\# Schema: todos/design_init_and_layout.md
+        \\version = 1
+        \\name = "admin-review"
+        \\description = "Review recent stack results and decide what to do next."
+        \\
+        \\[[step]]
+        \\name = "evaluate"
+        \\slug = "admin-evaluate"
+        \\kind = "prompt"
+        \\thread = "admin"
+        \\thread_mode = "resume"
+        \\prompt_file = "admin-review/evaluate.md"
+        \\
+    );
+}
+
+fn writeAdminPrompt(w: anytype) !void {
+    try w.writeAll(
+        \\Review the registered item and commit inputs from recent stack work.
+        \\
+        \\Write any useful decision, summary, or follow-up notes as ordinary files in the workdir or notes tree. Use one of these decision labels when you write a decision:
+        \\
+        \\- proceed
+        \\- needs follow-up
+        \\- done
+        \\
+        \\Include the evidence that led to the decision and any recommended follow-up prompts. Do not modify stack metadata directly.
+        \\
+    );
+}
+
+fn writeConfig(w: anytype) !void {
+    try w.writeAll(
+        \\# config.toml — per-root stako config. Gitignored.
         \\
         \\[daemon]
         \\loopback_only = true
         \\default_stack = "default"
+        \\port = 7421
         \\
-        \\# Project-wide identities. Add or edit by hand.
-        \\# Capabilities are scope strings like "stack.<name>.read" or "*".
+        \\[workdir]
+        \\# Items requesting a workdir outside this list are blocked at routing.
+        \\# Add absolute paths; tilde-expansion is performed at load time.
+        \\allowlist = []
+        \\
+        \\# Identities. Capabilities are scope strings like
+        \\# "stack.<name>.read" or "*".
+        \\[identity.local]
+        \\type = "user"
+        \\description = "the local user (CLI, web view) on this machine"
+        \\capabilities = ["*"]
+        \\
         \\[identity.claude-local]
         \\type = "mcp"
         \\description = "local Claude Code"
@@ -414,27 +461,6 @@ fn writeConfigCommitted(w: anytype) !void {
         \\
         \\[provider.openai]
         \\auth_kind = "subscription"
-        \\
-    );
-}
-
-fn writeConfigLocal(w: anytype) !void {
-    try w.writeAll(
-        \\# .stako/config.local.toml — per-machine; gitignored.
-        \\# Overrides values in config.toml at load time (last-write-wins).
-        \\
-        \\[daemon]
-        \\port = 7421
-        \\
-        \\[workdir]
-        \\# Items requesting a workdir outside this list are blocked at routing.
-        \\# Add absolute paths; tilde-expansion is performed at load time.
-        \\allowlist = []
-        \\
-        \\[identity.local]
-        \\type = "user"
-        \\description = "the local user (CLI, web view) on this machine"
-        \\capabilities = ["*"]
         \\
     );
 }
@@ -566,10 +592,10 @@ fn formatIsoUtc(arena: std.mem.Allocator, ts: i64) ![]const u8 {
 // ---------- internal unit tests ----------
 
 test "gitignoreContainsLine matches exact lines" {
-    const existing = "node_modules/\n.stako/local_token\n# comment\n";
-    try std.testing.expect(gitignoreContainsLine(existing, ".stako/local_token"));
+    const existing = "node_modules/\nstate/\n# comment\n";
+    try std.testing.expect(gitignoreContainsLine(existing, "state/"));
     try std.testing.expect(gitignoreContainsLine(existing, "node_modules/"));
-    try std.testing.expect(!gitignoreContainsLine(existing, ".stako/runtime/"));
+    try std.testing.expect(!gitignoreContainsLine(existing, "config.toml"));
     try std.testing.expect(!gitignoreContainsLine(existing, "# comment"));
 }
 

@@ -17,6 +17,7 @@ const cli = stako.cli;
 const init_mod = stako.init;
 const daemon_mod = stako.daemon;
 const http_client = stako.http_client;
+const vcs = stako.vcs;
 
 // ---------- harness (mirrors test/daemon_tests.zig) ----------
 
@@ -124,6 +125,18 @@ fn seedDemoStack(allocator: std.mem.Allocator, root: []const u8) !void {
     }
 }
 
+fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
+    const git_path = try std.fs.path.join(allocator, &.{ root, ".git" });
+    defer allocator.free(git_path);
+    std.fs.cwd().deleteTree(git_path) catch {};
+    try vcs.ensureRealRepo(allocator, root);
+
+    _ = vcs.commit(allocator, root, .{
+        .paths = &.{ ".gitignore", "stacks", "routines" },
+        .subject = "init: baseline",
+    }) catch {};
+}
+
 fn startEphemeralDaemon(allocator: std.mem.Allocator, root: []const u8) !daemon_mod.Daemon {
     return daemon_mod.start(allocator, .{
         .notes_root = root,
@@ -149,6 +162,13 @@ const Driver = struct {
     daemon: daemon_mod.Daemon,
     thread: ?std.Thread = null,
     ctx: ServeContext = undefined,
+    worker_started: bool = false,
+
+    fn startWorker(self: *Driver) !void {
+        if (self.worker_started) return;
+        try self.daemon.startWorker();
+        self.worker_started = true;
+    }
 
     /// Cleanup is order-sensitive: a `serveOne` worker may still be blocked
     /// in `accept()` (e.g., because a test aborted before driving every
@@ -173,11 +193,11 @@ fn buildDriver(allocator: std.mem.Allocator, root: []const u8) !Driver {
     return .{ .allocator = allocator, .daemon = d };
 }
 
-/// Write `<root>/.stako/config.local.toml` with `daemon.port = <port>` so
-/// the CLI's port-resolution layer finds the ephemeral port without needing
-/// `--port` on every invocation.
+/// Write `<root>/config.toml` with `daemon.port = <port>` so the CLI's
+/// port-resolution layer finds the ephemeral port without needing `--port`
+/// on every invocation.
 fn writePortConfig(allocator: std.mem.Allocator, root: []const u8, port: u16) !void {
-    const path = try std.fs.path.join(allocator, &.{ root, ".stako", "config.local.toml" });
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
     defer allocator.free(path);
     var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer f.close();
@@ -333,6 +353,38 @@ test "cli: stack config — canonical and short alias both work" {
     try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "stack: demo") != null);
 }
 
+test "cli: stack add prompt writes an item through the live daemon" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "stack-add-prompt");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try makeRealRepo(a, s.abs_path);
+
+    const prompt_path = try std.fs.path.join(a, &.{ s.abs_path, "first-pass.md" });
+    defer a.free(prompt_path);
+    {
+        var f = try std.fs.cwd().createFile(prompt_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("Find the next implementation step.\n");
+    }
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.startWorker();
+    try drv.serve(1);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r = try runCli(a, &.{ "stack", "add", "default", "prompt", "--target", "any", "--prompt-file", prompt_path, "--slug", "first-pass", "--root", s.abs_path });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.code);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "stako: ok") != null);
+
+    var d = try std.fs.openDirAbsolute(s.abs_path, .{});
+    defer d.close();
+    try d.access("stacks/default/0001-first-pass/meta.toml", .{});
+    try d.access("stacks/default/0001-first-pass/prompt.md", .{});
+}
+
 test "cli: stack show unknown stack -> non-zero exit + canonical error" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "stack-404");
@@ -453,12 +505,12 @@ test "cli: init on a fresh dir exits 0 and prints created list" {
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 0), r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, ".stako/local_token") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "state/local_token") != null);
 
     // Layout actually landed on disk.
     var d = try std.fs.openDirAbsolute(s.abs_path, .{});
     defer d.close();
-    d.access(".stako/local_token", .{}) catch return error.LayoutNotCreated;
+    d.access("state/local_token", .{}) catch return error.LayoutNotCreated;
     d.access("stacks/default/stack.toml", .{}) catch return error.LayoutNotCreated;
 }
 
@@ -472,7 +524,7 @@ test "cli: init --quiet suppresses per-line output but prints a summary" {
     try std.testing.expectEqual(@as(u8, 0), r.code);
     // No per-line `created:` block under --quiet.
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created:\n") == null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "  .stako/local_token\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "  state/local_token\n") == null);
     // But a one-line summary is present.
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "stako init:") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created") != null);
@@ -507,7 +559,7 @@ test "cli: init on a missing root creates it" {
     try std.testing.expectEqual(@as(u8, 0), r.code);
     var d = try std.fs.openDirAbsolute(root, .{});
     defer d.close();
-    try d.access(".stako/local_token", .{});
+    try d.access("state/local_token", .{});
     try d.access("stacks/default/stack.toml", .{});
 }
 
@@ -534,10 +586,34 @@ test "cli: init without --yes does not auto-init git on a non-git root" {
     // Layout landed, but .git was NOT created because --yes was absent.
     var d = try std.fs.openDirAbsolute(s.abs_path, .{});
     defer d.close();
-    d.access(".stako/local_token", .{}) catch return error.LayoutNotCreated;
+    d.access("state/local_token", .{}) catch return error.LayoutNotCreated;
     if (d.access(".git", .{})) |_| {
         return error.GitInitShouldHaveBeenSkipped;
     } else |_| {}
+}
+
+test "cli: routine list and show read routines through the live daemon" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "routine-read");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(2);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r1 = try runCli(a, &.{ "routine", "list", "--root", s.abs_path });
+    defer r1.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r1.code);
+    try std.testing.expect(std.mem.indexOf(u8, r1.stdout, "\"routines\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.stdout, "\"name\":\"admin-review\"") != null);
+
+    var r2 = try runCli(a, &.{ "routine", "show", "admin-review", "--root", s.abs_path });
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r2.code);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "\"name\":\"admin-review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "\"description\":\"Review recent stack results and decide what to do next.\"") != null);
 }
 
 // ---------- subprocess test ----------

@@ -438,7 +438,7 @@ test "daemon: daemon.log is created on non-ephemeral start" {
     defer d.deinit();
 
     // Log file exists.
-    const log_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "daemon.log" });
+    const log_path = try std.fs.path.join(a, &.{ s.abs_path, "state", "daemon.log" });
     defer a.free(log_path);
     var f = try std.fs.cwd().openFile(log_path, .{});
     defer f.close();
@@ -797,7 +797,7 @@ test "daemon: daemon_started and daemon_stopped events recorded in audit.log" {
     try d.startWorker();
     d.deinit();
 
-    const path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "audit.log" });
+    const path = try std.fs.path.join(a, &.{ s.abs_path, "state", "audit.log" });
     defer a.free(path);
     var f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -825,12 +825,12 @@ test "daemon: stop returns not_running and cleans pidfile when pid is dead" {
     defer s.deinit();
     try initNotesRoot(a, s.abs_path);
 
-    const stako_dir = try std.fs.path.join(a, &.{ s.abs_path, ".stako" });
-    defer a.free(stako_dir);
-    try std.fs.cwd().makePath(stako_dir);
+    const state_dir = try std.fs.path.join(a, &.{ s.abs_path, "state" });
+    defer a.free(state_dir);
+    try std.fs.cwd().makePath(state_dir);
 
     // Write a pidfile pointing at a PID that's almost certainly absent.
-    const pid_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "daemon.pid" });
+    const pid_path = try std.fs.path.join(a, &.{ s.abs_path, "state", "daemon.pid" });
     defer a.free(pid_path);
     {
         var f = try std.fs.cwd().createFile(pid_path, .{ .truncate = true, .mode = 0o600 });
@@ -856,7 +856,7 @@ test "daemon: stop returns not_running and cleans pidfile when pid is dead" {
 // daemon-struct shape, so they survive future routing refactors.
 
 fn writeStalePidFile(a: std.mem.Allocator, root: []const u8, pid: i32) !void {
-    const dir = try std.fs.path.join(a, &.{ root, ".stako" });
+    const dir = try std.fs.path.join(a, &.{ root, "state" });
     defer a.free(dir);
     try std.fs.cwd().makePath(dir);
     const pid_path = try std.fs.path.join(a, &.{ dir, "daemon.pid" });

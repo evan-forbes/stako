@@ -13,9 +13,8 @@
 //! Port resolution order (highest priority first):
 //!   1. `Opts.port_override` (`--port/-p` on the CLI).
 //!   2. `STAKO_PORT` environment variable.
-//!   3. `<root>/.stako/config.local.toml` daemon.port.
-//!   4. `<root>/.stako/config.toml` daemon.port.
-//!   5. Builtin default (7421, via Config defaults).
+//!   3. `<root>/config.toml` daemon.port.
+//!   4. Builtin default (7421, via Config defaults).
 
 const std = @import("std");
 const config_mod = @import("config.zig");
@@ -53,7 +52,7 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     host: []const u8,
     port: u16,
-    /// `null` when there's no `.stako/local_token` (e.g. user pointed
+    /// `null` when there's no `state/local_token` (e.g. user pointed
     /// `--root` at a non-initialized directory). Read endpoints don't require
     /// the token; we keep it loaded so milestone 5's mutation calls work
     /// without further plumbing.
@@ -76,16 +75,16 @@ pub const Response = struct {
     }
 };
 
-/// Build a `Client` from CLI options. Reads config.toml + config.local.toml
-/// (tolerant of missing files) and optionally the local token. Caller owns
-/// the returned client and must call `deinit`.
+/// Build a `Client` from CLI options. Reads config.toml (tolerant of
+/// missing files) and optionally the local token. Caller owns the returned
+/// client and must call `deinit`.
 pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
     const root = try paths.resolveNotesRoot(allocator, opts.root);
     defer allocator.free(root);
 
     // Port resolution.
     var port: u16 = 7421;
-    // Missing `.stako/` is the common case (user invokes from outside an
+    // Missing config.toml is the common case (user invokes from outside an
     // initialized notes root and overrides everything via flags/env). Other
     // load errors — malformed TOML, wrong types, `PortOutOfRange` — must
     // surface; otherwise we silently downgrade to the default port and the
@@ -113,7 +112,7 @@ pub fn open(allocator: std.mem.Allocator, opts: Opts) ClientError!Client {
     }
     if (opts.port_override) |p| port = p;
 
-    // Token (optional). If `.stako/local_token` exists, use it. Otherwise
+    // Token (optional). If `state/local_token` exists, use it. Otherwise
     // we proceed without one — read endpoints don't require it.
     var token_owned: ?[]u8 = null;
     if (loadTokenIfPresent(allocator, root)) |t| {
@@ -134,7 +133,7 @@ fn loadTokenIfPresent(
     allocator: std.mem.Allocator,
     notes_root: []const u8,
 ) !?[]u8 {
-    const path = try std.fs.path.join(allocator, &.{ notes_root, ".stako", "local_token" });
+    const path = try std.fs.path.join(allocator, &.{ notes_root, "state", "local_token" });
     defer allocator.free(path);
     var f = std.fs.cwd().openFile(path, .{}) catch return null;
     defer f.close();

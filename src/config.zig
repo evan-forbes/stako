@@ -1,14 +1,7 @@
-//! Daemon Config: typed view over `.stako/config.toml` and
-//! `.stako/config.local.toml`.
+//! Daemon Config: typed view over `<notes-root>/config.toml`.
 //!
-//! Load order: `config.toml` first, then `config.local.toml` overlaid on top.
-//! Per `todos/design_init_and_layout.md`:
-//!   - Scalar leaf keys: last-write-wins (local overrides committed).
-//!   - `[identity.<name>]` tables: replaced wholesale (no field-level merge).
-//!     A local identity entry shadows rather than partially overrides.
-//!
-//! This module owns the typed view; the rest of the daemon reads `Config`
-//! and never re-parses the TOML directly.
+//! Single-file config. Missing files are tolerated and yield defaults so
+//! tests can run against a notes root that only has the bits they need.
 
 const std = @import("std");
 const toml = @import("toml.zig");
@@ -57,37 +50,23 @@ pub const LoadError = error{
     FileTooLarge,
 } || std.fs.File.OpenError || std.fs.File.ReadError || std.fs.File.StatError;
 
-/// Load the daemon configuration from a notes root.
-///
-/// Looks at `<notes_root>/.stako/config.toml` and (optionally)
-/// `<notes_root>/.stako/config.local.toml`. Missing files are tolerated:
-/// load returns the defaults for any field not specified. This lets tests
-/// run against a temp dir that only has the bits they need.
 pub fn loadFromRoot(allocator: std.mem.Allocator, notes_root: []const u8) LoadError!Config {
     var cfg: Config = .{
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
     errdefer cfg.deinit();
     const arena = cfg.arena.allocator();
-    // Default values use the arena so the lifetime is uniform.
     cfg.daemon.default_stack = try arena.dupe(u8, "default");
 
     var root = try std.fs.cwd().openDir(notes_root, .{});
     defer root.close();
 
-    // Layer 1: config.toml.
-    if (try readOptional(arena, &root, ".stako/config.toml")) |bytes| {
-        try applyLayer(arena, &cfg, bytes, .committed);
-    }
-    // Layer 2: config.local.toml (overrides).
-    if (try readOptional(arena, &root, ".stako/config.local.toml")) |bytes| {
-        try applyLayer(arena, &cfg, bytes, .local);
+    if (try readOptional(arena, &root, "config.toml")) |bytes| {
+        try applyConfig(arena, &cfg, bytes);
     }
 
     return cfg;
 }
-
-const Layer = enum { committed, local };
 
 fn readOptional(arena: std.mem.Allocator, dir: *std.fs.Dir, rel: []const u8) LoadError!?[]const u8 {
     var f = dir.openFile(rel, .{}) catch |e| switch (e) {
@@ -101,54 +80,30 @@ fn readOptional(arena: std.mem.Allocator, dir: *std.fs.Dir, rel: []const u8) Loa
     return buf[0..n];
 }
 
-fn applyLayer(
+fn applyConfig(
     arena: std.mem.Allocator,
     cfg: *Config,
     source: []const u8,
-    layer: Layer,
 ) LoadError!void {
-    _ = layer;
     const doc = toml.parse(arena, source) catch return error.Toml;
-    // Don't deinit doc — arena owns the strings.
 
-    // Identity tables: collect a fresh per-layer set, then merge by replacement.
-    var layer_identities = std.ArrayList(Identity){};
-    defer layer_identities.deinit(arena);
+    var identities = std.ArrayList(Identity){};
+    defer identities.deinit(arena);
 
     for (doc.entries.items) |e| {
-        if (e.table.len == 0) {
-            // Top-level entries are not used by daemon config.
-            continue;
-        }
+        if (e.table.len == 0) continue;
         if (std.mem.eql(u8, e.table, "daemon")) {
             try applyDaemonField(arena, &cfg.daemon, e);
         } else if (std.mem.eql(u8, e.table, "workdir")) {
             try applyWorkdirField(arena, &cfg.workdir, e);
         } else if (std.mem.startsWith(u8, e.table, "identity.")) {
-            try applyIdentityField(arena, &layer_identities, e);
+            try applyIdentityField(arena, &identities, e);
         }
-        // Unknown tables (e.g. [provider.*]) are tolerated for forward-compat.
+        // Unknown tables (e.g. [provider.*]) tolerated for forward-compat.
     }
 
-    // Merge identities: any name appearing in this layer fully replaces a
-    // same-named identity from a prior layer.
-    if (layer_identities.items.len > 0) {
-        var merged = std.ArrayList(Identity){};
-        defer merged.deinit(arena);
-        // Carry over prior-layer identities that aren't shadowed.
-        for (cfg.identities) |prior| {
-            var shadowed = false;
-            for (layer_identities.items) |new_id| {
-                if (std.mem.eql(u8, prior.name, new_id.name)) {
-                    shadowed = true;
-                    break;
-                }
-            }
-            if (!shadowed) try merged.append(arena, prior);
-        }
-        // Append the new layer.
-        for (layer_identities.items) |new_id| try merged.append(arena, new_id);
-        cfg.identities = try merged.toOwnedSlice(arena);
+    if (identities.items.len > 0) {
+        cfg.identities = try identities.toOwnedSlice(arena);
     }
 }
 
@@ -164,7 +119,6 @@ fn applyDaemonField(arena: std.mem.Allocator, d: *Daemon, e: toml.Entry) LoadErr
         if (e.value.integer < 1 or e.value.integer > 65535) return error.PortOutOfRange;
         d.port = @intCast(e.value.integer);
     }
-    // Unknown daemon keys silently tolerated for forward-compat.
 }
 
 fn applyWorkdirField(arena: std.mem.Allocator, w: *Workdir, e: toml.Entry) LoadError!void {
@@ -179,24 +133,23 @@ fn applyWorkdirField(arena: std.mem.Allocator, w: *Workdir, e: toml.Entry) LoadE
 
 fn applyIdentityField(
     arena: std.mem.Allocator,
-    layer_identities: *std.ArrayList(Identity),
+    identities: *std.ArrayList(Identity),
     e: toml.Entry,
 ) LoadError!void {
     const name = e.table["identity.".len..];
     if (name.len == 0) return;
-    // Find or create.
     var idx: ?usize = null;
-    for (layer_identities.items, 0..) |id, i| {
+    for (identities.items, 0..) |id, i| {
         if (std.mem.eql(u8, id.name, name)) {
             idx = i;
             break;
         }
     }
     if (idx == null) {
-        try layer_identities.append(arena, .{ .name = try arena.dupe(u8, name) });
-        idx = layer_identities.items.len - 1;
+        try identities.append(arena, .{ .name = try arena.dupe(u8, name) });
+        idx = identities.items.len - 1;
     }
-    var id = &layer_identities.items[idx.?];
+    var id = &identities.items[idx.?];
 
     if (std.mem.eql(u8, e.key, "type")) {
         if (e.value != .string) return error.BadType;
@@ -231,27 +184,17 @@ test "loadFromRoot: empty notes root yields defaults" {
     try std.testing.expectEqual(@as(usize, 0), cfg.identities.len);
 }
 
-test "loadFromRoot: layered with config.toml + config.local.toml" {
+test "loadFromRoot: reads config.toml" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
     {
-        var f = try tmp.dir.createFile(".stako/config.toml", .{ .truncate = true });
+        var f = try tmp.dir.createFile("config.toml", .{ .truncate = true });
         defer f.close();
         try f.writeAll(
             \\[daemon]
             \\loopback_only = true
             \\default_stack = "default"
-            \\port = 9000
-            \\
-        );
-    }
-    {
-        var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
-        defer f.close();
-        try f.writeAll(
-            \\[daemon]
             \\port = 7421
             \\
         );
@@ -262,38 +205,26 @@ test "loadFromRoot: layered with config.toml + config.local.toml" {
     var cfg = try loadFromRoot(a, abs);
     defer cfg.deinit();
 
-    try std.testing.expectEqual(@as(u16, 7421), cfg.daemon.port); // local wins
+    try std.testing.expectEqual(@as(u16, 7421), cfg.daemon.port);
     try std.testing.expectEqualStrings("default", cfg.daemon.default_stack);
 }
 
-test "loadFromRoot: identity tables replace wholesale, not merge" {
+test "loadFromRoot: identities parsed" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
     {
-        var f = try tmp.dir.createFile(".stako/config.toml", .{ .truncate = true });
+        var f = try tmp.dir.createFile("config.toml", .{ .truncate = true });
         defer f.close();
         try f.writeAll(
             \\[identity.local]
             \\type = "user"
-            \\description = "project default local"
-            \\capabilities = ["stack.default.read"]
+            \\description = "this machine"
+            \\capabilities = ["*"]
             \\
             \\[identity.codex-local]
             \\type = "mcp"
             \\capabilities = ["stack.default.read"]
-            \\
-        );
-    }
-    {
-        var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
-        defer f.close();
-        // Only set capabilities; type/description must NOT carry over from
-        // the committed file (full replacement semantics).
-        try f.writeAll(
-            \\[identity.local]
-            \\capabilities = ["*"]
             \\
         );
     }
@@ -304,13 +235,9 @@ test "loadFromRoot: identity tables replace wholesale, not merge" {
     defer cfg.deinit();
 
     const local = cfg.findIdentity("local") orelse return error.MissingIdentity;
-    try std.testing.expect(local.type == null);
-    try std.testing.expect(local.description == null);
-    try std.testing.expect(local.capabilities != null);
-    try std.testing.expectEqual(@as(usize, 1), local.capabilities.?.len);
+    try std.testing.expectEqualStrings("user", local.type.?);
     try std.testing.expectEqualStrings("*", local.capabilities.?[0]);
 
-    // Non-shadowed identity from the committed file survives.
     const codex = cfg.findIdentity("codex-local") orelse return error.MissingIdentity;
     try std.testing.expectEqualStrings("mcp", codex.type.?);
 }
@@ -319,9 +246,8 @@ test "loadFromRoot: workdir.allowlist" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
     {
-        var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
+        var f = try tmp.dir.createFile("config.toml", .{ .truncate = true });
         defer f.close();
         try f.writeAll(
             \\[workdir]
@@ -344,8 +270,7 @@ test "loadFromRoot: invalid port rejected" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
-    var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
+    var f = try tmp.dir.createFile("config.toml", .{ .truncate = true });
     defer f.close();
     try f.writeAll("[daemon]\nport = 99999\n");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -357,20 +282,18 @@ test "loadFromRoot: config read errors are not treated as missing config" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako/config.toml");
+    try tmp.dir.makePath("config.toml");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
     try std.testing.expectError(error.IsDir, loadFromRoot(a, abs));
 }
 
-test "loadFromRoot: malformed TOML in config.local.toml surfaces error.Toml" {
+test "loadFromRoot: malformed TOML surfaces error.Toml" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
-    var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
+    var f = try tmp.dir.createFile("config.toml", .{ .truncate = true });
     defer f.close();
-    // Unterminated string ⇒ TOML parse failure.
     try f.writeAll("[daemon]\nport = \"oops\n");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
@@ -381,10 +304,8 @@ test "loadFromRoot: wrong scalar type rejected with error.BadType" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
-    var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
+    var f = try tmp.dir.createFile("config.toml", .{ .truncate = true });
     defer f.close();
-    // port is declared as a string instead of integer.
     try f.writeAll("[daemon]\nport = \"7421\"\n");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
@@ -395,8 +316,7 @@ test "loadFromRoot: loopback_only wrong type rejected" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
-    var f = try tmp.dir.createFile(".stako/config.local.toml", .{ .truncate = true });
+    var f = try tmp.dir.createFile("config.toml", .{ .truncate = true });
     defer f.close();
     try f.writeAll("[daemon]\nloopback_only = \"yes\"\n");
     var buf: [std.fs.max_path_bytes]u8 = undefined;

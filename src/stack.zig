@@ -349,7 +349,7 @@ pub const StackClient = struct {
         return output_packet.readManifest(self.registry.allocator, path);
     }
 
-    pub fn recentCompletedOutputSummaryInputs(self: *const StackClient, name: []const u8, limit: usize) ![][]const u8 {
+    pub fn recentCompletedItemInputs(self: *const StackClient, name: []const u8, limit: usize) ![][]const u8 {
         const items = try self.listItems(name);
         defer self.freeItemList(items);
 
@@ -364,7 +364,6 @@ pub const StackClient = struct {
             i -= 1;
             const summary = items[i];
             if (!std.mem.eql(u8, summary.status, "completed")) continue;
-            if (!try itemOutputSummaryExists(self.registry.allocator, self.registry.notes_root_abs, name, summary.id)) continue;
             try out.append(self.registry.allocator, try self.registry.allocator.dupe(u8, summary.id));
         }
         std.mem.reverse([]const u8, out.items);
@@ -745,19 +744,6 @@ fn findItemDirForRead(allocator: std.mem.Allocator, notes_root_abs: []const u8, 
     return error.NotFound;
 }
 
-fn itemOutputSummaryExists(allocator: std.mem.Allocator, notes_root_abs: []const u8, stack_name: []const u8, id: []const u8) !bool {
-    const item_dir = findItemDirForRead(allocator, notes_root_abs, stack_name, id) catch return false;
-    defer allocator.free(item_dir);
-    const path = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack_name, item_dir, "output", "summary.md" });
-    defer allocator.free(path);
-    var f = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
-        error.FileNotFound, error.IsDir => return false,
-        else => return e,
-    };
-    f.close();
-    return true;
-}
-
 fn noOpThreadResult(allocator: std.mem.Allocator, ident: mutations.IdentityCtx, stack_name: []const u8, thread_name: []const u8) MutationResult {
     const paths = allocator.alloc([]u8, 0) catch return .{ .err = .internal };
     errdefer allocator.free(paths);
@@ -817,7 +803,7 @@ test "StackClient: create stack, append item, and pause" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
+    try tmp.dir.makePath("state");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
 
@@ -877,7 +863,7 @@ test "StackClient: create, patch, archive, and read thread" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
+    try tmp.dir.makePath("state");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
 
@@ -949,7 +935,7 @@ test "StackClient: ensureThread creates admin thread by convention and is idempo
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
+    try tmp.dir.makePath("state");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
 
@@ -999,12 +985,12 @@ test "StackClient: ensureThread creates admin thread by convention and is idempo
     try std.testing.expectEqualStrings("admin", thread.name);
 }
 
-test "admin routine targets admin thread and ingests recent completed output summaries" {
+test "admin routine targets admin thread and ingests recent completed items" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
-    try tmp.dir.makePath("routines/prompts");
+    try tmp.dir.makePath("state");
+    try tmp.dir.makePath("routines/admin-review");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
 
@@ -1022,14 +1008,14 @@ test "admin routine targets admin thread and ingests recent completed output sum
             \\kind = "prompt"
             \\thread = "admin"
             \\thread_mode = "resume"
-            \\prompt_file = "prompts/admin-evaluate.md"
+            \\prompt_file = "admin-review/evaluate.md"
             \\
         );
     }
     {
-        var f = try tmp.dir.createFile("routines/prompts/admin-evaluate.md", .{ .truncate = true });
+        var f = try tmp.dir.createFile("routines/admin-review/evaluate.md", .{ .truncate = true });
         defer f.close();
-        try f.writeAll("Evaluate the registered outputs.\n");
+        try f.writeAll("Evaluate the registered item commits.\n");
     }
 
     var aw = try audit.Writer.init(a, abs);
@@ -1058,11 +1044,11 @@ test "admin routine targets admin thread and ingests recent completed output sum
         .err => return error.UnexpectedMutationFailure,
     }
 
-    try writeCompletedSummary(&tmp.dir, "0001", "plan", "first summary\n");
-    try writeCompletedSummary(&tmp.dir, "0002", "build", "second summary\n");
+    try writeCompletedItem(&tmp.dir, "0001", "plan");
+    try writeCompletedItem(&tmp.dir, "0002", "build");
     try writeQueuedItem(&tmp.dir, "0003", "todo");
 
-    const inputs = try client.recentCompletedOutputSummaryInputs("demo", 8);
+    const inputs = try client.recentCompletedItemInputs("demo", 8);
     defer client.freeStringList(inputs);
     try std.testing.expectEqual(@as(usize, 2), inputs.len);
     try std.testing.expectEqualStrings("0001", inputs[0]);
@@ -1095,8 +1081,8 @@ test "admin routine targets admin thread and ingests recent completed output sum
     defer a.free(item_dir);
     const rendered = try @import("prompt_materializer.zig").resolvePrompt(a, abs, "demo", &admin_item, item_dir);
     defer a.free(rendered);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "first summary") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "second summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "stacks/demo/0001-plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "stacks/demo/0002-build") != null);
 
     switch (client.runtimeTransitionItem("demo", .{ .stack = "demo", .id = "0004", .to = .running })) {
         .ok => |ok_value| {
@@ -1193,15 +1179,11 @@ test "runtime completion preflights named thread file" {
     try std.testing.expect(pathListContains(paths, "stacks/demo/threads/admin.toml"));
 }
 
-fn writeCompletedSummary(dir: *std.fs.Dir, id: []const u8, slug: []const u8, summary: []const u8) !void {
+fn writeCompletedItem(dir: *std.fs.Dir, id: []const u8, slug: []const u8) !void {
     var path_buf: [128]u8 = undefined;
-    const item_dir = try std.fmt.bufPrint(&path_buf, "stacks/demo/{s}-{s}/output", .{ id, slug });
+    const item_dir = try std.fmt.bufPrint(&path_buf, "stacks/demo/{s}-{s}", .{ id, slug });
     try dir.makePath(item_dir);
     try writeItemMeta(dir, id, slug, "completed");
-    const summary_path = try std.fmt.bufPrint(&path_buf, "stacks/demo/{s}-{s}/output/summary.md", .{ id, slug });
-    var f = try dir.createFile(summary_path, .{ .truncate = true });
-    defer f.close();
-    try f.writeAll(summary);
 }
 
 fn writeQueuedItem(dir: *std.fs.Dir, id: []const u8, slug: []const u8) !void {

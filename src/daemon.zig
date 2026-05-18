@@ -115,7 +115,7 @@ pub const Daemon = struct {
     notes_root_abs: []u8,
     /// True if daemon.pid was created by this instance (cleaned up on stop).
     pid_written: bool = false,
-    /// Open append-only handle to `.stako/daemon.log`. Null in ephemeral mode.
+    /// Open append-only handle to `state/daemon.log`. Null in ephemeral mode.
     log_file: ?std.fs.File = null,
     /// Audit-log writer (milestone 5). Owns the audit.log file descriptor.
     audit_writer: audit.Writer,
@@ -410,7 +410,7 @@ fn openLogFile(
     allocator: std.mem.Allocator,
     notes_root_abs: []const u8,
 ) !std.fs.File {
-    const dir_path = try std.fs.path.join(allocator, &.{ notes_root_abs, ".stako" });
+    const dir_path = try std.fs.path.join(allocator, &.{ notes_root_abs, "state" });
     defer allocator.free(dir_path);
     std.fs.cwd().makePath(dir_path) catch {};
     const log_path = try std.fs.path.join(allocator, &.{ dir_path, "daemon.log" });
@@ -2999,7 +2999,7 @@ pub const PidInfo = struct {
 };
 
 pub fn readPidFile(allocator: std.mem.Allocator, notes_root: []const u8) !?PidInfo {
-    const path = try std.fs.path.join(allocator, &.{ notes_root, ".stako", "daemon.pid" });
+    const path = try std.fs.path.join(allocator, &.{ notes_root, "state", "daemon.pid" });
     defer allocator.free(path);
     var f = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
         error.FileNotFound => return null,
@@ -3030,7 +3030,7 @@ fn writePidFile(
     notes_root_abs: []const u8,
     port: u16,
 ) StartError!bool {
-    const dir_path = try std.fs.path.join(allocator, &.{ notes_root_abs, ".stako" });
+    const dir_path = try std.fs.path.join(allocator, &.{ notes_root_abs, "state" });
     defer allocator.free(dir_path);
     std.fs.cwd().makePath(dir_path) catch {};
     const pid_path = try std.fs.path.join(allocator, &.{ dir_path, "daemon.pid" });
@@ -3060,7 +3060,7 @@ fn writePidFile(
 
 /// Remove `daemon.pid`, ignoring missing files.
 pub fn removePidFile(allocator: std.mem.Allocator, notes_root: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ notes_root, ".stako", "daemon.pid" });
+    const path = try std.fs.path.join(allocator, &.{ notes_root, "state", "daemon.pid" });
     defer allocator.free(path);
     std.fs.cwd().deleteFile(path) catch |e| switch (e) {
         error.FileNotFound => {},
@@ -3206,7 +3206,7 @@ test "start: rejects non-loopback host" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.makePath(".stako");
+    try tmp.dir.makePath("state");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
     try std.testing.expectError(error.NotLoopbackHost, start(a, .{

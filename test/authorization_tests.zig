@@ -4,12 +4,12 @@
 //! against a temp notes root (no real git so tests stay fast), then drive
 //! HTTP requests through `serveOne` on a worker thread.
 //!
-//! The key new wrinkle is that each test seeds
-//! `<root>/.stako/config.toml` with an `[identity.local]` table BEFORE
-//! the daemon starts, so the policy evaluator sees an explicit (rather
-//! than implicit-`*`) identity. Backwards-compat is covered by the
-//! pre-existing M5–M9 mutation tests — they pass without any new config,
-//! demonstrating that an undeclared local identity retains full access.
+//! The key new wrinkle is that each test seeds `<root>/config.toml`
+//! with an `[identity.local]` table BEFORE the daemon starts, so the
+//! policy evaluator sees an explicit (rather than implicit-`*`) identity.
+//! Backwards-compat is covered by the pre-existing M5–M9 mutation tests —
+//! they pass without any new config, demonstrating that an undeclared
+//! local identity retains full access.
 
 const std = @import("std");
 const stako = @import("stako");
@@ -57,15 +57,10 @@ fn initNotesRoot(allocator: std.mem.Allocator, root: []const u8) !void {
     r.deinit();
 }
 
-/// Overwrite `.stako/config.toml` with an `[identity.local]` block whose
-/// `capabilities` array is taken verbatim. `stako init` writes BOTH
-/// `config.toml` and `config.local.toml` — and the local layer's
-/// pre-baked `[identity.local]` block (caps = `*`) would otherwise
-/// shadow whatever we put here per the layered-config semantics. So we
-/// truncate `config.local.toml` to keep our committed layer
-/// authoritative for the test.
+/// Overwrite `config.toml` with an `[identity.local]` block whose
+/// `capabilities` array is taken verbatim.
 fn seedIdentityCapabilities(allocator: std.mem.Allocator, root: []const u8, caps_toml_array: []const u8) !void {
-    const path = try std.fs.path.join(allocator, &.{ root, ".stako", "config.toml" });
+    const path = try std.fs.path.join(allocator, &.{ root, "config.toml" });
     defer allocator.free(path);
     const body = try std.fmt.allocPrint(allocator,
         \\[identity.local]
@@ -74,18 +69,9 @@ fn seedIdentityCapabilities(allocator: std.mem.Allocator, root: []const u8, caps
         \\
     , .{caps_toml_array});
     defer allocator.free(body);
-    {
-        var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
-        defer f.close();
-        try f.writeAll(body);
-    }
-    // Truncate `config.local.toml` so the stub `[identity.local]` block
-    // init writes there does not shadow our committed layer above.
-    const local_path = try std.fs.path.join(allocator, &.{ root, ".stako", "config.local.toml" });
-    defer allocator.free(local_path);
-    var lf = try std.fs.cwd().createFile(local_path, .{ .truncate = true });
-    defer lf.close();
-    try lf.writeAll("# cleared by authorization tests so config.toml stays authoritative\n");
+    var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    defer f.close();
+    try f.writeAll(body);
 }
 
 fn startDaemonNoGit(allocator: std.mem.Allocator, root: []const u8) !daemon_mod.Daemon {
@@ -158,19 +144,15 @@ fn splitResponse(resp: []const u8) struct { status: u16, body: []const u8 } {
 }
 
 fn buildPost(allocator: std.mem.Allocator, path: []const u8, token: []const u8, body: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ path, token, body.len, body });
+    return std.fmt.allocPrint(allocator, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ path, token, body.len, body });
 }
 
 fn buildPostNoAuth(allocator: std.mem.Allocator, path: []const u8, body: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ path, body.len, body });
+    return std.fmt.allocPrint(allocator, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ path, body.len, body });
 }
 
 fn readAuditLog(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
-    const path = try std.fs.path.join(allocator, &.{ root, ".stako", "audit.log" });
+    const path = try std.fs.path.join(allocator, &.{ root, "state", "audit.log" });
     defer allocator.free(path);
     var f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -366,20 +348,13 @@ test "authorization: undeclared identity retains M3-era full access" {
     var s = try Scratch.create(a, "undeclared");
     defer s.deinit();
     try initNotesRoot(a, s.abs_path);
-    // Do NOT seed identity capabilities. We DO remove the local-layer
-    // `[identity.local]` block init wrote so the loader genuinely sees
-    // no `[identity.local]` table — that's the path the policy evaluator
-    // must keep open with implicit full access for milestone-3..9
-    // single-token deployments that never wrote an identity block.
+    // Do NOT seed identity capabilities. Overwrite config.toml so the
+    // loader genuinely sees no `[identity.local]` table — that's the path
+    // the policy evaluator must keep open with implicit full access for
+    // milestone-3..9 single-token deployments that never wrote an identity
+    // block.
     {
-        const local_path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "config.local.toml" });
-        defer a.free(local_path);
-        var lf = try std.fs.cwd().createFile(local_path, .{ .truncate = true });
-        defer lf.close();
-        try lf.writeAll("# cleared so no identity.local is declared\n");
-    }
-    {
-        const path = try std.fs.path.join(a, &.{ s.abs_path, ".stako", "config.toml" });
+        const path = try std.fs.path.join(a, &.{ s.abs_path, "config.toml" });
         defer a.free(path);
         var f = try std.fs.cwd().createFile(path, .{ .truncate = true });
         defer f.close();
@@ -457,9 +432,7 @@ test "authorization: routing denied for provider lacking capability" {
 // ---------- coverage gap #4 (audit_10): form-body auth path produces the same canonical denial body ----------
 
 fn buildPostForm(allocator: std.mem.Allocator, path: []const u8, body: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator,
-        "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ path, body.len, body });
+    return std.fmt.allocPrint(allocator, "POST {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}", .{ path, body.len, body });
 }
 
 test "authorization: form-body auth path emits canonical capability_denied" {
@@ -528,7 +501,7 @@ fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
     defer allocator.free(git_path);
     std.fs.cwd().deleteTree(git_path) catch {};
     try vcs.ensureRealRepo(allocator, root);
-    const paths = [_][]const u8{ ".gitignore", "stacks", ".stako/config.toml" };
+    const paths = [_][]const u8{ ".gitignore", "stacks", "routines" };
     _ = vcs.commit(allocator, root, .{ .paths = &paths, .subject = "init: baseline" }) catch {};
 }
 
@@ -575,12 +548,6 @@ test "authorization: denied mutation leaves zero git activity" {
     try initNotesRoot(a, s.abs_path);
     try makeRealRepo(a, s.abs_path);
     try seedIdentityCapabilities(a, s.abs_path, "[]");
-
-    // Re-commit the rewritten config so the baseline log is exactly one entry.
-    _ = vcs.commit(a, s.abs_path, .{
-        .paths = &.{".stako/config.toml"},
-        .subject = "test: seed identity",
-    }) catch {};
 
     const log_before = try runGitCapture(a, s.abs_path, &.{ "log", "--oneline" });
     defer a.free(log_before);

@@ -12,7 +12,7 @@ pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const IO_CONTRACT =
     \\## Stako I/O Contract
     \\
-    \\Treat registered inputs as the explicit input packet for this prompt. When prior commits are listed, use them as the relevant commit context and inspect git history only as needed for that context. Keep the final response suitable for `output/summary.md`: state the result, list durable outputs or decisions, and name any follow-up prompt, thread, routine, item, or commit context that should be passed forward.
+    \\Treat registered inputs as the explicit input packet for this prompt. Prior items and commits are commit context: inspect git history only as needed for those references. The durable output is the commit produced by this prompt. If a summary or decision is useful, write it as an ordinary file in the workdir or notes tree chosen by the prompt, then make the final response identify the durable files, decisions, and follow-up prompt, thread, routine, item, or commit context that should be passed forward.
     \\
 ;
 
@@ -75,12 +75,16 @@ pub fn resolvePrompt(
             if (!item_mod.isValidId(id)) return error.ValidationFailed;
             const dir_name = try findItemDir(allocator, notes_root_abs, stack_name, id);
             defer allocator.free(dir_name);
-            const source_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/{s}/output/summary.md", .{ stack_name, dir_name });
+            const source_rel = try std.fmt.allocPrint(allocator, "stacks/{s}/{s}", .{ stack_name, dir_name });
             errdefer allocator.free(source_rel);
-            const abs = try std.fs.path.join(allocator, &.{ notes_root_abs, source_rel });
-            defer allocator.free(abs);
-            const content = try readInputFileCapped(allocator, abs, &total_input_bytes);
+            const content = try std.fmt.allocPrint(
+                allocator,
+                "Use this item as relevant context. Inspect the notes git history for commits touching `{s}` and surrounding commits when the task needs the prior item's output details.\n",
+                .{source_rel},
+            );
             errdefer allocator.free(content);
+            total_input_bytes += content.len;
+            if (total_input_bytes > MAX_INPUT_BYTES) return error.InputTooLarge;
             try sections.append(allocator, .{
                 .kind = .item,
                 .title = try allocator.dupe(u8, id),
@@ -266,13 +270,8 @@ test "render prompt appends registered item input" {
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try tmp.dir.realpath(".", &root_buf);
-    try tmp.dir.makePath("stacks/demo/0001-plan/output");
+    try tmp.dir.makePath("stacks/demo/0001-plan");
     try tmp.dir.makePath("stacks/demo/0002-next");
-    {
-        var f = try tmp.dir.createFile("stacks/demo/0001-plan/output/summary.md", .{ .truncate = true });
-        defer f.close();
-        try f.writeAll("prior summary\n");
-    }
     {
         var f = try tmp.dir.createFile("stacks/demo/0002-next/prompt.md", .{ .truncate = true });
         defer f.close();
@@ -298,8 +297,8 @@ test "render prompt appends registered item input" {
     defer a.free(rendered);
     try std.testing.expect(std.mem.startsWith(u8, rendered, IO_CONTRACT));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "base prompt\n\n---\n\n## Registered Inputs") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "Source: stacks/demo/0001-plan/output/summary.md") != null);
-    try std.testing.expect(std.mem.indexOf(u8, rendered, "prior summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Source: stacks/demo/0001-plan") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "commits touching `stacks/demo/0001-plan`") != null);
 }
 
 test "render prompt prepends I/O contract without registered inputs" {

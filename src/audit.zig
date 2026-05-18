@@ -1,6 +1,6 @@
 //! Audit log writer (milestone 5).
 //!
-//! Append-only NDJSON at `<notes-root>/.stako/audit.log`, perms 0600, one
+//! Append-only NDJSON at `<notes-root>/state/audit.log`, perms 0600, one
 //! line per event. Schema per `todos/design_errors_and_audit.md`:
 //!
 //!     {"ts":"...","identity":"...","action":"...","target":"...",
@@ -108,7 +108,7 @@ pub const Writer = struct {
 
     fn ensureOpen(self: *Writer) !void {
         if (self.file != null) return;
-        const dir_path = try std.fs.path.join(self.allocator, &.{ self.notes_root_abs, ".stako" });
+        const dir_path = try std.fs.path.join(self.allocator, &.{ self.notes_root_abs, "state" });
         defer self.allocator.free(dir_path);
         std.fs.cwd().makePath(dir_path) catch {};
         const log_path = try std.fs.path.join(self.allocator, &.{ dir_path, "audit.log" });
@@ -262,7 +262,7 @@ test "Writer: append produces one NDJSON line, file mode 0600" {
     });
 
     // Verify file contents.
-    const log_path = try std.fs.path.join(a, &.{ abs, ".stako", "audit.log" });
+    const log_path = try std.fs.path.join(a, &.{ abs, "state", "audit.log" });
     defer a.free(log_path);
     var f = try std.fs.cwd().openFile(log_path, .{});
     defer f.close();
@@ -327,7 +327,7 @@ test "Writer: concurrent appends from many threads produce N*M parseable lines" 
     }
     for (threads) |th| th.join();
 
-    const log_path = try std.fs.path.join(a, &.{ abs, ".stako", "audit.log" });
+    const log_path = try std.fs.path.join(a, &.{ abs, "state", "audit.log" });
     defer a.free(log_path);
     var f = try std.fs.cwd().openFile(log_path, .{});
     defer f.close();
@@ -369,7 +369,7 @@ test "Writer: two appends produce two lines" {
     try w.append(.{ .ts = "2026-05-10T14:32:00.123Z", .identity = "local", .action = .pause_stack, .target = "stack/default", .outcome = .allowed });
     try w.append(.{ .ts = "2026-05-10T14:32:00.456Z", .identity = "local", .action = .resume_stack, .target = "stack/default", .outcome = .allowed });
 
-    const log_path = try std.fs.path.join(a, &.{ abs, ".stako", "audit.log" });
+    const log_path = try std.fs.path.join(a, &.{ abs, "state", "audit.log" });
     defer a.free(log_path);
     var f = try std.fs.cwd().openFile(log_path, .{});
     defer f.close();

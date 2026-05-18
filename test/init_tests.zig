@@ -93,15 +93,13 @@ test "init: on a fresh empty dir creates the documented layout" {
     // Directories.
     try std.testing.expect(fileExists(&d, "stacks"));
     try std.testing.expect(fileExists(&d, "stacks/default"));
-    try std.testing.expect(fileExists(&d, ".stako"));
-    try std.testing.expect(fileExists(&d, ".stako/credentials"));
-    try std.testing.expect(fileExists(&d, ".stako/runtime"));
+    try std.testing.expect(fileExists(&d, "state"));
+    try std.testing.expect(fileExists(&d, "state/runtime"));
 
     // Files.
     try std.testing.expect(fileExists(&d, "stacks/default/stack.toml"));
-    try std.testing.expect(fileExists(&d, ".stako/config.toml"));
-    try std.testing.expect(fileExists(&d, ".stako/config.local.toml"));
-    try std.testing.expect(fileExists(&d, ".stako/local_token"));
+    try std.testing.expect(fileExists(&d, "config.toml"));
+    try std.testing.expect(fileExists(&d, "state/local_token"));
     try std.testing.expect(fileExists(&d, ".gitignore"));
     try std.testing.expect(fileExists(&d, ".git"));
 }
@@ -126,10 +124,10 @@ test "init: creates the requested notes root when it does not exist" {
     var d = try std.fs.openDirAbsolute(root, .{ .iterate = true });
     defer d.close();
     try std.testing.expect(fileExists(&d, "stacks/default/stack.toml"));
-    try std.testing.expect(fileExists(&d, ".stako/config.toml"));
+    try std.testing.expect(fileExists(&d, "config.toml"));
 }
 
-test "init: credential dir has 0700 and local_token has 0600 (POSIX)" {
+test "init: local_token has 0600 (POSIX)" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "perms");
@@ -147,8 +145,7 @@ test "init: credential dir has 0700 and local_token has 0600 (POSIX)" {
     var d = try s.dir();
     defer d.close();
 
-    try std.testing.expectEqual(@as(u32, 0o700), try dirMode(&d, ".stako/credentials"));
-    try std.testing.expectEqual(@as(u32, 0o600), try fileMode(&d, ".stako/local_token"));
+    try std.testing.expectEqual(@as(u32, 0o600), try fileMode(&d, "state/local_token"));
 }
 
 test "init: rerunning is a no-op (zero created items, local_token preserved)" {
@@ -168,7 +165,7 @@ test "init: rerunning is a no-op (zero created items, local_token preserved)" {
 
     var d = try s.dir();
     defer d.close();
-    const token_before = try readAll(a, &d, ".stako/local_token");
+    const token_before = try readAll(a, &d, "state/local_token");
     defer a.free(token_before);
 
     var r2 = try init_mod.run(a, .{
@@ -182,7 +179,7 @@ test "init: rerunning is a no-op (zero created items, local_token preserved)" {
     try std.testing.expectEqual(@as(usize, 0), r2.created.items.len);
     try std.testing.expect(!r2.git_initialized);
 
-    const token_after = try readAll(a, &d, ".stako/local_token");
+    const token_after = try readAll(a, &d, "state/local_token");
     defer a.free(token_after);
     try std.testing.expectEqualSlices(u8, token_before, token_after);
 }
@@ -203,7 +200,7 @@ test "init: rerunning with a different seed does NOT rotate local_token" {
 
     var d = try s.dir();
     defer d.close();
-    const token_before = try readAll(a, &d, ".stako/local_token");
+    const token_before = try readAll(a, &d, "state/local_token");
     defer a.free(token_before);
 
     var r2 = try init_mod.run(a, .{
@@ -215,7 +212,7 @@ test "init: rerunning with a different seed does NOT rotate local_token" {
     });
     defer r2.deinit();
 
-    const token_after = try readAll(a, &d, ".stako/local_token");
+    const token_after = try readAll(a, &d, "state/local_token");
     defer a.free(token_after);
     try std.testing.expectEqualSlices(u8, token_before, token_after);
 }
@@ -227,8 +224,7 @@ test "init: directory path occupied by file is rejected" {
 
     var d = try s.dir();
     defer d.close();
-    try d.makePath(".stako");
-    var f = try d.createFile(".stako/credentials", .{ .truncate = true });
+    var f = try d.createFile("state", .{ .truncate = true });
     f.close();
 
     try std.testing.expectError(error.PathTypeMismatch, init_mod.run(a, .{
@@ -247,7 +243,7 @@ test "init: file path occupied by directory is rejected" {
 
     var d = try s.dir();
     defer d.close();
-    try d.makePath(".stako/local_token");
+    try d.makePath("state/local_token");
 
     try std.testing.expectError(error.PathTypeMismatch, init_mod.run(a, .{
         .root = s.abs_path,
@@ -275,9 +271,8 @@ test "init: config.toml is valid TOML and parseable by the milestone-1 reader" {
     var d = try s.dir();
     defer d.close();
 
-    // Sanity check: the milestone-1 toml reader can lex the file. We don't
-    // need a typed schema for it yet — daemon config schema lands in milestone 3.
-    const src = try readAll(a, &d, ".stako/config.toml");
+    // Sanity check: the milestone-1 toml reader can lex the file.
+    const src = try readAll(a, &d, "config.toml");
     defer a.free(src);
     var doc = try stako.toml.parse(a, src);
     defer doc.deinit();
@@ -291,13 +286,6 @@ test "init: config.toml is valid TOML and parseable by the milestone-1 reader" {
         }
     }
     try std.testing.expect(found_loopback);
-
-    // config.local.toml is also valid TOML.
-    const src2 = try readAll(a, &d, ".stako/config.local.toml");
-    defer a.free(src2);
-    var doc2 = try stako.toml.parse(a, src2);
-    defer doc2.deinit();
-    try std.testing.expect(doc2.entries.items.len > 0);
 }
 
 test "init: stack.toml round-trips through stack_config" {
@@ -365,7 +353,7 @@ test "init: appends to a pre-existing .gitignore without duplicating" {
         defer d_pre.close();
         var f = try d_pre.createFile(".gitignore", .{ .truncate = true });
         defer f.close();
-        try f.writeAll("node_modules/\n.stako/local_token\n");
+        try f.writeAll("node_modules/\nstate/\n");
     }
 
     var report = try init_mod.run(a, .{
@@ -388,12 +376,11 @@ test "init: appends to a pre-existing .gitignore without duplicating" {
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, gi, '\n');
     while (it.next()) |line| {
-        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), ".stako/local_token")) count += 1;
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), "state/")) count += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), count);
     // Other required lines should now be present.
-    try std.testing.expect(std.mem.indexOf(u8, gi, ".stako/runtime/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, gi, ".stako/credentials/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, gi, "config.toml") != null);
 }
 
 test "init: inside an existing parent git repo emits a warning but proceeds" {
@@ -425,7 +412,7 @@ test "init: inside an existing parent git repo emits a warning but proceeds" {
     try std.testing.expect(report.created.items.len > 0);
 }
 
-test "init: .stako/runtime is empty after a fresh init" {
+test "init: state/runtime is empty after a fresh init" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "runtime-empty");
     defer s.deinit();
@@ -441,7 +428,7 @@ test "init: .stako/runtime is empty after a fresh init" {
 
     var d = try s.dir();
     defer d.close();
-    var rt = try d.openDir(".stako/runtime", .{ .iterate = true });
+    var rt = try d.openDir("state/runtime", .{ .iterate = true });
     defer rt.close();
     var it = rt.iterate();
     var count: usize = 0;
@@ -468,7 +455,7 @@ test "init: yes=false skips auto git init on a non-git root" {
     defer d.close();
     // .git was not created, but the rest of the layout was.
     try std.testing.expect(!fileExists(&d, ".git"));
-    try std.testing.expect(fileExists(&d, ".stako/local_token"));
+    try std.testing.expect(fileExists(&d, "state/local_token"));
     try std.testing.expect(fileExists(&d, "stacks/default/stack.toml"));
 }
 
@@ -508,12 +495,11 @@ test "init: existing config.toml is never overwritten" {
     var s = try Scratch.create(a, "no-clobber");
     defer s.deinit();
 
-    // Pre-seed .stako/config.toml with custom content.
+    // Pre-seed config.toml with custom content.
     {
         var d = try std.fs.openDirAbsolute(s.abs_path, .{});
         defer d.close();
-        try d.makePath(".stako");
-        var f = try d.createFile(".stako/config.toml", .{ .truncate = true });
+        var f = try d.createFile("config.toml", .{ .truncate = true });
         defer f.close();
         try f.writeAll("# user-edited\n[daemon]\ndefault_stack = \"mine\"\n");
     }
@@ -529,7 +515,7 @@ test "init: existing config.toml is never overwritten" {
 
     var d = try s.dir();
     defer d.close();
-    const src = try readAll(a, &d, ".stako/config.toml");
+    const src = try readAll(a, &d, "config.toml");
     defer a.free(src);
     try std.testing.expect(std.mem.indexOf(u8, src, "# user-edited") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "default_stack = \"mine\"") != null);
@@ -552,9 +538,8 @@ const FIXTURE_SEED: u64 = 0x6F7267616E6F00; // ascii "stako\0"
 const FixtureMap = struct { actual: []const u8, fixture: []const u8 };
 const FIXTURE_FILES = [_]FixtureMap{
     .{ .actual = "stacks/default/stack.toml", .fixture = "stacks/default/stack.toml" },
-    .{ .actual = ".stako/config.toml", .fixture = ".stako/config.toml" },
-    .{ .actual = ".stako/config.local.toml", .fixture = ".stako/config.local.toml.expected" },
-    .{ .actual = ".stako/local_token", .fixture = ".stako/local_token.expected" },
+    .{ .actual = "config.toml", .fixture = "config.toml.expected" },
+    .{ .actual = "state/local_token", .fixture = "state/local_token.expected" },
     .{ .actual = ".gitignore", .fixture = "dot_gitignore" },
 };
 
