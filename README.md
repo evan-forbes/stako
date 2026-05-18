@@ -1,58 +1,102 @@
 # stako
 
-Stako keeps a visible notes root at `~/stako`, serves it through a loopback daemon, and queues prompt, thread, and routine work as stack items. Prompt items are rendered with the Stako I/O contract and registered item/file/commit inputs. Completed work is the commit produced by the item, so summaries and decisions are ordinary files only when the prompt chooses to write them.
+Stako is a stack-based meta-harness for coding agents. You queue prompts and routines onto a stack, and stako drives them through the harnesses you already use (Claude Code, Codex). Inputs and outputs travel as git commits, so the work stays visible and revertable.
+
+## Getting started
+
+This guide assumes you already have `claude` and `codex` on your `PATH` and signed in.
+
+### 1. Install and init
+
+```sh
+make install                   # builds and installs to $HOME/.local/bin
+stako init                     # bootstraps ~/stako with the standard layout
+stako daemon start             # serves the loopback API
+```
+
+`init` creates `~/stako/` with `prompts/`, `routines/`, `stacks/`, an `AGENTS.md` primer, a `config.toml`, and a local auth token. Run subsequent commands in another terminal.
+
+### 2. Create a stack
+
+A stack lives at `~/stako/stacks/<name>/`. Every step it runs produces a commit in the notes-root git repo, scoped to that stack's files. Inputs you register on an item (file, commit, or prior item) become explicit context the agent sees.
+
+```sh
+stako new add-rate-limiter
+```
+
+### 3. Write prompts
+
+Prompts live in `~/stako/prompts/` as plain markdown. Tell the agent what to read, what to do, and what to write back.
 
 ```text
-~/stako
-  stacks/<stack>/<item>/
-  prompts/<prompt>.md
-  routines/<routine>.toml
-  config.toml
-  state/
+~/stako/prompts/rate-limiter/
+  implement.md
+  review.md
 ```
 
-## Usage
+### 4. Write a routine
 
-```sh
-make           # build (zig-out/bin/stako)
-make test      # run the full test suite
-make install   # install to $HOME/.local/bin (override with PREFIX=...)
-stako init --yes
-stako daemon start
-```
+A routine in `~/stako/routines/<name>.toml` is an ordered list of steps that apply prompts. Steps on the same thread run in one agent context. A step can switch threads to run on a different harness.
 
-Run CLI commands from another terminal while the daemon is serving:
+> **Threads** are persistent agent sessions scoped to a stack. Same-thread steps share one running context. Different-thread steps run in their own contexts.
 
-```sh
-./zig-out/bin/stako stack list
-./zig-out/bin/stako stack show default
-./zig-out/bin/stako stack add default prompt --target any --prompt-file /path/to/prompt.md --slug first-pass
-./zig-out/bin/stako new demo
-./zig-out/bin/stako add planning demo
-./zig-out/bin/stako add -r planning -s demo
-./zig-out/bin/stako start demo
-./zig-out/bin/stako auth status
-./zig-out/bin/stako routine list
-./zig-out/bin/stako routine show admin-review
-```
-
-Daemon-backed commands accept `--root <path>`, `--port <n>`, `--json`, and `--verbose`. `STAKO_PORT` can provide the port when a root-local config is unavailable.
-
-## Routines
-
-Prompts live under `~/stako/prompts/`. Routines live under `~/stako/routines/` and are ordered lists of steps:
+`~/stako/routines/implement-and-review.toml`:
 
 ```toml
-thread = "admin"
+[[step]]
+thread = "builder"
+prompts = ["../prompts/rate-limiter/implement.md"]
 
 [[step]]
-prompts = ["../prompts/prefix.md", "../prompts/body.md", "../prompts/suffix.md"]
+thread = "claude-review"
+prompts = ["../prompts/rate-limiter/review.md"]
 
 [[step]]
-command = "compact"
-
-[[step]]
-prompts = ["../prompts/followup.md"]
+thread = "codex-review"
+prompts = ["../prompts/rate-limiter/review.md"]
 ```
 
-Each `prompts = [...]` step combines those prompt files in order into one prompt item. A step can override the root thread with `thread = "name"`. Use `command = "compact"` for compact steps; `command = "/compact"` is also accepted.
+The builder writes the implementation commit. Each reviewer reads that commit on its own thread, so Claude and Codex give independent audits.
+
+### 5. Queue it and start
+
+```sh
+stako add implement-and-review add-rate-limiter
+stako start add-rate-limiter
+stako stack show add-rate-limiter
+```
+
+`add` appends the routine to the stack. `start` resumes execution. `stack show` displays items and status.
+
+## How fixups happen
+
+A review prompt that finds something to fix writes a new prompt file and runs:
+
+```sh
+stako add fix add-rate-limiter
+```
+
+`fix.toml` is a one-step routine that runs the new prompt on the `builder` thread. The builder picks it up in its existing context, commits the fix, and the next reviewer in the stack sees it. The loop continues until reviewers stop appending.
+
+## CLI reference
+
+```sh
+stako init [--root <path>] [--yes] [--quiet]
+stako daemon start|stop|status
+stako new <stack>
+stako add <routine> <stack> [--input-item <id> | --input-file <path> | --input-commit <sha>]
+stako start <stack>
+stako stack list|show|config|pause|resume <stack>
+stako routine list|show [<name>]
+stako auth status [<provider>]
+```
+
+Daemon-backed commands accept `--root <path>`, `--port <n>`, `--json`, and `--verbose`. `STAKO_PORT` overrides the port when no local config is present.
+
+## Building from source
+
+```sh
+make            # build (zig-out/bin/stako)
+make test       # run the full test suite
+make install    # install to $HOME/.local/bin (override with PREFIX=...)
+```
