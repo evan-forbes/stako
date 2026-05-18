@@ -20,6 +20,7 @@ pub const Error = error{
     InputMissing,
     InputTooLarge,
     ValidationFailed,
+    PromptMissing,
     OutOfMemory,
 } || std.fs.File.OpenError || std.fs.File.StatError || std.fs.File.ReadError || std.fs.File.WriteError || std.fs.Dir.MakeError;
 
@@ -193,6 +194,10 @@ fn renderPrompt(
 }
 
 fn readBasePrompt(allocator: std.mem.Allocator, item: *const item_mod.Item, item_dir_abs: []const u8) ![]u8 {
+    if (item.prompts) |prompts| {
+        if (prompts.len == 0) return error.ValidationFailed;
+        return readPromptList(allocator, prompts, item_dir_abs);
+    }
     const path = try std.fs.path.join(allocator, &.{ item_dir_abs, "prompt.md" });
     defer allocator.free(path);
     const content = readWholeFile(allocator, path) catch |e| switch (e) {
@@ -202,6 +207,48 @@ fn readBasePrompt(allocator: std.mem.Allocator, item: *const item_mod.Item, item
     if (content.len == 0) {
         allocator.free(content);
         return allocator.dupe(u8, item.slug);
+    }
+    return content;
+}
+
+fn readPromptList(allocator: std.mem.Allocator, prompts: []const []const u8, item_dir_abs: []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    for (prompts, 0..) |rel, i| {
+        if (!item_mod.isValidInputFilePath(rel)) return error.ValidationFailed;
+        const abs = if (std.fs.path.isAbsolute(rel))
+            try allocator.dupe(u8, rel)
+        else
+            try std.fs.path.join(allocator, &.{ item_dir_abs, rel });
+        defer allocator.free(abs);
+        const raw = readWholeFile(allocator, abs) catch |e| switch (e) {
+            error.FileNotFound => return error.PromptMissing,
+            else => return e,
+        };
+        defer allocator.free(raw);
+        const body = stripTomlFrontmatter(raw);
+        if (i != 0) try w.writeAll("\n\n---\n\n");
+        try w.writeAll(body);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn stripTomlFrontmatter(content: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, content, "+++\n") and !std.mem.startsWith(u8, content, "+++\r\n")) return content;
+    const first_end: usize = if (std.mem.startsWith(u8, content, "+++\r\n")) 5 else 4;
+    var pos = first_end;
+    while (pos <= content.len) {
+        const line_start = pos;
+        var line_end = line_start;
+        while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
+        const line = std.mem.trim(u8, content[line_start..line_end], " \t\r");
+        if (std.mem.eql(u8, line, "+++")) {
+            const after = if (line_end < content.len) line_end + 1 else line_end;
+            return content[after..];
+        }
+        if (line_end == content.len) break;
+        pos = line_end + 1;
     }
     return content;
 }
@@ -330,4 +377,49 @@ test "render prompt prepends I/O contract without registered inputs" {
     try std.testing.expect(std.mem.startsWith(u8, rendered, IO_CONTRACT));
     try std.testing.expect(std.mem.endsWith(u8, rendered, "base prompt"));
     try std.testing.expect(std.mem.indexOf(u8, rendered, "## Registered Inputs") == null);
+}
+
+test "render prompt concatenates prompts list and strips frontmatter" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("stacks/demo/0001-next/prompts");
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-next/prompts/a.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\+++
+            \\title = "A"
+            \\+++
+            \\First prompt.
+        );
+    }
+    {
+        var f = try tmp.dir.createFile("stacks/demo/0001-next/prompts/b.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("Second prompt.");
+    }
+    var it = item_mod.Item{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .id = "0001",
+        .slug = "next",
+        .kind = .prompt,
+        .status = .queued,
+        .created_at = "2026-05-10T14:00:00Z",
+        .updated_at = "2026-05-10T14:00:00Z",
+    };
+    defer it.deinit();
+    const aa = it.arena.allocator();
+    const prompts = try aa.alloc([]const u8, 2);
+    prompts[0] = try aa.dupe(u8, "prompts/a.md");
+    prompts[1] = try aa.dupe(u8, "prompts/b.md");
+    it.prompts = prompts;
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+    const item_dir = try std.fs.path.join(a, &.{ root, "stacks/demo/0001-next" });
+    defer a.free(item_dir);
+    const rendered = try resolvePrompt(a, root, "demo", &it, item_dir);
+    defer a.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "title =") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "First prompt.\n\n---\n\nSecond prompt.") != null);
 }

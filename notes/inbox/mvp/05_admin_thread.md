@@ -29,16 +29,11 @@ Use a routine rather than a hardcoded runtime mode:
 
 ```toml
 version = 1
-name = "admin-review"
 description = "Review recent stack results and decide what to do next."
+thread = "admin"
 
 [[step]]
-name = "evaluate"
-slug = "admin-evaluate"
-kind = "prompt"
-thread = "admin"
-thread_mode = "resume"
-prompt_file = "admin-review/evaluate.md"
+prompts = ["../prompts/admin-review/evaluate.md"]
 ```
 
 The prompt materializer should provide registered inputs:
@@ -102,7 +97,7 @@ Avoid infinite loops:
 ## Tests
 
 - Admin thread can be created by convention.
-- Admin routine appends a prompt targeting `admin`.
+- Admin routine appends a prompt element pointing at `admin`.
 - Admin prompt ingests selected prior item commit context.
 - Admin completion updates `threads/admin.toml`.
 - No automatic requeue loop occurs.

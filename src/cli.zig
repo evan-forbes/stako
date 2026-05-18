@@ -79,6 +79,9 @@ pub const Subcommand = enum {
     stack,
     routine,
     auth,
+    new,
+    start,
+    add,
 
     /// Accepts the canonical name and the short alias documented in
     /// `todos/implement_cli_client.md`.
@@ -93,6 +96,9 @@ pub const Subcommand = enum {
             .{ .name = "rtn", .value = .routine },
             .{ .name = "auth", .value = .auth },
             .{ .name = "a", .value = .auth },
+            .{ .name = "new", .value = .new },
+            .{ .name = "start", .value = .start },
+            .{ .name = "add", .value = .add },
         };
         return matchAlias(Subcommand, s, &aliases);
     }
@@ -309,6 +315,11 @@ pub const StackArgs = struct {
     routine_name: []const u8 = "",
     input_items: [16][]const u8 = std.mem.zeroes([16][]const u8),
     input_item_count: u8 = 0,
+    input_files: [16][]const u8 = std.mem.zeroes([16][]const u8),
+    input_file_count: u8 = 0,
+    input_commits: [16][]const u8 = std.mem.zeroes([16][]const u8),
+    input_commit_count: u8 = 0,
+    input_mode: []const u8 = "",
     /// `config`: one or more --set entries (key=value). Up to 8 in v1.
     set_pairs: [8][]const u8 = std.mem.zeroes([8][]const u8),
     set_count: u8 = 0,
@@ -361,6 +372,30 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
                 if (out.input_item_count >= out.input_items.len) return error.BadFlagValue;
                 out.input_items[out.input_item_count] = v;
                 out.input_item_count += 1;
+                continue;
+            }
+        }
+        if (out.action == .run_routine) {
+            if (try flagValue(args, &i, "--input-item", null, "--input-item=")) |v| {
+                if (out.input_item_count >= out.input_items.len) return error.BadFlagValue;
+                out.input_items[out.input_item_count] = v;
+                out.input_item_count += 1;
+                continue;
+            }
+            if (try flagValue(args, &i, "--input-file", null, "--input-file=")) |v| {
+                if (out.input_file_count >= out.input_files.len) return error.BadFlagValue;
+                out.input_files[out.input_file_count] = v;
+                out.input_file_count += 1;
+                continue;
+            }
+            if (try flagValue(args, &i, "--input-commit", null, "--input-commit=")) |v| {
+                if (out.input_commit_count >= out.input_commits.len) return error.BadFlagValue;
+                out.input_commits[out.input_commit_count] = v;
+                out.input_commit_count += 1;
+                continue;
+            }
+            if (try flagValue(args, &i, "--input-mode", null, "--input-mode=")) |v| {
+                out.input_mode = v;
                 continue;
             }
         }
@@ -541,6 +576,90 @@ pub fn parseRoutineArgs(args: []const []const u8) UsageError!RoutineArgs {
     return out;
 }
 
+pub const AddArgs = struct {
+    routine_name: []const u8 = "",
+    stack_name: []const u8 = "",
+    flags: ApiFlags = .{},
+    input_items: [16][]const u8 = std.mem.zeroes([16][]const u8),
+    input_item_count: u8 = 0,
+    input_files: [16][]const u8 = std.mem.zeroes([16][]const u8),
+    input_file_count: u8 = 0,
+    input_commits: [16][]const u8 = std.mem.zeroes([16][]const u8),
+    input_commit_count: u8 = 0,
+    input_mode: []const u8 = "",
+};
+
+/// Parse top-level `stako add <routine> <stack>` and flag forms:
+/// `stako add -r <routine> -s <stack>`.
+pub fn parseAddArgs(args: []const []const u8) UsageError!AddArgs {
+    var out: AddArgs = .{};
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-j")) {
+            out.flags.json = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
+            out.flags.verbose = true;
+            continue;
+        }
+        if (try flagValue(args, &i, "--root", null, "--root=")) |v| {
+            out.flags.root = v;
+            if (out.flags.root.len == 0) return error.BadFlagValue;
+            continue;
+        }
+        if (try flagValue(args, &i, "--port", "-p", "--port=")) |v| {
+            out.flags.port_override = try parsePort(v);
+            continue;
+        }
+        if (try flagValue(args, &i, "--routine", "-r", "--routine=")) |v| {
+            out.routine_name = v;
+            if (out.routine_name.len == 0) return error.BadFlagValue;
+            continue;
+        }
+        if (try flagValue(args, &i, "--stack", "-s", "--stack=")) |v| {
+            out.stack_name = v;
+            if (out.stack_name.len == 0) return error.BadFlagValue;
+            continue;
+        }
+        if (try flagValue(args, &i, "--input-item", null, "--input-item=")) |v| {
+            if (out.input_item_count >= out.input_items.len) return error.BadFlagValue;
+            out.input_items[out.input_item_count] = v;
+            out.input_item_count += 1;
+            continue;
+        }
+        if (try flagValue(args, &i, "--input-file", null, "--input-file=")) |v| {
+            if (out.input_file_count >= out.input_files.len) return error.BadFlagValue;
+            out.input_files[out.input_file_count] = v;
+            out.input_file_count += 1;
+            continue;
+        }
+        if (try flagValue(args, &i, "--input-commit", null, "--input-commit=")) |v| {
+            if (out.input_commit_count >= out.input_commits.len) return error.BadFlagValue;
+            out.input_commits[out.input_commit_count] = v;
+            out.input_commit_count += 1;
+            continue;
+        }
+        if (try flagValue(args, &i, "--input-mode", null, "--input-mode=")) |v| {
+            out.input_mode = v;
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
+        if (out.routine_name.len == 0) {
+            out.routine_name = a;
+        } else if (out.stack_name.len == 0) {
+            out.stack_name = a;
+        } else {
+            return error.BadFlagValue;
+        }
+    }
+
+    if (out.routine_name.len == 0 or out.stack_name.len == 0) return error.NoSubcommand;
+    return out;
+}
+
 pub const AuthArgs = struct {
     action: AuthAction,
     /// Filled for `provider` and `signout` actions.
@@ -618,6 +737,9 @@ pub fn dispatch(
         .stack => return try runStack(allocator, rest, stdout, stderr),
         .routine => return try runRoutine(allocator, rest, stdout, stderr),
         .auth => return try runAuth(allocator, rest, stdout, stderr),
+        .new => return try runStackShortcut(allocator, .new, rest, stdout, stderr),
+        .start => return try runStackShortcut(allocator, .@"resume", rest, stdout, stderr),
+        .add => return try runAddShortcut(allocator, rest, stdout, stderr),
     }
 }
 
@@ -754,6 +876,67 @@ fn runStack(
     return cli_stack.run(allocator, parsed, stdout, stderr);
 }
 
+fn runStackShortcut(
+    allocator: std.mem.Allocator,
+    action: StackAction,
+    args: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    var parsed: StackArgs = .{ .action = action };
+    var i: usize = 0;
+    var saw_name = false;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (try parseApiFlag(args, &i, &parsed.flags)) continue;
+        if (std.mem.startsWith(u8, a, "-")) {
+            try stderr.print("stako {s}: BadFlagValue\n", .{if (action == .new) "new" else "start"});
+            try printShortcutUsage(stderr, action);
+            return 2;
+        }
+        if (saw_name) {
+            try stderr.print("stako {s}: BadFlagValue\n", .{if (action == .new) "new" else "start"});
+            try printShortcutUsage(stderr, action);
+            return 2;
+        }
+        parsed.name = a;
+        saw_name = true;
+    }
+    if (parsed.name.len == 0) {
+        try stderr.print("stako {s}: NoSubcommand\n", .{if (action == .new) "new" else "start"});
+        try printShortcutUsage(stderr, action);
+        return 2;
+    }
+    return cli_stack.run(allocator, parsed, stdout, stderr);
+}
+
+fn runAddShortcut(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const parsed = parseAddArgs(args) catch |e| {
+        try stderr.print("stako add: {s}\n", .{@errorName(e)});
+        try printAddUsage(stderr);
+        return 2;
+    };
+    const stack_args: StackArgs = .{
+        .action = .run_routine,
+        .name = parsed.stack_name,
+        .flags = parsed.flags,
+        .routine_name = parsed.routine_name,
+        .input_items = parsed.input_items,
+        .input_item_count = parsed.input_item_count,
+        .input_files = parsed.input_files,
+        .input_file_count = parsed.input_file_count,
+        .input_commits = parsed.input_commits,
+        .input_commit_count = parsed.input_commit_count,
+        .input_mode = parsed.input_mode,
+    };
+    return cli_stack.run(allocator, stack_args, stdout, stderr);
+}
+
 var g_daemon_for_signals: ?*daemon_mod.Daemon = null;
 
 fn installSignalHandlers() void {
@@ -812,11 +995,68 @@ fn printUsage(w: anytype) !void {
         \\Subcommands:
         \\  init                        Bootstrap a notes-root layout
         \\  daemon, d  start|stop|st    Start/stop/inspect the local daemon
+        \\  new       <stack>           Create a stack
+        \\  add       <routine> <stack> Append a routine to a stack
+        \\  start     <stack>           Resume a stack when the daemon is running
         \\  stack,  s  list|show|cfg    Read stacks via the daemon
         \\  routine    list|show        Read routines via the daemon
         \\  auth,   a  status|<prov>    Report provider availability + auth state
         \\
         \\Run `stako <subcommand>` with no further args for per-subcommand help.
+        \\
+    );
+}
+
+fn printShortcutUsage(w: anytype, action: StackAction) !void {
+    if (action == .new) {
+        try w.writeAll(
+            \\Usage: stako new <stack> [flags...]
+            \\
+            \\Alias for `stako stack new <stack>`.
+            \\
+            \\Flags:
+            \\  --root,    -r <path>  Notes root for local config/token discovery.
+            \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
+            \\  --json,    -j         Pass the daemon JSON through unchanged.
+            \\  --verbose, -v         Show request URL on errors.
+            \\
+        );
+    } else {
+        try w.writeAll(
+            \\Usage: stako start <stack> [flags...]
+            \\
+            \\Resumes/unpauses the stack. The daemon must already be running.
+            \\
+            \\Flags:
+            \\  --root,    -r <path>  Notes root for local config/token discovery.
+            \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
+            \\  --json,    -j         Pass the daemon JSON through unchanged.
+            \\  --verbose, -v         Show request URL on errors.
+            \\
+        );
+    }
+}
+
+fn printAddUsage(w: anytype) !void {
+    try w.writeAll(
+        \\Usage:
+        \\  stako add <routine> <stack> [flags...]
+        \\  stako add --routine <routine> --stack <stack> [flags...]
+        \\  stako add -r <routine> -s <stack> [flags...]
+        \\
+        \\Appends a routine to a stack through the daemon.
+        \\
+        \\Flags:
+        \\  --routine, -r <name>  Routine name.
+        \\  --stack,   -s <name>  Stack name.
+        \\  --root <path>         Notes root for local config/token discovery.
+        \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
+        \\  --json,    -j         Pass the daemon JSON through unchanged.
+        \\  --verbose, -v         Show request URL on errors.
+        \\  --input-item <id>     Register an item input for routine prompts.
+        \\  --input-file <path>   Register a file input for routine prompts.
+        \\  --input-commit <sha>  Register a commit input for routine prompts.
+        \\  --input-mode <mode>   Input placement mode.
         \\
     );
 }
@@ -871,12 +1111,16 @@ fn printInitUsage(w: anytype) !void {
 
 fn printStackUsage(w: anytype) !void {
     try w.writeAll(
-        \\Usage: stako stack|s <list|show|config> [<name>] [flags...]
+        \\Usage: stako stack|s <action> [<name>] [flags...]
         \\
         \\Actions:
         \\  list,   ls            List known stacks.
         \\  show,   sh   <name>   Show a stack's config + items.
         \\  config, cfg  <name>   Show a stack's config.
+        \\  new          <name>   Create a stack.
+        \\  run-routine <stack> <routine>
+        \\                        Append a routine to a stack.
+        \\  pause|resume <name>   Pause or resume a stack.
         \\
         \\Flags (common to every API subcommand):
         \\  --json,    -j         Pass the daemon JSON through unchanged.
@@ -1012,6 +1256,9 @@ test "Subcommand.fromString canonical names" {
     try std.testing.expect(Subcommand.fromString("init") != null);
     try std.testing.expect(Subcommand.fromString("daemon") != null);
     try std.testing.expect(Subcommand.fromString("stack") != null);
+    try std.testing.expect(Subcommand.fromString("new") != null);
+    try std.testing.expect(Subcommand.fromString("add") != null);
+    try std.testing.expect(Subcommand.fromString("start") != null);
     try std.testing.expect(Subcommand.fromString("nope") == null);
 }
 
@@ -1107,6 +1354,16 @@ test "parseStackArgs: output threads and routine commands" {
     const routine = try parseStackArgs(&.{ "run-routine", "demo", "review" });
     try std.testing.expectEqual(StackAction.run_routine, routine.action);
     try std.testing.expectEqualStrings("review", routine.routine_name);
+
+    const routine_inputs = try parseStackArgs(&.{ "run-routine", "demo", "review", "--input-file", "src/rpc.zig", "--input-item", "0007", "--input-commit", "abc123", "--input-mode", "prepend" });
+    try std.testing.expectEqual(StackAction.run_routine, routine_inputs.action);
+    try std.testing.expectEqual(@as(u8, 1), routine_inputs.input_file_count);
+    try std.testing.expectEqualStrings("src/rpc.zig", routine_inputs.input_files[0]);
+    try std.testing.expectEqual(@as(u8, 1), routine_inputs.input_item_count);
+    try std.testing.expectEqualStrings("0007", routine_inputs.input_items[0]);
+    try std.testing.expectEqual(@as(u8, 1), routine_inputs.input_commit_count);
+    try std.testing.expectEqualStrings("abc123", routine_inputs.input_commits[0]);
+    try std.testing.expectEqualStrings("prepend", routine_inputs.input_mode);
 }
 
 test "parseStackArgs: add threaded input item" {
@@ -1125,6 +1382,34 @@ test "parseRoutineArgs: list and show" {
     try std.testing.expectEqual(RoutineAction.show, show.action);
     try std.testing.expectEqualStrings("review", show.name);
     try std.testing.expect(show.flags.json);
+}
+
+test "parseAddArgs: positional and flag forms" {
+    const positional = try parseAddArgs(&.{ "planning", "demo" });
+    try std.testing.expectEqualStrings("planning", positional.routine_name);
+    try std.testing.expectEqualStrings("demo", positional.stack_name);
+
+    const flagged = try parseAddArgs(&.{ "-r", "review", "-s", "default", "--root", "/tmp/stako", "-p", "4242" });
+    try std.testing.expectEqualStrings("review", flagged.routine_name);
+    try std.testing.expectEqualStrings("default", flagged.stack_name);
+    try std.testing.expectEqualStrings("/tmp/stako", flagged.flags.root);
+    try std.testing.expectEqual(@as(?u16, 4242), flagged.flags.port_override);
+}
+
+test "parseAddArgs: collects routine input flags" {
+    const a = try parseAddArgs(&.{ "planning", "demo", "--input-file", "src/main.zig", "--input-item", "0001", "--input-commit", "abc123", "--input-mode", "prepend" });
+    try std.testing.expectEqual(@as(u8, 1), a.input_file_count);
+    try std.testing.expectEqualStrings("src/main.zig", a.input_files[0]);
+    try std.testing.expectEqual(@as(u8, 1), a.input_item_count);
+    try std.testing.expectEqualStrings("0001", a.input_items[0]);
+    try std.testing.expectEqual(@as(u8, 1), a.input_commit_count);
+    try std.testing.expectEqualStrings("abc123", a.input_commits[0]);
+    try std.testing.expectEqualStrings("prepend", a.input_mode);
+}
+
+test "parseAddArgs: requires routine and stack" {
+    try std.testing.expectError(error.NoSubcommand, parseAddArgs(&.{}));
+    try std.testing.expectError(error.NoSubcommand, parseAddArgs(&.{"planning"}));
 }
 
 test "parseStackArgs: rejects unknown flag" {

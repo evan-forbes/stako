@@ -353,8 +353,9 @@ pub const Reader = struct {
         defer self.allocator.free(src);
         const n = try f.readAll(src);
 
+        const name = file_name[0 .. file_name.len - ".toml".len];
         var diag: routine_mod.Diagnostic = .{};
-        var parsed = routine_mod.parseSlice(self.allocator, src[0..n], &diag) catch return null;
+        var parsed = routine_mod.parseSliceWithDefaultName(self.allocator, src[0..n], name, &diag) catch return null;
         defer parsed.deinit();
 
         return .{

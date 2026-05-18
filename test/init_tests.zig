@@ -93,11 +93,16 @@ test "init: on a fresh empty dir creates the documented layout" {
     // Directories.
     try std.testing.expect(fileExists(&d, "stacks"));
     try std.testing.expect(fileExists(&d, "stacks/default"));
+    try std.testing.expect(fileExists(&d, "prompts"));
+    try std.testing.expect(fileExists(&d, "prompts/admin-review"));
+    try std.testing.expect(fileExists(&d, "routines"));
     try std.testing.expect(fileExists(&d, "state"));
-    try std.testing.expect(fileExists(&d, "state/runtime"));
 
     // Files.
     try std.testing.expect(fileExists(&d, "stacks/default/stack.toml"));
+    try std.testing.expect(fileExists(&d, "prompts/admin-review/evaluate.md"));
+    try std.testing.expect(fileExists(&d, "routines/admin-review.toml"));
+    try std.testing.expect(fileExists(&d, "AGENTS.md"));
     try std.testing.expect(fileExists(&d, "config.toml"));
     try std.testing.expect(fileExists(&d, "state/local_token"));
     try std.testing.expect(fileExists(&d, ".gitignore"));
@@ -410,30 +415,6 @@ test "init: inside an existing parent git repo emits a warning but proceeds" {
     try std.testing.expect(report.inside_existing_git);
     try std.testing.expect(!report.git_initialized);
     try std.testing.expect(report.created.items.len > 0);
-}
-
-test "init: state/runtime is empty after a fresh init" {
-    const a = std.testing.allocator;
-    var s = try Scratch.create(a, "runtime-empty");
-    defer s.deinit();
-
-    var report = try init_mod.run(a, .{
-        .root = s.abs_path,
-        .yes = true,
-        .quiet = true,
-        .now_override = "2026-05-10T14:00:00Z",
-        .rng_seed_override = 0x77,
-    });
-    defer report.deinit();
-
-    var d = try s.dir();
-    defer d.close();
-    var rt = try d.openDir("state/runtime", .{ .iterate = true });
-    defer rt.close();
-    var it = rt.iterate();
-    var count: usize = 0;
-    while (try it.next()) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 0), count);
 }
 
 test "init: yes=false skips auto git init on a non-git root" {

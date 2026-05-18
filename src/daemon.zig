@@ -2075,32 +2075,13 @@ fn writeRoutineJson(w: anytype, routine: *const routine_mod.Routine) !void {
         if (i != 0) try w.writeAll(",");
         try w.writeAll("{\"name\":\"");
         try errors.writeJsonString(w, step.name);
-        try w.writeAll("\",\"slug\":\"");
-        try errors.writeJsonString(w, step.slug);
-        try w.writeAll("\",\"kind\":\"");
-        try errors.writeJsonString(w, step.kind.toString());
         try w.writeAll("\"");
-        if (step.prompt) |p| try writeOptionalStringMemberInline(w, "prompt", p);
-        if (step.prompt_file) |p| try writeOptionalStringMemberInline(w, "prompt_file", p);
-        if (step.after.len > 0) {
+        if (step.prompts) |p| {
             var first = false;
-            try writeJsonArrayField(w, "after", step.after, &first);
+            try writeJsonArrayField(w, "prompts", p, &first);
         }
-        if (step.inputs_from.len > 0) {
-            var first = false;
-            try writeJsonArrayField(w, "inputs_from", step.inputs_from, &first);
-        }
+        if (step.command) |c| try writeOptionalStringMemberInline(w, "command", c.toString());
         if (step.thread) |s| try writeOptionalStringMemberInline(w, "thread", s);
-        if (step.thread_mode) |m| try writeOptionalStringMemberInline(w, "thread_mode", m.toString());
-        if (step.target.provider != null or step.target.model != null or step.target.match != null or step.target.workdir != null) {
-            try w.writeAll(",\"target\":{");
-            var first = true;
-            if (step.target.provider) |s| try writeOptionalStringMember(w, "provider", s, &first);
-            if (step.target.model) |s| try writeOptionalStringMember(w, "model", s, &first);
-            if (step.target.match) |m| try writeOptionalStringMember(w, "match", m.toString(), &first);
-            if (step.target.workdir) |s| try writeOptionalStringMember(w, "workdir", s, &first);
-            try w.writeAll("}");
-        }
         try w.writeAll("}");
     }
     try w.writeAll("]}");

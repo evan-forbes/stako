@@ -18,7 +18,6 @@ const init_mod = stako.init;
 const audit_mod = stako.audit;
 const sse_mod = stako.sse;
 const runtime_mod = stako.runtime;
-const runtime_file = stako.runtime_file;
 const events = stako.events;
 const adapter_mod = stako.adapter;
 const claude_adapter = stako.claude_adapter;

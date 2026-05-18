@@ -67,6 +67,7 @@ pub const Thread = struct {
     created_at: []const u8,
     updated_at: []const u8,
     status: Status = .active,
+    description: ?[]const u8 = null,
     target: ?Target = null,
     state: ?State = null,
 
@@ -135,8 +136,10 @@ pub fn parseSlice(
 
     var target = Target{};
     const have_target = doc.hasTable("target");
+    var have_target_value = false;
     var state = State{};
     const have_state = doc.hasTable("state");
+    var have_state_value = false;
 
     for (doc.entries.items) |e| {
         if (std.mem.eql(u8, e.table, "")) {
@@ -163,30 +166,49 @@ pub fn parseSlice(
                     return error.UnknownStatus;
                 };
                 have_status = true;
+            } else if (std.mem.eql(u8, e.key, "description")) {
+                thread.description = try arena.dupe(u8, try requireString(e.value, "description", diag));
+            } else if (std.mem.eql(u8, e.key, "provider")) {
+                target.provider = try arena.dupe(u8, try requireString(e.value, "provider", diag));
+                have_target_value = true;
+            } else if (std.mem.eql(u8, e.key, "model")) {
+                target.model = try arena.dupe(u8, try requireString(e.value, "model", diag));
+                have_target_value = true;
+            } else if (std.mem.eql(u8, e.key, "session")) {
+                state.last_session_id = try arena.dupe(u8, try requireString(e.value, "session", diag));
+                have_state_value = true;
             }
         } else if (std.mem.eql(u8, e.table, "target")) {
             if (std.mem.eql(u8, e.key, "provider")) {
                 target.provider = try arena.dupe(u8, try requireString(e.value, "target.provider", diag));
+                have_target_value = true;
             } else if (std.mem.eql(u8, e.key, "model")) {
                 target.model = try arena.dupe(u8, try requireString(e.value, "target.model", diag));
+                have_target_value = true;
             } else if (std.mem.eql(u8, e.key, "match")) {
                 const s = try requireString(e.value, "target.match", diag);
                 target.match = Match.fromString(s) orelse {
                     diag.* = .{ .err = error.UnknownMatch, .message = "unknown target.match", .field = "target.match" };
                     return error.UnknownMatch;
                 };
+                have_target_value = true;
             }
         } else if (std.mem.eql(u8, e.table, "state")) {
             if (std.mem.eql(u8, e.key, "last_item_id")) {
                 state.last_item_id = try arena.dupe(u8, try requireString(e.value, "state.last_item_id", diag));
+                have_state_value = true;
             } else if (std.mem.eql(u8, e.key, "last_harness")) {
                 state.last_harness = try arena.dupe(u8, try requireString(e.value, "state.last_harness", diag));
+                have_state_value = true;
             } else if (std.mem.eql(u8, e.key, "last_session_id")) {
                 state.last_session_id = try arena.dupe(u8, try requireString(e.value, "state.last_session_id", diag));
+                have_state_value = true;
             } else if (std.mem.eql(u8, e.key, "last_session_file")) {
                 state.last_session_file = try arena.dupe(u8, try requireString(e.value, "state.last_session_file", diag));
+                have_state_value = true;
             } else if (std.mem.eql(u8, e.key, "last_transcript_path")) {
                 state.last_transcript_path = try arena.dupe(u8, try requireString(e.value, "state.last_transcript_path", diag));
+                have_state_value = true;
             }
         }
     }
@@ -200,8 +222,8 @@ pub fn parseSlice(
         diag.* = .{ .err = error.InvalidName, .message = "invalid thread name", .field = "name" };
         return error.InvalidName;
     }
-    if (have_target) thread.target = target;
-    if (have_state) thread.state = state;
+    if (have_target or have_target_value) thread.target = target;
+    if (have_state or have_state_value) thread.state = state;
     return thread;
 }
 
@@ -215,6 +237,7 @@ pub fn write(thread: *const Thread, w: anytype) !void {
     try w.writeAll(thread.updated_at);
     try w.writeByte('\n');
     try writeStringKv(w, "status", thread.status.toString());
+    if (thread.description) |d| try writeStringKv(w, "description", d);
 
     if (thread.target) |t| {
         try w.writeAll("\n[target]\n");

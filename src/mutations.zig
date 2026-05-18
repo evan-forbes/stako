@@ -305,34 +305,32 @@ pub fn applyAppendRoutine(
         step_ids[step_index] = try std.fmt.allocPrint(aa, "{d:0>4}", .{id_int});
     }
 
-    const prompt_bodies = try aa.alloc([]const u8, input.routine.steps.len);
+    const prompt_bodies = try aa.alloc(?[]const u8, input.routine.steps.len);
     const effective_thread_modes = try aa.alloc(?item_mod.ThreadMode, input.routine.steps.len);
     @memset(effective_thread_modes, null);
     for (input.routine.steps, 0..) |*step, i| {
-        const body = input.routine.resolvePrompt(allocator, step) catch return error.ValidationFailed;
-        prompt_bodies[i] = try aa.dupe(u8, body);
-        allocator.free(body);
+        if (step.command == null) {
+            const body = input.routine.resolvePrompt(allocator, step) catch return error.ValidationFailed;
+            prompt_bodies[i] = try aa.dupe(u8, body);
+            allocator.free(body);
+        } else {
+            prompt_bodies[i] = null;
+        }
 
-        effective_thread_modes[i] = step.thread_mode;
         if (step.thread) |thread_name| {
             const thread_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.stack, "threads", try std.fmt.allocPrint(aa, "{s}.toml", .{thread_name}) });
             defer allocator.free(thread_abs);
             var th = readThreadFile(allocator, thread_abs) catch return error.ValidationFailed;
             defer th.deinit();
             if (th.status != .active) return error.ValidationFailed;
-            if (step.thread_mode == .@"resume" and !threadHasSession(&th)) {
-                effective_thread_modes[i] = .fresh;
-            }
+            effective_thread_modes[i] = if (threadHasSession(&th)) .@"resume" else .fresh;
         }
     }
 
     for (order) |step_index| {
         const step = &input.routine.steps[step_index];
-        const parents = try mapStepRefsToIds(aa, input.routine.steps, step.after, step_ids);
-        const inputs = try mapStepRefsToIds(aa, input.routine.steps, step.inputs_from, step_ids);
-        const routine_input_items = try mergeStringRefs(aa, inputs, input.input_items);
-        try validateExpandedRoutineStep(allocator, notes_root_abs, input.stack, step, effective_thread_modes[step_index], step_ids[step_index], parents, .{
-            .input_items = routine_input_items,
+        try validateExpandedRoutineStep(allocator, notes_root_abs, input.stack, step, effective_thread_modes[step_index], step_ids[step_index], &.{}, .{
+            .input_items = input.input_items,
             .input_files = input.input_files,
             .input_commits = input.input_commits,
             .input_mode = input.input_mode,
@@ -347,22 +345,14 @@ pub fn applyAppendRoutine(
 
     for (order) |step_index| {
         const step = &input.routine.steps[step_index];
-        const parents = try mapStepRefsToIds(aa, input.routine.steps, step.after, step_ids);
-        const inputs = try mapStepRefsToIds(aa, input.routine.steps, step.inputs_from, step_ids);
-        const routine_input_items = try mergeStringRefs(aa, inputs, input.input_items);
         var out = try writeItem(allocator, notes_root_abs, ident, .append_item, input.stack, step_ids[step_index], step.kind, step.slug, .{
             .prompt_body = prompt_bodies[step_index],
-            .target_provider = step.target.provider,
-            .target_model = step.target.model,
-            .target_match = step.target.match,
-            .target_workdir = step.target.workdir,
-            .input_items = routine_input_items,
+            .input_items = input.input_items,
             .input_files = input.input_files,
             .input_commits = input.input_commits,
             .input_mode = input.input_mode,
             .thread_name = step.thread,
             .thread_mode = effective_thread_modes[step_index],
-            .parents = if (parents.len > 0) parents else null,
             .created_at_override = input.created_at_override,
         });
         defer out.deinit();
@@ -1212,7 +1202,7 @@ fn writeItem(
         };
         item.thread = .{
             .name = try ia.dupe(u8, name),
-            .mode = opts.thread_mode orelse .fresh,
+            .mode = opts.thread_mode orelse if (thread_defaults) |*th| if (threadHasSession(th)) .@"resume" else .fresh else .fresh,
         };
     } else if (opts.thread_mode != null) {
         return error.ValidationFailed;
@@ -1347,41 +1337,6 @@ fn isInternalGitPath(path: []const u8) bool {
     return std.mem.eql(u8, path, ".git") or std.mem.startsWith(u8, path, ".git/");
 }
 
-fn mapStepRefsToIds(
-    allocator: std.mem.Allocator,
-    steps: []const routine_mod.Step,
-    refs: []const []const u8,
-    ids: []const []const u8,
-) Error![]const []const u8 {
-    if (refs.len == 0) return &.{};
-    const out = try allocator.alloc([]const u8, refs.len);
-    for (refs, 0..) |name, i| {
-        var found: ?usize = null;
-        for (steps, 0..) |step, j| {
-            if (std.mem.eql(u8, step.name, name)) {
-                found = j;
-                break;
-            }
-        }
-        const idx = found orelse return error.ValidationFailed;
-        out[i] = ids[idx];
-    }
-    return out;
-}
-
-fn mergeStringRefs(
-    allocator: std.mem.Allocator,
-    left: []const []const u8,
-    right: ?[]const []const u8,
-) Error!?[]const []const u8 {
-    const right_items = right orelse &.{};
-    if (left.len == 0 and right_items.len == 0) return null;
-    const out = try allocator.alloc([]const u8, left.len + right_items.len);
-    for (left, 0..) |v, i| out[i] = v;
-    for (right_items, 0..) |v, i| out[left.len + i] = v;
-    return out;
-}
-
 const ExpandedInputs = struct {
     input_items: ?[]const []const u8 = null,
     input_files: ?[]const []const u8 = null,
@@ -1438,23 +1393,15 @@ fn validateExpandedRoutineStep(
 
     const thread_target = if (thread_defaults) |th| th.target else null;
     const has_thread_target = if (thread_target) |t| t.provider != null or t.model != null or t.match != null else false;
-    const has_any_target = step.target.provider != null or step.target.model != null or
-        step.target.match != null or step.target.workdir != null or has_thread_target;
-    if (has_any_target or step.kind == .prompt or step.kind == .review or step.kind == .compact) {
+    if (has_thread_target or step.kind == .prompt or step.kind == .review or step.kind == .compact) {
         var target: item_mod.Target = .{};
-        if (step.target.provider) |s| {
-            target.provider = try aa.dupe(u8, s);
-        } else if (thread_target) |tt| {
+        if (thread_target) |tt| {
             if (tt.provider) |s| target.provider = try aa.dupe(u8, s);
         }
-        if (step.target.model) |s| {
-            target.model = try aa.dupe(u8, s);
-        } else if (thread_target) |tt| {
+        if (thread_target) |tt| {
             if (tt.model) |s| target.model = try aa.dupe(u8, s);
         }
-        if (step.target.match) |m| {
-            target.match = m;
-        } else if (thread_target) |tt| {
+        if (thread_target) |tt| {
             if (tt.match) |m| target.match = switch (m) {
                 .exact => .exact,
                 .compatible => .compatible,
@@ -1462,7 +1409,6 @@ fn validateExpandedRoutineStep(
             };
         }
         if (target.match == null) target.match = .any;
-        if (step.target.workdir) |s| target.workdir = try aa.dupe(u8, s);
         item.target = target;
     }
 
@@ -1493,7 +1439,7 @@ fn validateExpandedRoutineStep(
     if (step.thread) |name| {
         item.thread = .{
             .name = try aa.dupe(u8, name),
-            .mode = effective_thread_mode orelse .fresh,
+            .mode = effective_thread_mode orelse if (thread_defaults) |*th| if (threadHasSession(th)) .@"resume" else .fresh else .fresh,
         };
     }
     if (step.kind == .clear) item.clear_present = true;

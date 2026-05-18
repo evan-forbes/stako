@@ -23,7 +23,7 @@ Each stack item is a directory on disk:
 
 The directory layout is the source of truth. HTML is a render target, not a storage format.
 
-Per-stack ID space (each stack counts from `0001` independently). Daemon state lives under a sibling `<notes-root>/.stako/` (config, credentials, PID, log) so the user-visible `stacks/` tree stays clean and version-controllable.
+Per-stack ID space (each stack counts from `0001` independently). Daemon state lives under `<notes-root>/state/` (local token, audit log, PID, log); per-root config is `<notes-root>/config.toml`. Both are gitignored so the user-visible `stacks/` tree stays clean and version-controllable.
 
 The exact schema for `meta.toml` is defined in `todos/design_stack_item_format.md`. The on-disk layout decision lives in `todos/design_init_and_layout.md`. Per-stack settings (continuity, intra-stack concurrency, pause state) live in `<notes-root>/stacks/<name>/stack.toml` per `todos/design_stack_config.md`.
 

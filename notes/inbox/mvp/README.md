@@ -9,6 +9,7 @@ Ordered implementation plans for the next stako layer:
 5. `04_routines.md` - batch prompt/routine expansion.
 6. `05_admin_thread.md` - conventional stack admin thread and self-feeding loops.
 7. `06_api_cli_html.md` - client surfaces for commits, threads, and routines.
+8. `07_minimal_stack_elements.md` - minimal authored element, prompt, command, routine, and thread shape.
 
 The order matters. Commit outputs give later items something stable to inspect.
 Prompt input materialization makes ingestion explicit. Threads then become
@@ -24,5 +25,5 @@ Global constraints:
 - All automated writes go through `StackClient`/`Stack` mutation methods.
 - Preserve existing HTTP response bodies for existing endpoints.
 - Preserve auth/policy checks, VCS/audit behavior, and adapter event output.
-- Runtime state under `state/runtime/` remains untracked and rebuildable.
+- Live runtime state is in-memory only; surviving `running` items at restart are swept to `failed/daemon_restart_orphan`.
 - Do not auto-commit arbitrary external workdir changes.

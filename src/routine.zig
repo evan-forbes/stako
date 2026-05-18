@@ -24,24 +24,13 @@ pub const Diagnostic = struct {
     field: []const u8 = "",
 };
 
-pub const Target = struct {
-    provider: ?[]const u8 = null,
-    model: ?[]const u8 = null,
-    match: ?item_mod.Match = null,
-    workdir: ?[]const u8 = null,
-};
-
 pub const Step = struct {
     name: []const u8,
     slug: []const u8,
     kind: item_mod.Kind,
-    prompt: ?[]const u8 = null,
-    prompt_file: ?[]const u8 = null,
-    after: []const []const u8 = &.{},
-    inputs_from: []const []const u8 = &.{},
+    prompts: ?[]const []const u8 = null,
+    command: ?item_mod.Command = null,
     thread: ?[]const u8 = null,
-    thread_mode: ?item_mod.ThreadMode = null,
-    target: Target = .{},
 };
 
 pub const Routine = struct {
@@ -49,6 +38,7 @@ pub const Routine = struct {
     version: i64,
     name: []const u8,
     description: ?[]const u8 = null,
+    thread: ?[]const u8 = null,
     source_dir_abs: ?[]const u8 = null,
     steps: []const Step,
 
@@ -57,26 +47,39 @@ pub const Routine = struct {
     }
 
     pub fn topologicalOrder(self: *const Routine, allocator: std.mem.Allocator) Error![]usize {
-        return computeOrder(allocator, self.steps);
+        const order = try allocator.alloc(usize, self.steps.len);
+        for (order, 0..) |*slot, i| slot.* = i;
+        return order;
     }
 
     pub fn resolvePrompt(self: *const Routine, allocator: std.mem.Allocator, step: *const Step) Error![]u8 {
-        if (step.prompt) |p| return allocator.dupe(u8, p);
-        const rel = step.prompt_file orelse return allocator.alloc(u8, 0);
-        if (std.fs.path.isAbsolute(rel) or !item_mod.isValidInputFilePath(rel)) return error.ValidationFailed;
-        const base = self.source_dir_abs orelse ".";
-        const abs = try std.fs.path.join(allocator, &.{ base, rel });
-        defer allocator.free(abs);
-        var f = std.fs.cwd().openFile(abs, .{}) catch |e| switch (e) {
-            error.FileNotFound, error.IsDir => return error.MissingPromptFile,
-            else => return e,
-        };
-        defer f.close();
-        const stat = try f.stat();
-        const buf = try allocator.alloc(u8, stat.size);
-        errdefer allocator.free(buf);
-        const n = try f.readAll(buf);
-        return buf[0..n];
+        if (step.prompts) |prompts| return self.resolvePromptList(allocator, prompts);
+        return allocator.alloc(u8, 0);
+    }
+
+    fn resolvePromptList(self: *const Routine, allocator: std.mem.Allocator, prompts: []const []const u8) Error![]u8 {
+        if (prompts.len == 0) return error.ValidationFailed;
+        var out = std.ArrayList(u8){};
+        errdefer out.deinit(allocator);
+        const w = out.writer(allocator);
+        for (prompts, 0..) |rel, i| {
+            if (!isValidPromptPath(rel)) return error.ValidationFailed;
+            const base = self.source_dir_abs orelse ".";
+            const abs = try std.fs.path.join(allocator, &.{ base, rel });
+            defer allocator.free(abs);
+            var f = std.fs.cwd().openFile(abs, .{}) catch |e| switch (e) {
+                error.FileNotFound, error.IsDir => return error.MissingPromptFile,
+                else => return e,
+            };
+            defer f.close();
+            const stat = try f.stat();
+            const buf = try allocator.alloc(u8, stat.size);
+            defer allocator.free(buf);
+            const n = try f.readAll(buf);
+            if (i != 0) try w.writeAll("\n\n---\n\n");
+            try w.writeAll(stripTomlFrontmatter(buf[0..n]));
+        }
+        return out.toOwnedSlice(allocator);
     }
 };
 
@@ -86,38 +89,63 @@ pub const Summary = struct {
 };
 
 pub fn parseSlice(allocator: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Error!Routine {
+    return parseSliceWithDefaultName(allocator, source, null, diag);
+}
+
+pub fn parseSliceWithDefaultName(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    default_name: ?[]const u8,
+    diag: *Diagnostic,
+) Error!Routine {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const aa = arena.allocator();
 
-    const first_step = findStepHeader(source) orelse source.len;
-    var root_doc = toml.parse(allocator, source[0..first_step]) catch {
+    const first_section = findRoutineSectionHeader(source) orelse source.len;
+    var root_doc = toml.parse(allocator, source[0..first_section]) catch {
         diag.* = .{ .err = error.Toml, .message = "TOML parse failed", .field = "" };
         return error.Toml;
     };
     defer root_doc.deinit();
 
-    const version = try requireInt(&root_doc, "", "version", diag);
+    const version = if (find(&root_doc, "", "version")) |_| try requireInt(&root_doc, "", "version", diag) else 1;
     if (version != 1) {
         diag.* = .{ .err = error.UnsupportedVersion, .message = "routine version must be 1", .field = "version" };
         return error.UnsupportedVersion;
     }
-    const name = try aa.dupe(u8, try requireString(&root_doc, "", "name", diag));
+    const name_src = if (find(&root_doc, "", "name")) |e|
+        try requireValueString(e.value, "name", diag)
+    else
+        default_name orelse {
+            diag.* = .{ .err = error.MissingField, .message = "missing required field", .field = "name" };
+            return error.MissingField;
+        };
+    const name = try aa.dupe(u8, name_src);
     if (!isValidRoutineName(name)) {
         diag.* = .{ .err = error.ValidationFailed, .message = "routine name must be lowercase identifier text", .field = "name" };
         return error.ValidationFailed;
     }
     const description = if (find(&root_doc, "", "description")) |e| try aa.dupe(u8, try requireValueString(e.value, "description", diag)) else null;
+    const root_thread = if (find(&root_doc, "", "thread")) |e| blk: {
+        const t = try requireValueString(e.value, "thread", diag);
+        if (!stack_thread.isValidName(t)) {
+            diag.* = .{ .err = error.ValidationFailed, .message = "invalid thread name", .field = "thread" };
+            return error.ValidationFailed;
+        }
+        break :blk try aa.dupe(u8, t);
+    } else null;
 
     var steps = std.ArrayList(Step){};
     defer steps.deinit(allocator);
-    var pos = first_step;
+    var pos = first_section;
     while (pos < source.len) {
-        const header = findStepHeader(source[pos..]) orelse break;
-        const content_start = pos + header + stepHeaderLen(source[pos + header ..]);
-        const next_rel = findStepHeader(source[content_start..]) orelse source.len - content_start;
+        const header = findRoutineSectionHeader(source[pos..]) orelse break;
+        const header_abs = pos + header;
+        const content_start = header_abs + sectionHeaderLen(source[header_abs..]);
+        const next_rel = findRoutineSectionHeader(source[content_start..]) orelse source.len - content_start;
         const content = source[content_start .. content_start + next_rel];
-        try steps.append(allocator, try parseStep(allocator, aa, content, diag));
+        try steps.append(allocator, try parseStep(allocator, aa, content, steps.items.len, root_thread, diag));
         pos = content_start + next_rel;
     }
     if (steps.items.len == 0) {
@@ -134,6 +162,7 @@ pub fn parseSlice(allocator: std.mem.Allocator, source: []const u8, diag: *Diagn
         .version = version,
         .name = name,
         .description = description,
+        .thread = root_thread,
         .steps = owned_steps,
     };
 }
@@ -148,7 +177,9 @@ pub fn parseFile(allocator: std.mem.Allocator, path_abs: []const u8, diag: *Diag
     const src = try allocator.alloc(u8, stat.size);
     defer allocator.free(src);
     const n = try f.readAll(src);
-    var r = try parseSlice(allocator, src[0..n], diag);
+    const base = std.fs.path.basename(path_abs);
+    const default_name = if (std.mem.endsWith(u8, base, ".toml")) base[0 .. base.len - ".toml".len] else base;
+    var r = try parseSliceWithDefaultName(allocator, src[0..n], default_name, diag);
     errdefer r.deinit();
     const dir = std.fs.path.dirname(path_abs) orelse ".";
     r.source_dir_abs = try r.arena.allocator().dupe(u8, dir);
@@ -165,117 +196,90 @@ pub fn write(routine: *const Routine, w: anytype) !void {
         try toml.writeString(w, d);
         try w.writeByte('\n');
     }
+    if (routine.thread) |t| {
+        try w.writeAll("thread = ");
+        try toml.writeString(w, t);
+        try w.writeByte('\n');
+    }
     for (routine.steps) |step| {
         try w.writeAll("\n[[step]]\n");
-        try w.writeAll("name = ");
-        try toml.writeString(w, step.name);
-        try w.writeAll("\nslug = ");
-        try toml.writeString(w, step.slug);
-        try w.writeAll("\nkind = ");
-        try toml.writeString(w, step.kind.toString());
-        try w.writeByte('\n');
-        if (step.prompt) |p| {
-            try w.writeAll("prompt = ");
-            try toml.writeString(w, p);
-            try w.writeByte('\n');
-        }
-        if (step.prompt_file) |p| {
-            try w.writeAll("prompt_file = ");
-            try toml.writeString(w, p);
-            try w.writeByte('\n');
-        }
-        if (step.after.len > 0) try writeStringArrayField(w, "after", step.after);
-        if (step.inputs_from.len > 0) try writeStringArrayField(w, "inputs_from", step.inputs_from);
         if (step.thread) |t| {
-            try w.writeAll("thread = ");
-            try toml.writeString(w, t);
-            try w.writeByte('\n');
+            if (routine.thread == null or !std.mem.eql(u8, routine.thread.?, t)) {
+                try w.writeAll("thread = ");
+                try toml.writeString(w, t);
+                try w.writeByte('\n');
+            }
         }
-        if (step.thread_mode) |m| {
-            try w.writeAll("thread_mode = ");
-            try toml.writeString(w, m.toString());
+        if (step.prompts) |p| try writeStringArrayField(w, "prompts", p);
+        if (step.command) |c| {
+            try w.writeAll("command = ");
+            try toml.writeString(w, c.toString());
             try w.writeByte('\n');
-        }
-        if (targetHasAnyField(step.target)) {
-            try w.writeAll("\n[step.target]\n");
-            if (step.target.provider) |s| {
-                try w.writeAll("provider = ");
-                try toml.writeString(w, s);
-                try w.writeByte('\n');
-            }
-            if (step.target.model) |s| {
-                try w.writeAll("model = ");
-                try toml.writeString(w, s);
-                try w.writeByte('\n');
-            }
-            if (step.target.match) |m| {
-                try w.writeAll("match = ");
-                try toml.writeString(w, m.toString());
-                try w.writeByte('\n');
-            }
-            if (step.target.workdir) |s| {
-                try w.writeAll("workdir = ");
-                try toml.writeString(w, s);
-                try w.writeByte('\n');
-            }
         }
     }
 }
 
-fn parseStep(allocator: std.mem.Allocator, arena: std.mem.Allocator, source: []const u8, diag: *Diagnostic) Error!Step {
+fn parseStep(
+    allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    source: []const u8,
+    index: usize,
+    default_thread: ?[]const u8,
+    diag: *Diagnostic,
+) Error!Step {
     var doc = toml.parse(allocator, source) catch {
         diag.* = .{ .err = error.Toml, .message = "step TOML parse failed", .field = "step" };
         return error.Toml;
     };
     defer doc.deinit();
 
-    const name = try arena.dupe(u8, try requireString(&doc, "", "name", diag));
-    const slug = try arena.dupe(u8, try requireString(&doc, "", "slug", diag));
-    const kind_s = try requireString(&doc, "", "kind", diag);
-    const kind = item_mod.Kind.fromString(kind_s) orelse {
-        diag.* = .{ .err = error.ValidationFailed, .message = "unknown step kind", .field = "step.kind" };
-        return error.ValidationFailed;
-    };
-    const prompt = if (find(&doc, "", "prompt")) |e| try arena.dupe(u8, try requireValueString(e.value, "step.prompt", diag)) else null;
-    const prompt_file = if (find(&doc, "", "prompt_file")) |e| try arena.dupe(u8, try requireValueString(e.value, "step.prompt_file", diag)) else null;
-    if ((prompt == null) == (prompt_file == null)) {
-        diag.* = .{ .err = error.ValidationFailed, .message = "step requires exactly one of prompt or prompt_file", .field = "step.prompt" };
-        return error.ValidationFailed;
+    for (doc.entries.items) |e| {
+        const known_top_level = std.mem.eql(u8, e.table, "") and
+            (std.mem.eql(u8, e.key, "thread") or
+                std.mem.eql(u8, e.key, "prompts") or
+                std.mem.eql(u8, e.key, "command"));
+        if (!known_top_level) {
+            diag.* = .{ .err = error.ValidationFailed, .message = "unknown routine step field", .field = e.key };
+            return error.ValidationFailed;
+        }
     }
-    const after = if (find(&doc, "", "after")) |e| try dupeStringArray(arena, try requireValueStringArray(e.value, "step.after", diag)) else &.{};
-    const inputs_from = if (find(&doc, "", "inputs_from")) |e| try dupeStringArray(arena, try requireValueStringArray(e.value, "step.inputs_from", diag)) else &.{};
-    const thread = if (find(&doc, "", "thread")) |e| try arena.dupe(u8, try requireValueString(e.value, "step.thread", diag)) else null;
-    const thread_mode = if (find(&doc, "", "thread_mode")) |e| blk: {
-        const s = try requireValueString(e.value, "step.thread_mode", diag);
-        break :blk item_mod.ThreadMode.fromString(s) orelse {
-            diag.* = .{ .err = error.ValidationFailed, .message = "unknown thread_mode", .field = "step.thread_mode" };
+
+    const prompts = if (find(&doc, "", "prompts")) |e| try dupeStringArray(arena, try requireValueStringArray(e.value, "step.prompts", diag)) else null;
+    const command = if (find(&doc, "", "command")) |e| blk: {
+        const raw = try requireValueString(e.value, "step.command", diag);
+        const s = if (std.mem.startsWith(u8, raw, "/")) raw[1..] else raw;
+        break :blk item_mod.Command.fromString(s) orelse {
+            diag.* = .{ .err = error.ValidationFailed, .message = "unknown command", .field = "step.command" };
             return error.ValidationFailed;
         };
     } else null;
-
-    var target: Target = .{};
-    if (findAnyTarget(&doc, "provider")) |e| target.provider = try arena.dupe(u8, try requireValueString(e.value, "step.target.provider", diag));
-    if (findAnyTarget(&doc, "model")) |e| target.model = try arena.dupe(u8, try requireValueString(e.value, "step.target.model", diag));
-    if (findAnyTarget(&doc, "match")) |e| {
-        const s = try requireValueString(e.value, "step.target.match", diag);
-        target.match = item_mod.Match.fromString(s) orelse {
-            diag.* = .{ .err = error.ValidationFailed, .message = "unknown target match", .field = "step.target.match" };
-            return error.ValidationFailed;
-        };
+    if (command != null and prompts != null) {
+        diag.* = .{ .err = error.ValidationFailed, .message = "command step cannot also declare prompts", .field = "step.command" };
+        return error.ValidationFailed;
     }
-    if (findAnyTarget(&doc, "workdir")) |e| target.workdir = try arena.dupe(u8, try requireValueString(e.value, "step.target.workdir", diag));
+    if (command == null and prompts == null) {
+        diag.* = .{ .err = error.ValidationFailed, .message = "prompt step requires prompts", .field = "step.prompts" };
+        return error.ValidationFailed;
+    }
+    const kind = if (command) |c| c.toKind() else item_mod.Kind.prompt;
+    const slug = try deriveElementSlug(arena, prompts, command, index);
+    const name = try arena.dupe(u8, slug);
+    const thread = if (find(&doc, "", "thread")) |e| blk: {
+        const t = try requireValueString(e.value, "step.thread", diag);
+        break :blk try arena.dupe(u8, t);
+    } else if (default_thread) |t| try arena.dupe(u8, t) else null;
+    if (thread == null) {
+        diag.* = .{ .err = error.MissingField, .message = "routine step requires a root or step thread", .field = "step.thread" };
+        return error.MissingField;
+    }
 
     return .{
         .name = name,
         .slug = slug,
         .kind = kind,
-        .prompt = prompt,
-        .prompt_file = prompt_file,
-        .after = after,
-        .inputs_from = inputs_from,
+        .prompts = prompts,
+        .command = command,
         .thread = thread,
-        .thread_mode = thread_mode,
-        .target = target,
     };
 }
 
@@ -289,22 +293,31 @@ fn validateSteps(allocator: std.mem.Allocator, steps: []const Step, diag: *Diagn
             diag.* = .{ .err = error.ValidationFailed, .message = "invalid step slug", .field = "step.slug" };
             return error.ValidationFailed;
         }
+        if (step.prompts) |prompts| {
+            if (prompts.len == 0) {
+                diag.* = .{ .err = error.ValidationFailed, .message = "prompts must be non-empty", .field = "step.prompts" };
+                return error.ValidationFailed;
+            }
+            for (prompts) |path| {
+                if (!isValidPromptPath(path)) {
+                    diag.* = .{ .err = error.ValidationFailed, .message = "invalid prompt path", .field = "step.prompts" };
+                    return error.ValidationFailed;
+                }
+            }
+        }
         if (step.thread) |t| {
             if (!stack_thread.isValidName(t)) {
                 diag.* = .{ .err = error.ValidationFailed, .message = "invalid thread name", .field = "step.thread" };
                 return error.ValidationFailed;
             }
-        } else if (step.thread_mode != null) {
-            diag.* = .{ .err = error.ValidationFailed, .message = "thread_mode requires thread", .field = "step.thread_mode" };
+        } else {
+            diag.* = .{ .err = error.MissingField, .message = "routine step requires a root or step thread", .field = "step.thread" };
+            return error.MissingField;
+        }
+        if (step.command == null and step.prompts == null) {
+            diag.* = .{ .err = error.ValidationFailed, .message = "prompt step requires prompts", .field = "step.prompts" };
             return error.ValidationFailed;
         }
-        if (step.thread_mode) |mode| switch (mode) {
-            .fresh, .@"resume" => {},
-            .@"continue", .fork => {
-                diag.* = .{ .err = error.ValidationFailed, .message = "routine thread_mode must be fresh or resume", .field = "step.thread_mode" };
-                return error.ValidationFailed;
-            },
-        };
         for (steps[0..i]) |prev| {
             if (std.mem.eql(u8, prev.name, step.name)) {
                 diag.* = .{ .err = error.DuplicateStep, .message = "duplicate step name", .field = "step.name" };
@@ -312,70 +325,10 @@ fn validateSteps(allocator: std.mem.Allocator, steps: []const Step, diag: *Diagn
             }
         }
     }
-    const order = computeOrder(allocator, steps) catch |e| {
-        diag.* = .{ .err = e, .message = switch (e) {
-            error.MissingStepReference => "step reference does not exist",
-            error.Cycle => "routine step graph contains a cycle",
-            else => "invalid routine step graph",
-        }, .field = "step.after" };
-        return e;
-    };
-    allocator.free(order);
+    _ = allocator;
 }
 
-fn computeOrder(allocator: std.mem.Allocator, steps: []const Step) Error![]usize {
-    const n = steps.len;
-    var indegree = try allocator.alloc(usize, n);
-    defer allocator.free(indegree);
-    @memset(indegree, 0);
-    var edges = try allocator.alloc(std.ArrayList(usize), n);
-    defer {
-        for (edges) |*e| e.deinit(allocator);
-        allocator.free(edges);
-    }
-    for (edges) |*e| e.* = .{};
-
-    for (steps, 0..) |step, i| {
-        for (step.after) |dep| {
-            const j = findStepIndex(steps, dep) orelse return error.MissingStepReference;
-            try edges[j].append(allocator, i);
-            indegree[i] += 1;
-        }
-        for (step.inputs_from) |dep| {
-            const j = findStepIndex(steps, dep) orelse return error.MissingStepReference;
-            try edges[j].append(allocator, i);
-            indegree[i] += 1;
-        }
-    }
-
-    var out = std.ArrayList(usize){};
-    errdefer out.deinit(allocator);
-    while (out.items.len < n) {
-        var picked: ?usize = null;
-        for (steps, 0..) |_, i| {
-            if (indegree[i] == 0 and !containsIndex(out.items, i)) {
-                picked = i;
-                break;
-            }
-        }
-        const idx = picked orelse return error.Cycle;
-        try out.append(allocator, idx);
-        for (edges[idx].items) |to| indegree[to] -= 1;
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn findStepIndex(steps: []const Step, name: []const u8) ?usize {
-    for (steps, 0..) |s, i| if (std.mem.eql(u8, s.name, name)) return i;
-    return null;
-}
-
-fn containsIndex(items: []const usize, needle: usize) bool {
-    for (items) |v| if (v == needle) return true;
-    return false;
-}
-
-fn findStepHeader(source: []const u8) ?usize {
+fn findRoutineSectionHeader(source: []const u8) ?usize {
     var line_start: usize = 0;
     while (line_start <= source.len) {
         var line_end = line_start;
@@ -388,26 +341,43 @@ fn findStepHeader(source: []const u8) ?usize {
     return null;
 }
 
-fn stepHeaderLen(source: []const u8) usize {
+fn sectionHeaderLen(source: []const u8) usize {
     var i: usize = 0;
     while (i < source.len and source[i] != '\n') : (i += 1) {}
     return if (i < source.len) i + 1 else i;
 }
 
+fn deriveElementSlug(arena: std.mem.Allocator, prompts: ?[]const []const u8, command: ?item_mod.Command, index: usize) ![]const u8 {
+    if (command) |c| return arena.dupe(u8, c.toString());
+    const path = if (prompts) |ps| ps[0] else return std.fmt.allocPrint(arena, "element-{d}", .{index + 1});
+    const base = std.fs.path.basename(path);
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse base.len;
+    const stem = base[0..dot];
+    if (item_mod.isValidSlug(stem)) return arena.dupe(u8, stem);
+    return std.fmt.allocPrint(arena, "element-{d}", .{index + 1});
+}
+
+fn stripTomlFrontmatter(content: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, content, "+++\n") and !std.mem.startsWith(u8, content, "+++\r\n")) return content;
+    const first_end: usize = if (std.mem.startsWith(u8, content, "+++\r\n")) 5 else 4;
+    var pos = first_end;
+    while (pos <= content.len) {
+        const line_start = pos;
+        var line_end = line_start;
+        while (line_end < content.len and content[line_end] != '\n') : (line_end += 1) {}
+        const line = std.mem.trim(u8, content[line_start..line_end], " \t\r");
+        if (std.mem.eql(u8, line, "+++")) {
+            const after = if (line_end < content.len) line_end + 1 else line_end;
+            return content[after..];
+        }
+        if (line_end == content.len) break;
+        pos = line_end + 1;
+    }
+    return content;
+}
+
 fn find(doc: *const toml.Document, table: []const u8, key: []const u8) ?*const toml.Entry {
     return doc.find(table, key);
-}
-
-fn findAnyTarget(doc: *const toml.Document, key: []const u8) ?*const toml.Entry {
-    return doc.find("step.target", key) orelse doc.find("target", key);
-}
-
-fn requireString(doc: *const toml.Document, table: []const u8, key: []const u8, diag: *Diagnostic) Error![]const u8 {
-    const e = find(doc, table, key) orelse {
-        diag.* = .{ .err = error.MissingField, .message = "missing required field", .field = key };
-        return error.MissingField;
-    };
-    return requireValueString(e.value, key, diag);
 }
 
 fn requireInt(doc: *const toml.Document, table: []const u8, key: []const u8, diag: *Diagnostic) Error!i64 {
@@ -451,12 +421,20 @@ fn writeStringArrayField(w: anytype, key: []const u8, values: []const []const u8
     try w.writeByte('\n');
 }
 
-fn targetHasAnyField(t: Target) bool {
-    return t.provider != null or t.model != null or t.match != null or t.workdir != null;
-}
-
 fn isValidRoutineName(name: []const u8) bool {
     return isValidStepName(name);
+}
+
+fn isValidPromptPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    if (std.fs.path.isAbsolute(path)) return false;
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
+    var it = std.mem.splitAny(u8, path, "/\\");
+    while (it.next()) |part| {
+        if (part.len == 0) return false;
+        if (std.mem.eql(u8, part, ".")) return false;
+    }
+    return true;
 }
 
 fn isValidStepName(name: []const u8) bool {
@@ -475,33 +453,22 @@ test "routine parser round trip" {
         \\version = 1
         \\name = "planning"
         \\description = "Plan work."
-        \\
-        \\[[step]]
-        \\name = "research"
-        \\slug = "research"
-        \\kind = "prompt"
-        \\prompt = "Research."
         \\thread = "admin"
-        \\thread_mode = "resume"
-        \\
-        \\[step.target]
-        \\provider = "openai"
-        \\match = "compatible"
         \\
         \\[[step]]
-        \\name = "write-plan"
-        \\slug = "write-plan"
-        \\kind = "prompt"
-        \\prompt_file = "prompts/write.md"
-        \\after = ["research"]
-        \\inputs_from = ["research"]
+        \\prompts = ["../prompts/research.md"]
+        \\
+        \\[[step]]
+        \\thread = "builder"
+        \\prompts = ["../prompts/write.md"]
         \\
     , &diag);
     defer r.deinit();
     try std.testing.expectEqual(@as(usize, 2), r.steps.len);
     try std.testing.expectEqualStrings("planning", r.name);
     try std.testing.expectEqualStrings("research", r.steps[0].name);
-    try std.testing.expectEqualStrings("openai", r.steps[0].target.provider.?);
+    try std.testing.expectEqualStrings("admin", r.steps[0].thread.?);
+    try std.testing.expectEqualStrings("builder", r.steps[1].thread.?);
     const order = try r.topologicalOrder(a);
     defer a.free(order);
     try std.testing.expectEqual(@as(usize, 0), order[0]);
@@ -512,28 +479,120 @@ test "routine parser round trip" {
     var r2 = try parseSlice(a, out.items, &diag);
     defer r2.deinit();
     try std.testing.expectEqual(@as(usize, 2), r2.steps.len);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "[[step]]") != null);
 }
 
-test "routine parser rejects cycles" {
+test "routine order is source order" {
     const a = std.testing.allocator;
     var diag: Diagnostic = .{};
-    try std.testing.expectError(error.Cycle, parseSlice(a,
+    var r = try parseSlice(a,
         \\version = 1
-        \\name = "cycle"
+        \\name = "ordered"
+        \\thread = "admin"
         \\
         \\[[step]]
-        \\name = "a"
-        \\slug = "a"
-        \\kind = "prompt"
-        \\prompt = "A"
-        \\after = ["b"]
+        \\prompts = ["a.md"]
         \\
         \\[[step]]
-        \\name = "b"
-        \\slug = "b"
+        \\prompts = ["b.md"]
+        \\
+    , &diag);
+    defer r.deinit();
+    const order = try r.topologicalOrder(a);
+    defer a.free(order);
+    try std.testing.expectEqual(@as(usize, 0), order[0]);
+    try std.testing.expectEqual(@as(usize, 1), order[1]);
+}
+
+test "routine parser rejects legacy step fields" {
+    const a = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.ValidationFailed, parseSlice(a,
+        \\name = "legacy"
+        \\thread = "admin"
+        \\
+        \\[[step]]
+        \\prompts = ["a.md"]
         \\kind = "prompt"
-        \\prompt = "B"
-        \\after = ["a"]
         \\
     , &diag));
+}
+
+test "routine parser rejects missing effective thread" {
+    const a = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.MissingField, parseSlice(a,
+        \\name = "missing-thread"
+        \\
+        \\[[step]]
+        \\prompts = ["a.md"]
+        \\
+    , &diag));
+}
+
+test "routine parser accepts slash command spelling" {
+    const a = std.testing.allocator;
+    var diag: Diagnostic = .{};
+    var r = try parseSlice(a,
+        \\name = "compact-only"
+        \\thread = "admin"
+        \\
+        \\[[step]]
+        \\command = "/compact"
+        \\
+    , &diag);
+    defer r.deinit();
+    try std.testing.expectEqual(item_mod.Command.compact, r.steps[0].command.?);
+}
+
+test "routine parser accepts minimal steps and resolves prompt paths" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("routines");
+    try tmp.dir.makePath("prompts/admin-review");
+    {
+        var f = try tmp.dir.createFile("prompts/admin-review/evaluate.md", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\+++
+            \\title = "evaluate"
+            \\+++
+            \\Evaluate.
+        );
+    }
+    {
+        var f = try tmp.dir.createFile("routines/admin-review.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\thread = "admin"
+            \\
+            \\[[step]]
+            \\prompts = ["../prompts/admin-review/evaluate.md"]
+            \\
+        );
+    }
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+    const routine_path = try std.fs.path.join(a, &.{ root, "routines", "admin-review.toml" });
+    defer a.free(routine_path);
+    var diag: Diagnostic = .{};
+    var r = try parseFile(a, routine_path, &diag);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(i64, 1), r.version);
+    try std.testing.expectEqualStrings("admin-review", r.name);
+    try std.testing.expectEqualStrings("evaluate", r.steps[0].name);
+    try std.testing.expectEqualStrings("evaluate", r.steps[0].slug);
+    try std.testing.expectEqualStrings("admin", r.steps[0].thread.?);
+    try std.testing.expectEqualStrings("../prompts/admin-review/evaluate.md", r.steps[0].prompts.?[0]);
+    const prompt = try r.resolvePrompt(a, &r.steps[0]);
+    defer a.free(prompt);
+    try std.testing.expectEqualStrings("Evaluate.", prompt);
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try write(&r, out.writer(a));
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "[[step]]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "slug") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "kind") == null);
 }

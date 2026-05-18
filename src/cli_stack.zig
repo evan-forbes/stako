@@ -658,7 +658,49 @@ fn runRoutineAppend(
 ) !u8 {
     const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/routines/{s}", .{ args.name, args.routine_name });
     defer allocator.free(path);
-    return try postAndReport(client, path, "{}", args.flags, stdout, stderr);
+    const body = try buildRoutineBody(allocator, args);
+    defer allocator.free(body);
+    return try postAndReport(client, path, body, args.flags, stdout, stderr);
+}
+
+fn buildRoutineBody(allocator: std.mem.Allocator, args: cli.StackArgs) ![]u8 {
+    if (args.input_item_count == 0 and args.input_file_count == 0 and args.input_commit_count == 0 and args.input_mode.len == 0) {
+        return try allocator.dupe(u8, "{}");
+    }
+
+    var body = std.ArrayList(u8){};
+    errdefer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{\"inputs\":{");
+    var first = true;
+    try writeOptionalJsonArray(w, "items", args.input_items[0..args.input_item_count], &first);
+    try writeOptionalJsonArray(w, "files", args.input_files[0..args.input_file_count], &first);
+    try writeOptionalJsonArray(w, "commits", args.input_commits[0..args.input_commit_count], &first);
+    if (args.input_mode.len > 0) {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.writeAll("\"mode\":\"");
+        try writeJsonStr(w, args.input_mode);
+        try w.writeAll("\"");
+    }
+    try w.writeAll("}}");
+    return try body.toOwnedSlice(allocator);
+}
+
+fn writeOptionalJsonArray(w: anytype, name: []const u8, values: []const []const u8, first: *bool) !void {
+    if (values.len == 0) return;
+    if (!first.*) try w.writeAll(",");
+    first.* = false;
+    try w.writeAll("\"");
+    try writeJsonStr(w, name);
+    try w.writeAll("\":[");
+    for (values, 0..) |value, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("\"");
+        try writeJsonStr(w, value);
+        try w.writeAll("\"");
+    }
+    try w.writeAll("]");
 }
 
 fn runTransition(

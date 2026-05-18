@@ -990,7 +990,8 @@ test "admin routine targets admin thread and ingests recent completed items" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.makePath("state");
-    try tmp.dir.makePath("routines/admin-review");
+    try tmp.dir.makePath("routines");
+    try tmp.dir.makePath("prompts/admin-review");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const abs = try tmp.dir.realpath(".", &buf);
 
@@ -999,21 +1000,16 @@ test "admin routine targets admin thread and ingests recent completed items" {
         defer f.close();
         try f.writeAll(
             \\version = 1
-            \\name = "admin-review"
             \\description = "Review recent stack results and decide what to do next."
+            \\thread = "admin"
             \\
             \\[[step]]
-            \\name = "evaluate"
-            \\slug = "admin-evaluate"
-            \\kind = "prompt"
-            \\thread = "admin"
-            \\thread_mode = "resume"
-            \\prompt_file = "admin-review/evaluate.md"
+            \\prompts = ["../prompts/admin-review/evaluate.md"]
             \\
         );
     }
     {
-        var f = try tmp.dir.createFile("routines/admin-review/evaluate.md", .{ .truncate = true });
+        var f = try tmp.dir.createFile("prompts/admin-review/evaluate.md", .{ .truncate = true });
         defer f.close();
         try f.writeAll("Evaluate the registered item commits.\n");
     }
@@ -1065,7 +1061,7 @@ test "admin routine targets admin thread and ingests recent completed items" {
         .ok => |ok_value| {
             var ok = ok_value;
             defer ok.deinit();
-            try std.testing.expect(pathListContains(ok.output.paths, "stacks/demo/0004-admin-evaluate/meta.toml"));
+            try std.testing.expect(pathListContains(ok.output.paths, "stacks/demo/0004-evaluate/meta.toml"));
         },
         .err => return error.UnexpectedMutationFailure,
     }
@@ -1077,7 +1073,7 @@ test "admin routine targets admin thread and ingests recent completed items" {
     try std.testing.expectEqualStrings("0001", admin_item.inputs.?.items.?[0]);
     try std.testing.expectEqualStrings("0002", admin_item.inputs.?.items.?[1]);
 
-    const item_dir = try std.fs.path.join(a, &.{ abs, "stacks/demo/0004-admin-evaluate" });
+    const item_dir = try std.fs.path.join(a, &.{ abs, "stacks/demo/0004-evaluate" });
     defer a.free(item_dir);
     const rendered = try @import("prompt_materializer.zig").resolvePrompt(a, abs, "demo", &admin_item, item_dir);
     defer a.free(rendered);

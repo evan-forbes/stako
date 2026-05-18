@@ -33,7 +33,6 @@ pub const codex_adapter = @import("codex_adapter.zig");
 pub const harness_dispatch = @import("harness_dispatch.zig");
 pub const transcript = @import("transcript.zig");
 pub const sse = @import("sse.zig");
-pub const runtime_file = @import("runtime_file.zig");
 pub const output_packet = @import("output_packet.zig");
 pub const prompt_materializer = @import("prompt_materializer.zig");
 pub const session_manager = @import("session_manager.zig");

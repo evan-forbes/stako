@@ -132,7 +132,7 @@ fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
     try vcs.ensureRealRepo(allocator, root);
 
     _ = vcs.commit(allocator, root, .{
-        .paths = &.{ ".gitignore", "stacks", "routines" },
+        .paths = &.{ ".gitignore", "stacks", "prompts", "routines" },
         .subject = "init: baseline",
     }) catch {};
 }
@@ -614,6 +614,59 @@ test "cli: routine list and show read routines through the live daemon" {
     try std.testing.expectEqual(@as(u8, 0), r2.code);
     try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "\"name\":\"admin-review\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "\"description\":\"Review recent stack results and decide what to do next.\"") != null);
+}
+
+test "cli: top-level new add start flow" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "routine-flow");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try makeRealRepo(a, s.abs_path);
+
+    {
+        const prompt_dir = try std.fs.path.join(a, &.{ s.abs_path, "prompts", "planning" });
+        defer a.free(prompt_dir);
+        try std.fs.cwd().makePath(prompt_dir);
+        const prompt_path = try std.fs.path.join(a, &.{ prompt_dir, "first.md" });
+        defer a.free(prompt_path);
+        var f = try std.fs.cwd().createFile(prompt_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("Plan the next step.");
+    }
+    {
+        const routine_path = try std.fs.path.join(a, &.{ s.abs_path, "routines", "planning.toml" });
+        defer a.free(routine_path);
+        var f = try std.fs.cwd().createFile(routine_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\thread = "admin"
+            \\
+            \\[[step]]
+            \\prompts = ["../prompts/planning/first.md"]
+            \\
+        );
+    }
+
+    var drv = try buildDriver(a, s.abs_path);
+    defer drv.deinit();
+    try drv.serve(4);
+    try writePortConfig(a, s.abs_path, drv.daemon.bound_port);
+
+    var r1 = try runCli(a, &.{ "new", "demo", "--root", s.abs_path });
+    defer r1.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r1.code);
+
+    var r2 = try runCli(a, &.{ "stack", "thread", "create", "demo", "admin", "--root", s.abs_path });
+    defer r2.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r2.code);
+
+    var r3 = try runCli(a, &.{ "add", "-r", "planning", "-s", "demo", "--root", s.abs_path });
+    defer r3.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r3.code);
+
+    var r4 = try runCli(a, &.{ "start", "demo", "--root", s.abs_path });
+    defer r4.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r4.code);
 }
 
 // ---------- subprocess test ----------

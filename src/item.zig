@@ -19,6 +19,7 @@ pub const Kind = enum {
     prompt,
     compact,
     clear,
+    @"new",
     sleep,
     review,
 
@@ -27,6 +28,7 @@ pub const Kind = enum {
             .{ "prompt", Kind.prompt },
             .{ "compact", Kind.compact },
             .{ "clear", Kind.clear },
+            .{ "new", Kind.@"new" },
             .{ "sleep", Kind.sleep },
             .{ "review", Kind.review },
         };
@@ -41,8 +43,38 @@ pub const Kind = enum {
             .prompt => "prompt",
             .compact => "compact",
             .clear => "clear",
+            .@"new" => "new",
             .sleep => "sleep",
             .review => "review",
+        };
+    }
+};
+
+pub const Command = enum {
+    compact,
+    clear,
+    @"new",
+
+    pub fn fromString(s: []const u8) ?Command {
+        if (std.mem.eql(u8, s, "compact")) return .compact;
+        if (std.mem.eql(u8, s, "clear")) return .clear;
+        if (std.mem.eql(u8, s, "new")) return .@"new";
+        return null;
+    }
+
+    pub fn toString(self: Command) []const u8 {
+        return switch (self) {
+            .compact => "compact",
+            .clear => "clear",
+            .@"new" => "new",
+        };
+    }
+
+    pub fn toKind(self: Command) Kind {
+        return switch (self) {
+            .compact => .compact,
+            .clear => .clear,
+            .@"new" => .@"new",
         };
     }
 };
@@ -133,6 +165,7 @@ pub const ThreadMode = enum {
 pub const ThreadRef = struct {
     name: []const u8,
     mode: ThreadMode = .fresh,
+    implicit_resume: bool = false,
 };
 
 pub const Sleep = struct {
@@ -167,6 +200,9 @@ pub const Item = struct {
 
     // Optional top-level fields.
     parents: ?[]const []const u8 = null,
+    description: ?[]const u8 = null,
+    prompts: ?[]const []const u8 = null,
+    command: ?Command = null,
     blocked_reason: ?[]const u8 = null,
     failed_reason: ?[]const u8 = null,
     canceled_by: ?[]const u8 = null,
@@ -202,10 +238,81 @@ pub const ParseError = error{
     UnknownMatch,
     UnknownInputMode,
     UnknownThreadMode,
+    UnknownCommand,
+    InvalidElement,
     InvalidSleep,
     BadType,
     OutOfMemory,
 };
+
+pub const ElementSpec = struct {
+    arena: std.heap.ArenaAllocator,
+    thread: []const u8,
+    prompts: ?[]const []const u8 = null,
+    command: ?Command = null,
+    description: ?[]const u8 = null,
+
+    pub fn deinit(self: *ElementSpec) void {
+        self.arena.deinit();
+    }
+};
+
+pub fn parseElementSpec(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    diag: *ParseDiagnostic,
+) ParseError!ElementSpec {
+    var doc = toml.parse(allocator, source) catch |e| {
+        diag.* = .{ .err = ParseError.Toml, .message = "TOML parse failed", .field = @errorName(e) };
+        return error.Toml;
+    };
+    defer doc.deinit();
+
+    var out: ElementSpec = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .thread = "",
+    };
+    errdefer out.deinit();
+    const arena = out.arena.allocator();
+
+    var have_thread = false;
+    var have_prompts = false;
+    var have_command = false;
+    for (doc.entries.items) |e| {
+        if (!std.mem.eql(u8, e.table, "")) continue;
+        if (std.mem.eql(u8, e.key, "thread")) {
+            out.thread = try arena.dupe(u8, try requireString(e.value, "thread", diag));
+            have_thread = true;
+        } else if (std.mem.eql(u8, e.key, "prompts")) {
+            const arr = try requireStringArray(e.value, "prompts", diag);
+            if (arr.len == 0) {
+                diag.* = .{ .err = ParseError.InvalidElement, .message = "prompts must be non-empty", .field = "prompts" };
+                return error.InvalidElement;
+            }
+            out.prompts = try dupeStringArray(arena, arr);
+            have_prompts = true;
+        } else if (std.mem.eql(u8, e.key, "command")) {
+            const s = try requireString(e.value, "command", diag);
+            out.command = Command.fromString(s) orelse {
+                diag.* = .{ .err = ParseError.UnknownCommand, .message = "unknown command value", .field = "command" };
+                return error.UnknownCommand;
+            };
+            have_command = true;
+        } else if (std.mem.eql(u8, e.key, "description")) {
+            out.description = try arena.dupe(u8, try requireString(e.value, "description", diag));
+        }
+    }
+    if (!have_thread) return missing(diag, "thread");
+    if (!isValidThreadName(out.thread)) {
+        diag.* = .{ .err = ParseError.InvalidElement, .message = "invalid thread name", .field = "thread" };
+        return error.InvalidElement;
+    }
+    if (have_prompts == have_command) {
+        diag.* = .{ .err = ParseError.InvalidElement, .message = "exactly one of prompts or command is required", .field = "prompts" };
+        return error.InvalidElement;
+    }
+    return out;
+}
 
 pub const ParseDiagnostic = struct {
     err: ParseError = error.Toml,
@@ -252,6 +359,7 @@ pub fn parseSlice(
     var have_status = false;
     var have_created = false;
     var have_updated = false;
+    var top_level_thread_name: ?[]const u8 = null;
 
     var target_provider: ?[]const u8 = null;
     var target_model: ?[]const u8 = null;
@@ -316,6 +424,21 @@ pub fn parseSlice(
             } else if (std.mem.eql(u8, e.key, "parents")) {
                 const arr = try requireStringArray(e.value, "parents", diag);
                 item.parents = try dupeStringArray(arena, arr);
+            } else if (std.mem.eql(u8, e.key, "description")) {
+                item.description = try arena.dupe(u8, try requireString(e.value, "description", diag));
+            } else if (std.mem.eql(u8, e.key, "thread")) {
+                top_level_thread_name = try arena.dupe(u8, try requireString(e.value, "thread", diag));
+            } else if (std.mem.eql(u8, e.key, "prompts")) {
+                const arr = try requireStringArray(e.value, "prompts", diag);
+                item.prompts = try dupeStringArray(arena, arr);
+            } else if (std.mem.eql(u8, e.key, "command")) {
+                const s = try requireString(e.value, "command", diag);
+                item.command = Command.fromString(s) orelse {
+                    diag.* = .{ .err = ParseError.UnknownCommand, .message = "unknown command value", .field = "command" };
+                    return error.UnknownCommand;
+                };
+                item.kind = item.command.?.toKind();
+                have_kind = true;
             } else if (std.mem.eql(u8, e.key, "blocked_reason")) {
                 item.blocked_reason = try arena.dupe(u8, try requireString(e.value, "blocked_reason", diag));
             } else if (std.mem.eql(u8, e.key, "failed_reason")) {
@@ -433,7 +556,17 @@ pub fn parseSlice(
             .mode = input_mode,
         };
     }
-    if (have_thread) {
+    if (top_level_thread_name) |name| {
+        if (have_thread) {
+            diag.* = .{ .err = ParseError.InvalidElement, .message = "use either top-level thread or [thread], not both", .field = "thread" };
+            return error.InvalidElement;
+        }
+        item.thread = .{
+            .name = name,
+            .mode = .fresh,
+            .implicit_resume = true,
+        };
+    } else if (have_thread) {
         if (thread_name == null) return missing(diag, "thread.name");
         item.thread = .{
             .name = thread_name.?,
@@ -537,6 +670,9 @@ pub fn write(item: *const Item, w: anytype) !void {
     if (item.parents) |p| {
         try writeKVArray(w, "parents", p);
     }
+    if (item.description) |s| try writeKV(w, "description", .{ .string = s });
+    if (item.prompts) |p| try writeKVArray(w, "prompts", p);
+    if (item.command) |c| try writeKV(w, "command", .{ .string = c.toString() });
     if (item.blocked_reason) |s| try writeKV(w, "blocked_reason", .{ .string = s });
     if (item.failed_reason) |s| try writeKV(w, "failed_reason", .{ .string = s });
     if (item.canceled_by) |s| try writeKV(w, "canceled_by", .{ .string = s });
@@ -670,6 +806,24 @@ pub fn validate(item: *const Item, diag: *ValidationDiagnostic) ValidationError!
             }
         }
     }
+    if (item.prompts) |paths| {
+        if (paths.len == 0) {
+            diag.* = .{ .err = error.InvalidInputFile, .message = "prompts must be non-empty", .field = "prompts" };
+            return error.InvalidInputFile;
+        }
+        for (paths) |path| {
+            if (!isValidInputFilePath(path)) {
+                diag.* = .{ .err = error.InvalidInputFile, .message = "prompt path must be a normalized relative path or absolute path", .field = "prompts" };
+                return error.InvalidInputFile;
+            }
+        }
+    }
+    if (item.command) |cmd| {
+        if (cmd.toKind() != item.kind) {
+            diag.* = .{ .err = error.InvalidInputFile, .message = "command must match item kind", .field = "command" };
+            return error.InvalidInputFile;
+        }
+    }
     if (item.inputs) |inp| {
         if (inp.items) |ids| {
             for (ids) |id| {
@@ -738,6 +892,7 @@ pub fn validate(item: *const Item, diag: *ValidationDiagnostic) ValidationError!
                 return error.ClearHasBody;
             }
         },
+        .@"new" => {},
     }
 
     // Workdir presence is parsed but its allowlist check is deferred to
@@ -969,6 +1124,46 @@ test "parse/write preserves optional thread table" {
     defer out.deinit(a);
     try write(&it, out.writer(a));
     try std.testing.expectEqualStrings(src, out.items);
+}
+
+test "parse minimal element spec prompt list" {
+    const a = std.testing.allocator;
+    var diag: ParseDiagnostic = .{};
+    var spec = try parseElementSpec(a,
+        \\thread = "admin"
+        \\prompts = ["prompts/context.md", "prompts/review.md"]
+        \\
+    , &diag);
+    defer spec.deinit();
+    try std.testing.expectEqualStrings("admin", spec.thread);
+    try std.testing.expectEqual(@as(usize, 2), spec.prompts.?.len);
+    try std.testing.expectEqualStrings("prompts/context.md", spec.prompts.?[0]);
+    try std.testing.expect(spec.command == null);
+}
+
+test "parse minimal element spec command" {
+    const a = std.testing.allocator;
+    var diag: ParseDiagnostic = .{};
+    var spec = try parseElementSpec(a,
+        \\thread = "admin"
+        \\command = "compact"
+        \\
+    , &diag);
+    defer spec.deinit();
+    try std.testing.expectEqual(Command.compact, spec.command.?);
+    try std.testing.expect(spec.prompts == null);
+}
+
+test "parse minimal element spec rejects prompts plus command" {
+    const a = std.testing.allocator;
+    var diag: ParseDiagnostic = .{};
+    const parsed = parseElementSpec(a,
+        \\thread = "admin"
+        \\prompts = ["a.md"]
+        \\command = "clear"
+        \\
+    , &diag);
+    try std.testing.expectError(error.InvalidElement, parsed);
 }
 
 test "omitted thread table remains absent" {

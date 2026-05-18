@@ -2,9 +2,11 @@
 //!
 //! Layout (created under `<root>/`):
 //!   - `stacks/default/stack.toml`
+//!   - `prompts/`
+//!   - `routines/`
+//!   - `AGENTS.md`              (concise guide for agents editing this root)
 //!   - `config.toml`            (gitignored)
 //!   - `state/local_token`      (gitignored, perms 0600)
-//!   - `state/runtime/`         (gitignored)
 //!   - `.gitignore`             (entries appended; existing lines preserved)
 //!
 //! Idempotency:
@@ -123,10 +125,10 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
     // 2. Directory layout.
     try ensureDir(&root_dir, "stacks", &report, r_arena);
     try ensureDir(&root_dir, "stacks/default", &report, r_arena);
+    try ensureDir(&root_dir, "prompts", &report, r_arena);
+    try ensureDir(&root_dir, "prompts/admin-review", &report, r_arena);
     try ensureDir(&root_dir, "routines", &report, r_arena);
-    try ensureDir(&root_dir, "routines/admin-review", &report, r_arena);
     try ensureDir(&root_dir, "state", &report, r_arena);
-    try ensureDir(&root_dir, "state/runtime", &report, r_arena);
 
     // 3. stacks/default/stack.toml — write defaults if absent.
     {
@@ -156,14 +158,24 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
     );
     try writeFileIfAbsent(
         &root_dir,
-        "routines/admin-review/evaluate.md",
+        "prompts/admin-review/evaluate.md",
         &report,
         r_arena,
         .{ .admin_prompt = {} },
         null,
     );
 
-    // 5. config.toml — single per-root config file, gitignored.
+    // 5. AGENTS.md — concise primer agents discover at the root.
+    try writeFileIfAbsent(
+        &root_dir,
+        "AGENTS.md",
+        &report,
+        r_arena,
+        .{ .agents_md = {} },
+        null,
+    );
+
+    // 6. config.toml — single per-root config file, gitignored.
     try writeFileIfAbsent(
         &root_dir,
         "config.toml",
@@ -173,7 +185,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
         null,
     );
 
-    // 6. state/local_token — generated once, perms 0600, gitignored.
+    // 7. state/local_token — generated once, perms 0600, gitignored.
     // Token bytes are produced lazily inside writeFileIfAbsent so we don't
     // burn kernel entropy on idempotent re-init runs.
     try writeFileIfAbsent(
@@ -185,7 +197,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
         0o600,
     );
 
-    // 7. .gitignore — append missing lines.
+    // 8. .gitignore — append missing lines.
     try appendGitignoreLines(&root_dir, &report, r_arena);
 
     return report;
@@ -316,6 +328,7 @@ const FileSpec = union(enum) {
     stack_defaults: struct { created_at: []const u8 },
     admin_routine,
     admin_prompt,
+    agents_md,
     config,
     /// Generated lazily inside `writeFileIfAbsent` to avoid wasted entropy
     /// when the file already exists.
@@ -344,6 +357,7 @@ fn writeFileIfAbsent(
         .stack_defaults => |sd| try stack_config.writeDefaults(w, sd.created_at),
         .admin_routine => try writeAdminRoutine(w),
         .admin_prompt => try writeAdminPrompt(w),
+        .agents_md => try writeAgentsMd(w),
         .config => try writeConfig(w),
         .local_token => |seed| {
             const token = try generateLocalToken(arena, seed);
@@ -396,16 +410,11 @@ fn writeAtomic(root_dir: *std.fs.Dir, rel: []const u8, content: []const u8) !voi
 fn writeAdminRoutine(w: anytype) !void {
     try w.writeAll(
         \\version = 1
-        \\name = "admin-review"
         \\description = "Review recent stack results and decide what to do next."
+        \\thread = "admin"
         \\
         \\[[step]]
-        \\name = "evaluate"
-        \\slug = "admin-evaluate"
-        \\kind = "prompt"
-        \\thread = "admin"
-        \\thread_mode = "resume"
-        \\prompt_file = "admin-review/evaluate.md"
+        \\prompts = ["../prompts/admin-review/evaluate.md"]
         \\
     );
 }
@@ -421,6 +430,66 @@ fn writeAdminPrompt(w: anytype) !void {
         \\- done
         \\
         \\Include the evidence that led to the decision and any recommended follow-up prompts. Do not modify stack metadata directly.
+        \\
+    );
+}
+
+fn writeAgentsMd(w: anytype) !void {
+    try w.writeAll(
+        \\# Agents guide
+        \\
+        \\This is a stako notes root. Stako queues prompt work onto stacks and
+        \\runs it through coding-agent harnesses.
+        \\
+        \\## Layout
+        \\
+        \\- `prompts/<name>.md` — reusable prompt text.
+        \\- `routines/<name>.toml` — ordered steps that combine prompts.
+        \\- `stacks/<stack>/` — work queues.
+        \\
+        \\## Writing prompts
+        \\
+        \\Plain markdown. Tell the agent what to read, what to do, and what
+        \\to write back. Keep prose in prompt files, not in routine TOML.
+        \\Multi-file prompts are conventional: split a long prompt into
+        \\`prompts/<routine>/intro.md`, `body.md`, etc.
+        \\
+        \\## Writing routines
+        \\
+        \\A routine is `routines/<name>.toml` with one or more `[[step]]`
+        \\blocks. Prompt paths are relative to the routine file.
+        \\
+        \\```toml
+        \\thread = "admin"
+        \\
+        \\[[step]]
+        \\prompts = ["../prompts/planning/intro.md", "../prompts/planning/body.md"]
+        \\
+        \\[[step]]
+        \\command = "compact"
+        \\
+        \\[[step]]
+        \\thread = "builder"
+        \\prompts = ["../prompts/planning/build.md"]
+        \\```
+        \\
+        \\- `prompts = [...]` concatenates those files into one prompt item.
+        \\- Set root `thread = "..."` for the default; override per-step when needed.
+        \\- Use `command = "compact"` for compact steps.
+        \\
+        \\## Running stako
+        \\
+        \\```sh
+        \\stako daemon start                 # serve the loopback API
+        \\stako new <stack>                  # create a stack
+        \\stako add <routine> <stack>        # append a routine to it
+        \\stako start <stack>                # resume execution
+        \\stako stack show <stack>           # inspect items + status
+        \\stako routine list                 # list available routines
+        \\```
+        \\
+        \\Do not edit stack item metadata by hand — go through `stako add` /
+        \\`stako start` so the daemon stays consistent.
         \\
     );
 }

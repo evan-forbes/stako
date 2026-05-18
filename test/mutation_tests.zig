@@ -63,7 +63,7 @@ fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
     try vcs.ensureRealRepo(allocator, root);
 
     // Stage and commit the init layout so the working tree is clean.
-    const paths = [_][]const u8{ ".gitignore", "stacks", "routines" };
+    const paths = [_][]const u8{ ".gitignore", "AGENTS.md", "stacks", "prompts", "routines" };
     _ = vcs.commit(allocator, root, .{
         .paths = &paths,
         .subject = "init: baseline",
@@ -737,6 +737,9 @@ test "mutation: append routine writes ordinary items in one commit and one wake"
     const routines_dir = try std.fs.path.join(a, &.{ s.abs_path, "routines" });
     defer a.free(routines_dir);
     try std.fs.cwd().makePath(routines_dir);
+    const prompt_dir = try std.fs.path.join(a, &.{ s.abs_path, "prompts", "planning" });
+    defer a.free(prompt_dir);
+    try std.fs.cwd().makePath(prompt_dir);
     {
         const routine_path = try std.fs.path.join(a, &.{ s.abs_path, "routines", "planning.toml" });
         defer a.free(routine_path);
@@ -744,30 +747,30 @@ test "mutation: append routine writes ordinary items in one commit and one wake"
         defer f.close();
         try f.writeAll(
             \\version = 1
-            \\name = "planning"
             \\description = "Plan work."
+            \\thread = "admin"
             \\
             \\[[step]]
-            \\name = "research"
-            \\slug = "research"
-            \\kind = "prompt"
-            \\prompt = "Research the task."
-            \\
-            \\[step.target]
-            \\match = "any"
+            \\prompts = ["../prompts/planning/research.md"]
             \\
             \\[[step]]
-            \\name = "write-plan"
-            \\slug = "write-plan"
-            \\kind = "prompt"
-            \\prompt = "Write the plan."
-            \\after = ["research"]
-            \\inputs_from = ["research"]
-            \\
-            \\[step.target]
-            \\match = "any"
+            \\prompts = ["../prompts/planning/write-plan.md"]
             \\
         );
+    }
+    {
+        const prompt_path = try std.fs.path.join(a, &.{ s.abs_path, "prompts", "planning", "research.md" });
+        defer a.free(prompt_path);
+        var f = try std.fs.cwd().createFile(prompt_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("Research the task.");
+    }
+    {
+        const prompt_path = try std.fs.path.join(a, &.{ s.abs_path, "prompts", "planning", "write-plan.md" });
+        defer a.free(prompt_path);
+        var f = try std.fs.cwd().createFile(prompt_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("Write the plan.");
     }
 
     var audit_writer = try audit_mod.Writer.init(a, s.abs_path);
@@ -777,6 +780,18 @@ test "mutation: append routine writes ordinary items in one commit and one wake"
     var wakes = WakeCounter{};
     registry.setPostCommitHook(&wakes, countWake);
     const client = registry.localClient("local", "/internal/routine-test");
+    switch (client.ensureThread("default", .{
+        .stack = "default",
+        .name = "admin",
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            ok.deinit();
+        },
+        .err => return error.UnexpectedCreateThreadFailure,
+    }
+    wakes.count = 0;
 
     const routines = try client.listRoutines();
     defer client.freeRoutineList(routines);
@@ -794,13 +809,16 @@ test "mutation: append routine writes ordinary items in one commit and one wake"
     const before_items = try client.listItems("default");
     defer client.freeItemList(before_items);
 
-    var result = client.appendRoutine("default", .{
+    const result = client.appendRoutine("default", .{
         .stack = "default",
         .routine = &routine,
         .created_at_override = "2026-05-17T12:00:00.000Z",
     });
     switch (result) {
-        .ok => |*ok| ok.deinit(),
+        .ok => |ok_value| {
+            var ok = ok_value;
+            ok.deinit();
+        },
         .err => |e| {
             std.debug.print("appendRoutine failed: {any}\n", .{e});
             return error.UnexpectedAppendRoutineFailure;
@@ -821,8 +839,8 @@ test "mutation: append routine writes ordinary items in one commit and one wake"
     defer item2.deinit();
     try std.testing.expectEqualStrings("research", item1.slug);
     try std.testing.expectEqualStrings("write-plan", item2.slug);
-    try std.testing.expectEqualStrings(item1.id, item2.parents.?[0]);
-    try std.testing.expectEqualStrings(item1.id, item2.inputs.?.items.?[0]);
+    try std.testing.expect(item2.parents == null);
+    try std.testing.expect(item2.inputs == null);
 
     const log_path = try std.fs.path.join(a, &.{ s.abs_path, "state", "audit.log" });
     defer a.free(log_path);
@@ -848,16 +866,10 @@ test "mutation: append routine validation failure leaves stack unchanged" {
         defer f.close();
         try f.writeAll(
             \\version = 1
-            \\name = "missing-prompt"
+            \\thread = "admin"
             \\
             \\[[step]]
-            \\name = "first"
-            \\slug = "first"
-            \\kind = "prompt"
-            \\prompt_file = "prompts/nope.md"
-            \\
-            \\[step.target]
-            \\match = "any"
+            \\prompts = ["../prompts/nope.md"]
             \\
         );
     }
@@ -869,6 +881,18 @@ test "mutation: append routine validation failure leaves stack unchanged" {
     var wakes = WakeCounter{};
     registry.setPostCommitHook(&wakes, countWake);
     const client = registry.localClient("local", "/internal/routine-test");
+    switch (client.ensureThread("default", .{
+        .stack = "default",
+        .name = "admin",
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            ok.deinit();
+        },
+        .err => return error.UnexpectedCreateThreadFailure,
+    }
+    wakes.count = 0;
 
     var routine = try client.readRoutine("missing-prompt");
     defer routine.deinit();
@@ -877,9 +901,10 @@ test "mutation: append routine validation failure leaves stack unchanged" {
     const before_items = try client.listItems("default");
     defer client.freeItemList(before_items);
 
-    var result = client.appendRoutine("default", .{ .stack = "default", .routine = &routine });
+    const result = client.appendRoutine("default", .{ .stack = "default", .routine = &routine });
     switch (result) {
-        .ok => |*ok| {
+        .ok => |ok_value| {
+            var ok = ok_value;
             ok.deinit();
             return error.ExpectedAppendRoutineFailure;
         },
@@ -903,6 +928,9 @@ test "mutation: append routine item validation failure writes nothing" {
     const routines_dir = try std.fs.path.join(a, &.{ s.abs_path, "routines" });
     defer a.free(routines_dir);
     try std.fs.cwd().makePath(routines_dir);
+    const invalid_prompt_dir = try std.fs.path.join(a, &.{ s.abs_path, "prompts", "invalid-expanded-item" });
+    defer a.free(invalid_prompt_dir);
+    try std.fs.cwd().makePath(invalid_prompt_dir);
     {
         const routine_path = try std.fs.path.join(a, &.{ s.abs_path, "routines", "invalid-expanded-item.toml" });
         defer a.free(routine_path);
@@ -910,28 +938,22 @@ test "mutation: append routine item validation failure writes nothing" {
         defer f.close();
         try f.writeAll(
             \\version = 1
-            \\name = "invalid-expanded-item"
+            \\thread = "admin"
             \\
             \\[[step]]
-            \\name = "research"
-            \\slug = "research"
-            \\kind = "prompt"
-            \\prompt = "Research the task."
-            \\
-            \\[step.target]
-            \\match = "any"
+            \\prompts = ["../prompts/invalid-expanded-item/research.md"]
             \\
             \\[[step]]
-            \\name = "compact"
-            \\slug = "compact"
-            \\kind = "compact"
-            \\prompt = "Compact context."
-            \\after = ["research"]
-            \\
-            \\[step.target]
-            \\match = "any"
+            \\command = "compact"
             \\
         );
+    }
+    {
+        const prompt_path = try std.fs.path.join(a, &.{ s.abs_path, "prompts", "invalid-expanded-item", "research.md" });
+        defer a.free(prompt_path);
+        var f = try std.fs.cwd().createFile(prompt_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("Research the task.");
     }
 
     var audit_writer = try audit_mod.Writer.init(a, s.abs_path);
@@ -941,15 +963,28 @@ test "mutation: append routine item validation failure writes nothing" {
     var wakes = WakeCounter{};
     registry.setPostCommitHook(&wakes, countWake);
     const client = registry.localClient("local", "/internal/routine-test");
+    switch (client.ensureThread("default", .{
+        .stack = "default",
+        .name = "admin",
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            ok.deinit();
+        },
+        .err => return error.UnexpectedCreateThreadFailure,
+    }
+    wakes.count = 0;
 
     var routine = try client.readRoutine("invalid-expanded-item");
     defer routine.deinit();
     const baseline_commits = try countCommits(a, s.abs_path);
     const baseline_audit = try auditLineCount(a, s.abs_path);
 
-    var result = client.appendRoutine("default", .{ .stack = "default", .routine = &routine });
+    const result = client.appendRoutine("default", .{ .stack = "default", .routine = &routine });
     switch (result) {
-        .ok => |*ok| {
+        .ok => |ok_value| {
+            var ok = ok_value;
             ok.deinit();
             return error.ExpectedAppendRoutineFailure;
         },

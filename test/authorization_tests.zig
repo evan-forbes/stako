@@ -501,7 +501,7 @@ fn makeRealRepo(allocator: std.mem.Allocator, root: []const u8) !void {
     defer allocator.free(git_path);
     std.fs.cwd().deleteTree(git_path) catch {};
     try vcs.ensureRealRepo(allocator, root);
-    const paths = [_][]const u8{ ".gitignore", "stacks", "routines" };
+    const paths = [_][]const u8{ ".gitignore", "stacks", "prompts", "routines" };
     _ = vcs.commit(allocator, root, .{ .paths = &paths, .subject = "init: baseline" }) catch {};
 }
 

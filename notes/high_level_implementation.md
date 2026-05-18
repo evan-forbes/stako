@@ -5,7 +5,7 @@ This document covers *how* the daemon, web view, CLI, provider dispatch, and loc
 ## Build Order
 
 1. Stack item file format (per-item directory, `meta.toml` schema).
-2. On-disk layout + `stako init` (defaults to `~/stako`, creates one `stacks/` directory and `.stako/` under the notes root).
+2. On-disk layout + `stako init` (defaults to `~/stako`, creates `stacks/`, `config.toml`, and `state/` under the notes root).
 3. Daemon skeleton: start/stop, loopback HTTP server, local bearer token, read/list/show endpoints.
 4. CLI client wrapping those read endpoints, with short aliases and short flags for common inspection/debugging commands.
 5. Mutation endpoints: append, insert, retry, cancel, supersede, pause, resume, stack config — wired to the single-writer queue and version-control commits.
@@ -68,7 +68,7 @@ Single-process for v1. No external database. Filesystem is the source of truth; 
 - Sibling files for transcripts, follow-ups, attachments.
 - A per-stack `index.toml` may be added later if scanning the directory becomes too slow; not v1.
 
-All v1 stacks live under the single `<notes-root>/stacks/` directory. There are no separate project/global stack roots yet. Stack directories live under the notes repository so they version-control with everything else. Daemon state (config, credentials, runtime files, PID, log) lives in a sibling `<notes-root>/.stako/` that is gitignored except for `config.toml`.
+All v1 stacks live under the single `<notes-root>/stacks/` directory. There are no separate project/global stack roots yet. Stack directories live under the notes repository so they version-control with everything else. Daemon state (local token, audit log, PID, log) lives under `<notes-root>/state/` and is gitignored. The single `<notes-root>/config.toml` is also gitignored.
 
 ## HTTP API Shape (Initial)
 
@@ -170,7 +170,7 @@ The daemon commits stack mutations and terminal harness artifacts:
 - One harness completion → one commit containing the final tracked item metadata and transcript.
 - Commit messages are generated from the action and item identifiers.
 
-Live runtime state is daemon state under `.stako/runtime/`, not tracked stack metadata. Hand-edits to stack files outside the daemon should still produce commits via the standard editor flow; the daemon does not need to detect them. The daemon does not auto-commit arbitrary harness workdir changes in v1. Workdir commits require an explicit later design because the daemon cannot safely infer ownership of external project changes.
+Live runtime state is in-memory only; on restart the daemon scans `stacks/` and transitions any item still in `running` to `failed/daemon_restart_orphan` (no live session is attached). Hand-edits to stack files outside the daemon should still produce commits via the standard editor flow; the daemon does not need to detect them. The daemon does not auto-commit arbitrary harness workdir changes in v1. Workdir commits require an explicit later design because the daemon cannot safely infer ownership of external project changes.
 
 ## Testing Strategy
 

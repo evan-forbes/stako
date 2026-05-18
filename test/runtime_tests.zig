@@ -13,7 +13,6 @@ const daemon_mod = stako.daemon;
 const audit_mod = stako.audit;
 const sse_mod = stako.sse;
 const session_manager = stako.session_manager;
-const runtime_file = stako.runtime_file;
 const runtime_mod = stako.runtime;
 const events = stako.events;
 const adapter_mod = stako.adapter;
@@ -387,14 +386,6 @@ test "runtime: end-to-end fake run produces transcript and completes item" {
     const output_dir = try std.fs.path.join(a, &.{ item_dir, "output" });
     defer a.free(output_dir);
     try std.testing.expectError(error.FileNotFound, std.fs.cwd().access(output_dir, .{}));
-
-    // Runtime file was deleted.
-    const rp = try runtime_file.read(a, s.abs_path, "demo", "0001");
-    if (rp) |p| {
-        var pp = p;
-        defer pp.deinit();
-        return error.RuntimeFileShouldBeAbsent;
-    }
 }
 
 test "runtime: paused stack does NOT dispatch" {
@@ -609,13 +600,6 @@ test "runtime: restart-orphan sweep marks running items failed" {
         \\
     ;
     try seedItem(a, s.abs_path, "demo", "0001", "running-item", body);
-    try runtime_file.write(a, s.abs_path, "demo", "0001", .{
-        .pid = 999999,
-        .harness = "claude",
-        .started_at = "2026-05-10T14:00:00.000Z",
-        .transcript_path = "/tmp/x.jsonl",
-        .session_id = "sess-abandoned",
-    });
 
     var aw = try audit_mod.Writer.init(a, s.abs_path);
     defer aw.deinit();
@@ -642,13 +626,6 @@ test "runtime: restart-orphan sweep marks running items failed" {
     _ = try f.readAll(buf);
     try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"failed\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "failed_reason = \"daemon_restart_orphan\"") != null);
-
-    // Runtime file is gone.
-    if (try runtime_file.read(a, s.abs_path, "demo", "0001")) |p| {
-        var pp = p;
-        defer pp.deinit();
-        return error.RuntimeFileShouldBeGone;
-    }
 }
 
 test "runtime: routing preflight blocks on harness_denied when allowed_harnesses is empty/missing match" {
@@ -1375,16 +1352,6 @@ test "runtime: consumes with_running_item fixture for restart sweep" {
     defer a.free(buf);
     _ = try f.readAll(buf);
     try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"failed\"") != null);
-
-    // state/runtime/ is clean.
-    const rt_dir = try std.fs.path.join(a, &.{ s.abs_path, "state/runtime/demo" });
-    defer a.free(rt_dir);
-    var dir = std.fs.openDirAbsolute(rt_dir, .{ .iterate = true }) catch return;
-    defer dir.close();
-    var it = dir.iterate();
-    var count: usize = 0;
-    while (try it.next()) |_| count += 1;
-    try std.testing.expectEqual(@as(usize, 0), count);
 }
 
 fn copyTree(a: std.mem.Allocator, src_abs: []const u8, dst_abs: []const u8) !void {
@@ -1750,14 +1717,6 @@ test "runtime: daemon-owned supervisor drives a seeded item to completed without
     const t_buf = try fake.readTranscript(a, item_dir);
     defer a.free(t_buf);
     try std.testing.expect(std.mem.indexOf(u8, t_buf, "\"kind\":\"session_ended\"") != null);
-
-    // Runtime file was cleaned up.
-    const rp = try runtime_file.read(a, s.abs_path, "demo", "0001");
-    if (rp) |p| {
-        var pp = p;
-        defer pp.deinit();
-        return error.RuntimeFileShouldBeAbsent;
-    }
 }
 
 // ---------- milestone 8: provider preflight integration ----------
@@ -2200,40 +2159,6 @@ test "fake adapter: parseStderrLine attaches captured session id to error event"
     try std.testing.expectEqualStrings("sess-err", evs[0].ev.session);
 }
 
-test "runtime_file: write+read round-trip preserves quote-escaped values" {
-    // Audit coverage gap: the parser strips a single enclosing pair of
-    // quotes from values. Verify a stored value containing internal
-    // characters (a backslash + a quote escape) round-trips correctly.
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs = try tmp.dir.realpath(".", &buf);
-
-    // A transcript path with spaces + an internal quote — exercises the
-    // writer's escape codepath. Backslashes & quotes both get escaped on
-    // write; the reader's "strip one outer pair" semantics still finds
-    // the embedded delimiters as literal bytes.
-    const weird_path = "/tmp/my dir/has \"quote\".jsonl";
-    try runtime_file.write(a, abs, "demo", "0042", .{
-        .pid = 99,
-        .harness = "fake",
-        .started_at = "2026-05-10T14:00:00.000Z",
-        .transcript_path = weird_path,
-        .session_id = "sess-q",
-    });
-    var p = (try runtime_file.read(a, abs, "demo", "0042")).?;
-    defer p.deinit();
-    try std.testing.expectEqualStrings("fake", p.rf.harness);
-    try std.testing.expectEqualStrings("sess-q", p.rf.session_id);
-    // The reader strips one pair of outer quotes but does not unescape;
-    // the writer escapes internal `"` as `\"` and `\\` as `\\\\`. The
-    // round-trip value therefore preserves the escape sequence rather
-    // than the original raw bytes — pin that contract here so future
-    // changes have to update both halves together.
-    try std.testing.expect(std.mem.indexOf(u8, p.rf.transcript_path, "/tmp/my dir/has \\\"quote\\\".jsonl") != null);
-}
-
 test "[result] block: session_ended payload empty fields still produce a result block with exit_code" {
     // Audit coverage gap: the case where the adapter emits a session_ended
     // with no session_id / session_file / model. The fake adapter's onExit
@@ -2442,13 +2367,6 @@ test "runtime: daemon shutdown mid-session reaps the live subprocess and clears 
     defer a.free(buf);
     _ = try f.readAll(buf);
     try std.testing.expect(std.mem.indexOf(u8, buf, "status = \"canceled\"") != null);
-
-    // Runtime file was cleaned up.
-    if (try runtime_file.read(a, s.abs_path, "demo", "0001")) |p| {
-        var pp = p;
-        defer pp.deinit();
-        return error.RuntimeFileShouldBeGone;
-    }
 }
 
 test "Worker: tear-down right after start cleanly joins the worker thread" {
@@ -2913,9 +2831,6 @@ fn seedItemWithStatus(
     slug: []const u8,
     status_str: []const u8,
 ) !void {
-    // `running` items also need a runtime_file present, but only for the
-    // restart-orphan sweep — the HTML render path doesn't require it.
-    // Skipping it keeps these tests focused on the render gate.
     const body = try std.fmt.allocPrint(a,
         \\id = "{s}"
         \\slug = "{s}"
@@ -2929,57 +2844,6 @@ fn seedItemWithStatus(
     try seedItem(a, root, stack, id, slug, body);
 }
 
-fn getItemHtmlWithRuntime(
-    a: std.mem.Allocator,
-    root: []const u8,
-    stack: []const u8,
-    item_id: []const u8,
-    slug: []const u8,
-) ![]u8 {
-    // Need enable_runtime=true so the daemon owns a live SSE hub; the
-    // gate evaluates `sse_hub != null and status == .running`.
-    var d = try daemon_mod.start(a, .{
-        .notes_root = root,
-        .port_override = 0,
-        .ephemeral = true,
-        .enable_git = false,
-        .check_repo_conflicts = false,
-        .enable_runtime = true,
-        .dispatch = fakeDispatchCat(),
-    });
-    try d.startWorker();
-    defer d.deinit();
-
-    var sc = F1ServeCtx{ .d = &d };
-    const th = try std.Thread.spawn(.{}, f1ServeFn, .{&sc});
-    defer {
-        d.requestShutdown();
-        th.join();
-    }
-
-    const path = try std.fmt.allocPrint(a, "/stacks/{s}/items/{s}", .{ stack, item_id });
-    defer a.free(path);
-    const req = try std.fmt.allocPrint(a, "GET {s} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept: text/html\r\n\r\n", .{path});
-    defer a.free(req);
-    // Suppress unused-var warning when slug is only for the meta filename.
-    _ = slug;
-
-    const addr = try std.net.Address.parseIp("127.0.0.1", d.bound_port);
-    var stream = try std.net.tcpConnectToAddress(addr);
-    defer stream.close();
-    try stream.writeAll(req);
-    var buf = std.ArrayList(u8){};
-    errdefer buf.deinit(a);
-    var tmp: [4096]u8 = undefined;
-    while (true) {
-        const n = stream.read(&tmp) catch break;
-        if (n == 0) break;
-        try buf.appendSlice(a, tmp[0..n]);
-        if (buf.items.len > 1024 * 1024) break;
-    }
-    return buf.toOwnedSlice(a);
-}
-
 fn assertSseGate(
     a: std.mem.Allocator,
     status_str: []const u8,
@@ -2991,11 +2855,53 @@ fn assertSseGate(
     defer s.deinit();
     try initNotesRoot(a, s.abs_path);
     try seedStack(a, s.abs_path, "demo", false);
-    try seedItemWithStatus(a, s.abs_path, "demo", "0001", "p", status_str);
+    // For non-running statuses, seed before daemon start. For `running`, seed
+    // after `startWorker` so the one-shot restart-orphan sweep (which now
+    // transitions every surviving `running` item to failed/daemon_restart_orphan)
+    // doesn't reclassify the fixture before the HTML render reads it.
+    const seed_running_after_start = std.mem.eql(u8, status_str, "running");
+    if (!seed_running_after_start) {
+        try seedItemWithStatus(a, s.abs_path, "demo", "0001", "p", status_str);
+    }
 
-    const resp = try getItemHtmlWithRuntime(a, s.abs_path, "demo", "0001", "p");
-    defer a.free(resp);
-    const present = std.mem.indexOf(u8, resp, "new EventSource(\"/stacks/demo/events\")") != null;
+    var d = try daemon_mod.start(a, .{
+        .notes_root = s.abs_path,
+        .port_override = 0,
+        .ephemeral = true,
+        .enable_git = false,
+        .check_repo_conflicts = false,
+        .enable_runtime = true,
+        .dispatch = fakeDispatchCat(),
+    });
+    try d.startWorker();
+    defer d.deinit();
+
+    if (seed_running_after_start) {
+        try seedItemWithStatus(a, s.abs_path, "demo", "0001", "p", status_str);
+    }
+
+    var sc = F1ServeCtx{ .d = &d };
+    const th = try std.Thread.spawn(.{}, f1ServeFn, .{&sc});
+    defer {
+        d.requestShutdown();
+        th.join();
+    }
+
+    const req = "GET /stacks/demo/items/0001 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept: text/html\r\n\r\n";
+    const addr = try std.net.Address.parseIp("127.0.0.1", d.bound_port);
+    var stream = try std.net.tcpConnectToAddress(addr);
+    defer stream.close();
+    try stream.writeAll(req);
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(a);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = stream.read(&tmp) catch break;
+        if (n == 0) break;
+        try buf.appendSlice(a, tmp[0..n]);
+        if (buf.items.len > 1024 * 1024) break;
+    }
+    const present = std.mem.indexOf(u8, buf.items, "new EventSource(\"/stacks/demo/events\")") != null;
     try std.testing.expectEqual(should_have_eventsource, present);
 }
 

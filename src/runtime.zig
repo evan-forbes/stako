@@ -11,12 +11,12 @@ const stack_config = @import("stack_config.zig");
 const state = @import("state.zig");
 const session_manager = @import("session_manager.zig");
 const stack_mod = @import("stack.zig");
+const mutations = @import("mutations.zig");
 const audit = @import("audit.zig");
 const sse_mod = @import("sse.zig");
 const adapter_mod = @import("adapter.zig");
 const fake_adapter = @import("fake_adapter.zig");
 const harness_dispatch = @import("harness_dispatch.zig");
-const runtime_file = @import("runtime_file.zig");
 const provider_status = @import("provider_status.zig");
 const prompt_materializer = @import("prompt_materializer.zig");
 const stack_thread = @import("stack_thread.zig");
@@ -144,20 +144,28 @@ pub const Supervisor = struct {
     }
 
     /// Restart-orphan recovery (per design_state_machine.md).
+    ///
+    /// Any item still in `running` after a restart must have been mid-flight
+    /// when the daemon went down — no live session is now attached to it.
+    /// Walk every stack and transition each surviving `running` item to
+    /// `failed/daemon_restart_orphan`. The daemon is the only writer of
+    /// `running` status, so this scan is the authoritative orphan signal.
     pub fn reconcileOrphans(self: *Supervisor) !void {
-        const orphans = try runtime_file.listAll(self.allocator, self.opts.notes_root_abs);
-        defer runtime_file.freeOrphans(self.allocator, orphans);
         const client = self.systemClient("runtime/restart-sweep");
-        for (orphans) |o| {
-            // Try to apply the running→failed transition; ignore errors.
-            deinitMutationIfOk(client.runtimeTransitionItem(o.stack, .{
-                .stack = o.stack,
-                .id = o.id,
-                .to = .failed,
-                .failed_reason = "daemon_restart_orphan",
-            }));
-            // Delete the runtime file regardless of transition success.
-            runtime_file.deleteFor(self.allocator, self.opts.notes_root_abs, o.stack, o.id) catch {};
+        const stacks = try client.listStacks();
+        defer client.freeStackList(stacks);
+        for (stacks) |stack_name| {
+            const items = client.listItems(stack_name) catch continue;
+            defer client.freeItemList(items);
+            for (items) |it| {
+                if (!std.mem.eql(u8, it.status, "running")) continue;
+                deinitMutationIfOk(client.runtimeTransitionItem(stack_name, .{
+                    .stack = stack_name,
+                    .id = it.id,
+                    .to = .failed,
+                    .failed_reason = "daemon_restart_orphan",
+                }));
+            }
         }
     }
 
@@ -235,6 +243,11 @@ pub const Supervisor = struct {
                 try self.handleSleepItem(stack_name, &item);
                 continue;
             }
+            if ((item.kind == .clear or item.kind == .@"new") and item.thread != null) {
+                try self.handleThreadLocalCommand(stack_name, &item);
+                running_in_stack += 1;
+                continue;
+            }
 
             // Routing preflight.
             const decision = try self.routingPreflight(stack_name, &cfg, &item);
@@ -281,6 +294,43 @@ pub const Supervisor = struct {
         // Future-dated sleep items remain queued; the loop will re-evaluate
         // on the next tick. (Per design, paused-with-timer is the eventual
         // implementation; v1 uses the simpler "leave queued" path.)
+    }
+
+    fn handleThreadLocalCommand(self: *Supervisor, stack_name: []const u8, item: *const item_mod.Item) !void {
+        const thread_ref = item.thread orelse return;
+        const client = self.systemClient("runtime/thread-command");
+        deinitMutationIfOk(client.runtimeTransitionItem(stack_name, .{
+            .stack = stack_name,
+            .id = item.id,
+            .to = .running,
+        }));
+        const patches = [_]mutations.ThreadPatch{
+            .{ .key = "state.last_item_id", .value = null },
+            .{ .key = "state.last_harness", .value = null },
+            .{ .key = "state.last_session_id", .value = null },
+            .{ .key = "state.last_session_file", .value = null },
+            .{ .key = "state.last_transcript_path", .value = null },
+        };
+        switch (client.patchThread(stack_name, thread_ref.name, &patches)) {
+            .ok => |ok_value| {
+                var ok = ok_value;
+                defer ok.deinit();
+            },
+            .err => {
+                deinitMutationIfOk(client.runtimeTransitionItem(stack_name, .{
+                    .stack = stack_name,
+                    .id = item.id,
+                    .to = .blocked,
+                    .blocked_reason = "thread_not_found",
+                }));
+                return;
+            },
+        }
+        deinitMutationIfOk(client.runtimeTransitionItem(stack_name, .{
+            .stack = stack_name,
+            .id = item.id,
+            .to = .completed,
+        }));
     }
 
     pub const PreflightDecision = union(enum) {
@@ -391,6 +441,9 @@ pub const Supervisor = struct {
                 error.InputMissing => {
                     return .{ .blocked = "input_missing" };
                 },
+                error.PromptMissing => {
+                    return .{ .blocked = "input_missing" };
+                },
                 error.InputTooLarge => {
                     return .{ .blocked = "input_too_large" };
                 },
@@ -460,6 +513,9 @@ pub const Supervisor = struct {
                 error.InputMissing => {
                     return .{ .blocked = "input_missing" };
                 },
+                error.PromptMissing => {
+                    return .{ .blocked = "input_missing" };
+                },
                 error.InputTooLarge => {
                     return .{ .blocked = "input_too_large" };
                 },
@@ -499,26 +555,28 @@ pub const Supervisor = struct {
 
     fn resolveThreadExecution(self: *Supervisor, stack_name: []const u8, item: *const item_mod.Item) !ThreadExecution {
         const ref = item.thread orelse return .{};
-        switch (ref.mode) {
+        const requested_mode = ref.mode;
+        switch (requested_mode) {
             .fresh, .@"resume" => {},
-            .@"continue", .fork => return .{ .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_mode_unsupported" },
+            .@"continue", .fork => return .{ .thread_name = ref.name, .mode = requested_mode, .blocked_reason = "thread_mode_unsupported" },
         }
         const rel = try std.fmt.allocPrint(self.allocator, "stacks/{s}/threads/{s}.toml", .{ stack_name, ref.name });
         defer self.allocator.free(rel);
         const abs = try std.fs.path.join(self.allocator, &.{ self.opts.notes_root_abs, rel });
         defer self.allocator.free(abs);
         var thread = readThreadFile(self.allocator, abs) catch |e| switch (e) {
-            error.FileNotFound => return .{ .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_not_found" },
+            error.FileNotFound => return .{ .thread_name = ref.name, .mode = requested_mode, .blocked_reason = "thread_not_found" },
             else => return e,
         };
         errdefer thread.deinit();
-        if (thread.status == .archived) return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_archived" };
-        if (ref.mode == .@"resume") {
-            const st = thread.state orelse return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_no_session" };
-            const sid = st.last_session_id orelse return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode, .blocked_reason = "thread_no_session" };
-            return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode, .resume_session_id = sid };
+        if (thread.status == .archived) return .{ .thread = thread, .thread_name = ref.name, .mode = requested_mode, .blocked_reason = "thread_archived" };
+        const mode = if (ref.implicit_resume and threadHasSession(&thread)) item_mod.ThreadMode.@"resume" else requested_mode;
+        if (mode == .@"resume") {
+            const st = thread.state orelse return .{ .thread = thread, .thread_name = ref.name, .mode = mode, .blocked_reason = "thread_no_session" };
+            const sid = st.last_session_id orelse return .{ .thread = thread, .thread_name = ref.name, .mode = mode, .blocked_reason = "thread_no_session" };
+            return .{ .thread = thread, .thread_name = ref.name, .mode = mode, .resume_session_id = sid };
         }
-        return .{ .thread = thread, .thread_name = ref.name, .mode = ref.mode };
+        return .{ .thread = thread, .thread_name = ref.name, .mode = mode };
     }
 
     const ResolvedWorkdir = struct {
@@ -617,6 +675,11 @@ fn itemTargetProvider(item: *const item_mod.Item, thread: ?stack_thread.Thread) 
     if (item.target) |t| if (t.provider) |p| return p;
     if (thread) |th| if (th.target) |t| if (t.provider) |p| return p;
     return null;
+}
+
+fn threadHasSession(thread: *const stack_thread.Thread) bool {
+    const st = thread.state orelse return false;
+    return st.last_session_id != null;
 }
 
 fn deinitMutationIfOk(result: stack_mod.MutationResult) void {

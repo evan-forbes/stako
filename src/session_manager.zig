@@ -2,8 +2,8 @@
 //!
 //! Owns the registry of live subprocess sessions. Each item that the
 //! runtime decides to run gets a `Session` here; on exit, the session
-//! deletes its runtime file, publishes a terminal `session_ended` event,
-//! and asks the stack API to write the terminal status transition.
+//! publishes a terminal `session_ended` event and asks the stack API to
+//! write the terminal status transition.
 //!
 //! Design constraints honored:
 //!
@@ -30,7 +30,6 @@ const sse_mod = @import("sse.zig");
 const audit = @import("audit.zig");
 const item_mod = @import("item.zig");
 const output_packet = @import("output_packet.zig");
-const runtime_file = @import("runtime_file.zig");
 const stack_mod = @import("stack.zig");
 
 pub const Error = error{
@@ -302,15 +301,6 @@ pub const Manager = struct {
         transcript_in_local = false;
         outcome_in_local = false;
 
-        // Runtime file.
-        runtime_file.write(self.allocator, self.notes_root_abs, input.stack, input.item_id, .{
-            .pid = child.id,
-            .harness = input.harness,
-            .started_at = start_ts,
-            .transcript_path = sess.transcript.path,
-            .session_id = "",
-        }) catch {};
-
         // Register before starting pumps so cancel() can find it.
         self.mutex.lock();
         self.sessions.append(self.allocator, sess) catch {
@@ -450,7 +440,6 @@ pub const Manager = struct {
         _ = sess.child.kill() catch {};
         _ = sess.child.wait() catch {};
         joinPumpThreads(sess);
-        runtime_file.deleteFor(self.allocator, self.notes_root_abs, sess.stack, sess.item_id) catch {};
 
         self.mutex.lock();
         var i: usize = 0;
@@ -719,8 +708,6 @@ fn onExitMain(s: *Session, term_opt: ?std.process.Child.Term) void {
         s.transcript.append(event) catch {};
         if (s.manager.hub) |h| h.publish(event) catch {};
     }
-
-    runtime_file.deleteFor(s.allocator, s.manager.notes_root_abs, s.stack, s.item_id) catch {};
 
     const tag: stack_mod.RuntimeTargetStatus = blk: {
         if (canceled) break :blk .canceled;
