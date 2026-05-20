@@ -1,6 +1,6 @@
-# stacks/default/stack.toml — created by `stako init`.
-# All fields below are at their documented defaults. Edit freely;
-# see todos/design_stack_config.md for field semantics.
+# stacks/default/stack.toml - created by `stako init`.
+# Stack config is safe to edit by hand. Stack item metadata is not.
+# Use `stako stack config <name>` to inspect the daemon's parsed view.
 
 description = "default stack"
 created_at = 2026-05-10T14:00:00Z

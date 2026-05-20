@@ -307,6 +307,8 @@ pub fn applyAppendRoutine(
 
     const prompt_bodies = try aa.alloc(?[]const u8, input.routine.steps.len);
     const effective_thread_modes = try aa.alloc(?item_mod.ThreadMode, input.routine.steps.len);
+    var missing_threads = std.ArrayList([]const u8){};
+    defer missing_threads.deinit(allocator);
     @memset(effective_thread_modes, null);
     for (input.routine.steps, 0..) |*step, i| {
         if (step.command == null) {
@@ -320,7 +322,14 @@ pub fn applyAppendRoutine(
         if (step.thread) |thread_name| {
             const thread_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.stack, "threads", try std.fmt.allocPrint(aa, "{s}.toml", .{thread_name}) });
             defer allocator.free(thread_abs);
-            var th = readThreadFile(allocator, thread_abs) catch return error.ValidationFailed;
+            var th = readThreadFile(allocator, thread_abs) catch |e| switch (e) {
+                error.NotFound => {
+                    try appendUniqueThreadName(allocator, &missing_threads, thread_name);
+                    effective_thread_modes[i] = .fresh;
+                    continue;
+                },
+                else => return error.ValidationFailed,
+            };
             defer th.deinit();
             if (th.status != .active) return error.ValidationFailed;
             effective_thread_modes[i] = if (threadHasSession(&th)) .@"resume" else .fresh;
@@ -329,7 +338,7 @@ pub fn applyAppendRoutine(
 
     for (order) |step_index| {
         const step = &input.routine.steps[step_index];
-        try validateExpandedRoutineStep(allocator, notes_root_abs, input.stack, step, effective_thread_modes[step_index], step_ids[step_index], &.{}, .{
+        try validateExpandedRoutineStep(allocator, notes_root_abs, input.stack, step, effective_thread_modes[step_index], true, step_ids[step_index], &.{}, .{
             .input_items = input.input_items,
             .input_files = input.input_files,
             .input_commits = input.input_commits,
@@ -341,6 +350,11 @@ pub fn applyAppendRoutine(
     errdefer {
         for (paths_list.items) |p| allocator.free(p);
         paths_list.deinit(allocator);
+    }
+
+    for (missing_threads.items) |thread_name| {
+        const rel = try createRoutineThread(allocator, notes_root_abs, input.stack, thread_name, input.created_at_override);
+        try appendPathUnique(allocator, &paths_list, rel);
     }
 
     for (order) |step_index| {
@@ -1350,6 +1364,7 @@ fn validateExpandedRoutineStep(
     stack: []const u8,
     step: *const routine_mod.Step,
     effective_thread_mode: ?item_mod.ThreadMode,
+    allow_missing_thread: bool,
     id: []const u8,
     parents: []const []const u8,
     inputs: ExpandedInputs,
@@ -1387,8 +1402,13 @@ fn validateExpandedRoutineStep(
     if (step.thread) |thread_name| {
         const thread_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack, "threads", try std.fmt.allocPrint(aa, "{s}.toml", .{thread_name}) });
         defer allocator.free(thread_abs);
-        thread_defaults = readThreadFile(allocator, thread_abs) catch return error.ValidationFailed;
-        if (thread_defaults.?.status != .active) return error.ValidationFailed;
+        thread_defaults = readThreadFile(allocator, thread_abs) catch |e| switch (e) {
+            error.NotFound => if (allow_missing_thread) null else return error.ValidationFailed,
+            else => return error.ValidationFailed,
+        };
+        if (thread_defaults) |*th| {
+            if (th.status != .active) return error.ValidationFailed;
+        }
     }
 
     const thread_target = if (thread_defaults) |th| th.target else null;
@@ -1451,6 +1471,51 @@ fn validateExpandedRoutineStep(
 fn threadHasSession(thread: *const stack_thread.Thread) bool {
     const thread_state = thread.state orelse return false;
     return thread_state.last_session_id != null;
+}
+
+fn appendUniqueThreadName(
+    allocator: std.mem.Allocator,
+    names: *std.ArrayList([]const u8),
+    name: []const u8,
+) !void {
+    for (names.items) |existing| {
+        if (std.mem.eql(u8, existing, name)) return;
+    }
+    try names.append(allocator, name);
+}
+
+fn createRoutineThread(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    stack: []const u8,
+    name: []const u8,
+    created_at_override: ?[]const u8,
+) Error![]u8 {
+    const rel = try threadRel(allocator, stack, name);
+    errdefer allocator.free(rel);
+    const abs = try std.fs.path.join(allocator, &.{ notes_root_abs, rel });
+    defer allocator.free(abs);
+    if (fileExists(abs)) return rel;
+    const dir_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", stack, "threads" });
+    defer allocator.free(dir_abs);
+    try std.fs.cwd().makePath(dir_abs);
+
+    var ts_buf: [40]u8 = undefined;
+    const now = created_at_override orelse audit.nowRfc3339Millis(&ts_buf);
+    var thread: stack_thread.Thread = .{
+        .arena = std.heap.ArenaAllocator.init(allocator),
+        .name = name,
+        .created_at = now,
+        .updated_at = now,
+        .status = .active,
+    };
+    defer thread.deinit();
+    const aa = thread.arena.allocator();
+    thread.name = try aa.dupe(u8, name);
+    thread.created_at = try aa.dupe(u8, now);
+    thread.updated_at = try aa.dupe(u8, now);
+    try writeThreadFile(allocator, abs, &thread);
+    return rel;
 }
 
 fn readThreadFile(allocator: std.mem.Allocator, abs: []const u8) Error!stack_thread.Thread {

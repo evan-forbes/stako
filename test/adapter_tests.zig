@@ -54,7 +54,6 @@ const Scratch = struct {
 fn initNotesRoot(allocator: std.mem.Allocator, root: []const u8) !void {
     var r = try init_mod.run(allocator, .{
         .root = root,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xD3D7,

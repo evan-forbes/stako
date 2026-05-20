@@ -80,7 +80,6 @@ test "init: on a fresh empty dir creates the documented layout" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xDEADBEEFCAFE,
@@ -94,14 +93,13 @@ test "init: on a fresh empty dir creates the documented layout" {
     try std.testing.expect(fileExists(&d, "stacks"));
     try std.testing.expect(fileExists(&d, "stacks/default"));
     try std.testing.expect(fileExists(&d, "prompts"));
-    try std.testing.expect(fileExists(&d, "prompts/admin-review"));
     try std.testing.expect(fileExists(&d, "routines"));
     try std.testing.expect(fileExists(&d, "state"));
 
     // Files.
     try std.testing.expect(fileExists(&d, "stacks/default/stack.toml"));
-    try std.testing.expect(fileExists(&d, "prompts/admin-review/evaluate.md"));
-    try std.testing.expect(fileExists(&d, "routines/admin-review.toml"));
+    try std.testing.expect(!fileExists(&d, "prompts/admin-review/evaluate.md"));
+    try std.testing.expect(!fileExists(&d, "routines/admin-review.toml"));
     try std.testing.expect(fileExists(&d, "AGENTS.md"));
     try std.testing.expect(fileExists(&d, "config.toml"));
     try std.testing.expect(fileExists(&d, "state/local_token"));
@@ -119,7 +117,6 @@ test "init: creates the requested notes root when it does not exist" {
 
     var report = try init_mod.run(a, .{
         .root = root,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x123456,
@@ -140,7 +137,6 @@ test "init: local_token has 0600 (POSIX)" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xBEEF,
@@ -160,7 +156,6 @@ test "init: rerunning is a no-op (zero created items, local_token preserved)" {
 
     var r1 = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xA11CE,
@@ -175,7 +170,6 @@ test "init: rerunning is a no-op (zero created items, local_token preserved)" {
 
     var r2 = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xA11CE,
@@ -196,7 +190,6 @@ test "init: rerunning with a different seed does NOT rotate local_token" {
 
     var r1 = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x1111,
@@ -210,7 +203,6 @@ test "init: rerunning with a different seed does NOT rotate local_token" {
 
     var r2 = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x9999, // different
@@ -234,7 +226,6 @@ test "init: directory path occupied by file is rejected" {
 
     try std.testing.expectError(error.PathTypeMismatch, init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x1234,
@@ -252,7 +243,6 @@ test "init: file path occupied by directory is rejected" {
 
     try std.testing.expectError(error.PathTypeMismatch, init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x1234,
@@ -266,7 +256,6 @@ test "init: config.toml is valid TOML and parseable by the milestone-1 reader" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xC0FFEE,
@@ -293,6 +282,42 @@ test "init: config.toml is valid TOML and parseable by the milestone-1 reader" {
     try std.testing.expect(found_loopback);
 }
 
+test "init: AGENTS.md contains concise workflow and safety guidance" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "agents-guide");
+    defer s.deinit();
+
+    var report = try init_mod.run(a, .{
+        .root = s.abs_path,
+        .quiet = true,
+        .now_override = "2026-05-10T14:00:00Z",
+        .rng_seed_override = 0xCAFE,
+    });
+    defer report.deinit();
+
+    var d = try s.dir();
+    defer d.close();
+    const src = try readAll(a, &d, "AGENTS.md");
+    defer a.free(src);
+
+    inline for (.{
+        "Stako queues prompts and routines onto",
+        "Do not edit stack item metadata by hand",
+        "Prompt files are plain markdown",
+        "A routine is `routines/<name>.toml`",
+        "steps with the same thread reuse that agent",
+        "Provider, model, and related routing settings",
+        "stako new <stack>",
+        "stako add <routine> <stack>",
+        "stako start <stack>",
+    }) |needle| {
+        if (std.mem.indexOf(u8, src, needle) == null) {
+            std.debug.print("missing AGENTS.md guidance: {s}\n", .{needle});
+            return error.MissingAgentsGuidance;
+        }
+    }
+}
+
 test "init: stack.toml round-trips through stack_config" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "stack-parse");
@@ -300,7 +325,6 @@ test "init: stack.toml round-trips through stack_config" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xFEEDFACE,
@@ -327,7 +351,6 @@ test "init: .gitignore contains all required stako lines" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x42,
@@ -363,7 +386,6 @@ test "init: appends to a pre-existing .gitignore without duplicating" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x7,
@@ -405,7 +427,6 @@ test "init: inside an existing parent git repo emits a warning but proceeds" {
 
     var report = try init_mod.run(a, .{
         .root = notes,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x5,
@@ -415,29 +436,6 @@ test "init: inside an existing parent git repo emits a warning but proceeds" {
     try std.testing.expect(report.inside_existing_git);
     try std.testing.expect(!report.git_initialized);
     try std.testing.expect(report.created.items.len > 0);
-}
-
-test "init: yes=false skips auto git init on a non-git root" {
-    const a = std.testing.allocator;
-    var s = try Scratch.create(a, "no-yes");
-    defer s.deinit();
-
-    var report = try init_mod.run(a, .{
-        .root = s.abs_path,
-        .yes = false,
-        .quiet = true,
-        .now_override = "2026-05-10T14:00:00Z",
-        .rng_seed_override = 0x88,
-    });
-    defer report.deinit();
-    try std.testing.expect(!report.git_initialized);
-
-    var d = try s.dir();
-    defer d.close();
-    // .git was not created, but the rest of the layout was.
-    try std.testing.expect(!fileExists(&d, ".git"));
-    try std.testing.expect(fileExists(&d, "state/local_token"));
-    try std.testing.expect(fileExists(&d, "stacks/default/stack.toml"));
 }
 
 test "init: existing stack.toml is never overwritten" {
@@ -456,7 +454,6 @@ test "init: existing stack.toml is never overwritten" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x66,
@@ -487,7 +484,6 @@ test "init: existing config.toml is never overwritten" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0x6,
@@ -518,6 +514,7 @@ const FIXTURE_SEED: u64 = 0x6F7267616E6F00; // ascii "stako\0"
 /// `config.local.toml` inside a fixture dir gets ignored by recursive matches).
 const FixtureMap = struct { actual: []const u8, fixture: []const u8 };
 const FIXTURE_FILES = [_]FixtureMap{
+    .{ .actual = "AGENTS.md", .fixture = "AGENTS.md" },
     .{ .actual = "stacks/default/stack.toml", .fixture = "stacks/default/stack.toml" },
     .{ .actual = "config.toml", .fixture = "config.toml.expected" },
     .{ .actual = "state/local_token", .fixture = "state/local_token.expected" },
@@ -531,7 +528,6 @@ test "fixture: empty_initialized matches committed snapshot (byte-for-byte)" {
 
     var report = try init_mod.run(a, .{
         .root = s.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = FIXTURE_NOW,
         .rng_seed_override = FIXTURE_SEED,

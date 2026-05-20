@@ -244,7 +244,6 @@ fn buildInitializedRoot(allocator: std.mem.Allocator, name_hint: []const u8) !Sm
     errdefer root.deinit();
     var ir = try init_mod.run(allocator, .{
         .root = root.abs_path,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xD3D0,
@@ -355,8 +354,7 @@ test "daemon: GET / returns HTML index" {
     var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
     defer drv.deinit();
     try drv.serve(1);
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
@@ -373,8 +371,7 @@ test "daemon: GET /stacks/smoke serves HTML when Accept: text/html" {
     var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
     defer drv.deinit();
     try drv.serve(1);
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET /stacks/smoke HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /stacks/smoke HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
@@ -392,8 +389,7 @@ test "daemon: GET /stacks/smoke returns JSON by default" {
     defer drv.deinit();
     try drv.serve(1);
     // No Accept header: programmatic clients keep getting JSON.
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET /stacks/smoke HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /stacks/smoke HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
@@ -407,8 +403,7 @@ test "daemon: GET /stacks/smoke/items/0001 serves HTML item page" {
     var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
     defer drv.deinit();
     try drv.serve(1);
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET /stacks/smoke/items/0001 HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /stacks/smoke/items/0001 HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
@@ -429,8 +424,7 @@ test "daemon: HTML responses include a CSP" {
     var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
     defer drv.deinit();
     try drv.serve(1);
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "content-security-policy:") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "form-action 'self'") != null);
@@ -443,8 +437,7 @@ test "daemon: GET /static/style.css returns CSS" {
     var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
     defer drv.deinit();
     try drv.serve(1);
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET /static/style.css HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /static/style.css HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
@@ -460,8 +453,7 @@ test "daemon: HTML routes don't bypass auth gate (no auth required for GET)" {
     var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
     defer drv.deinit();
     try drv.serve(1);
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     const parsed = splitResponse(resp);
     try std.testing.expectEqual(@as(u16, 200), parsed.status);
@@ -493,8 +485,7 @@ test "renderStack: pause form rendered when local_token set and stack running" {
     // hidden field carries the local token verbatim.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "<section class=\"controls\">") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/pause\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items,
-        "name=\"_token\" value=\"deadbeefdeadbeefdeadbeefdeadbeef\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "name=\"_token\" value=\"deadbeefdeadbeefdeadbeefdeadbeef\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Pause stack") != null);
     // Resume form must NOT appear when the stack isn't paused.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/resume\"") == null);
@@ -545,8 +536,7 @@ test "renderItem: cancel form rendered for queued item" {
         .local_token = "0123456789abcdef0123456789abcdef",
     });
     try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/items/0002/cancel\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items,
-        "name=\"_token\" value=\"0123456789abcdef0123456789abcdef\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "name=\"_token\" value=\"0123456789abcdef0123456789abcdef\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Cancel item") != null);
     // Retry button doesn't apply to queued items.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Retry item") == null);
@@ -623,9 +613,7 @@ test "daemon: POST /pause without form token returns 401 identity_required" {
 
     // Empty body; form path is recognised by the content-type header.
     const body = "";
-    const req = try std.fmt.allocPrint(a,
-        "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ body.len, body });
+    const req = try std.fmt.allocPrint(a, "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
     defer a.free(req);
     const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
     defer a.free(resp);
@@ -655,9 +643,7 @@ test "daemon: POST /pause with valid form token succeeds" {
 
     const body = try std.fmt.allocPrint(a, "_token={s}", .{drv.daemon.token.bytes});
     defer a.free(body);
-    const req = try std.fmt.allocPrint(a,
-        "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ body.len, body });
+    const req = try std.fmt.allocPrint(a, "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
     defer a.free(req);
     const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
     defer a.free(resp);
@@ -862,8 +848,7 @@ test "daemon: HTML stack page includes CSP header" {
     var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
     defer drv.deinit();
     try drv.serve(1);
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET /stacks/smoke HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /stacks/smoke HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "content-security-policy:") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "form-action 'self'") != null);
@@ -877,8 +862,7 @@ test "daemon: HTML item page includes CSP header" {
     var drv: Driver = .{ .allocator = a, .daemon = try startEphemeralDaemon(a, root.abs_path) };
     defer drv.deinit();
     try drv.serve(1);
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET /stacks/smoke/items/0001 HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /stacks/smoke/items/0001 HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "content-security-policy:") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "form-action 'self'") != null);
@@ -901,8 +885,7 @@ test "daemon: HTML stack page is open to malicious-looking stack-name lookups" {
     // `%3Cscript%3E` → `<script>` after percent decode. The daemon's
     // router does its own normalization; the validator rejects bytes
     // outside `[a-zA-Z0-9_-]`.
-    const resp = try httpRequestRaw(a, drv.daemon.bound_port,
-        "GET /stacks/%3Cscript%3E HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+    const resp = try httpRequestRaw(a, drv.daemon.bound_port, "GET /stacks/%3Cscript%3E HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
     defer a.free(resp);
     const parsed = splitResponse(resp);
     // Either a 400-class rejection or a 404; what matters is that no
@@ -949,9 +932,7 @@ test "daemon: HTML stack page embeds working pause form" {
     // Step 2: replay the form body with that token.
     const body = try std.fmt.allocPrint(a, "_token={s}", .{token});
     defer a.free(body);
-    const post_req = try std.fmt.allocPrint(a,
-        "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ body.len, body });
+    const post_req = try std.fmt.allocPrint(a, "POST /stacks/smoke/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
     defer a.free(post_req);
     const post_resp = try httpRequestRaw(a, drv.daemon.bound_port, post_req);
     defer a.free(post_resp);

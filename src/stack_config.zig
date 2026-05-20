@@ -106,9 +106,9 @@ pub fn parseSlice(allocator: std.mem.Allocator, source: []const u8) ParseError!S
 /// `stacks/default/stack.toml` and as the baseline for any new stack.
 pub fn writeDefaults(w: anytype, created_at: []const u8) !void {
     // Keep this output byte-stable; tests snapshot it.
-    try w.writeAll("# stacks/default/stack.toml — created by `stako init`.\n");
-    try w.writeAll("# All fields below are at their documented defaults. Edit freely;\n");
-    try w.writeAll("# see todos/design_stack_config.md for field semantics.\n");
+    try w.writeAll("# stacks/default/stack.toml - created by `stako init`.\n");
+    try w.writeAll("# Stack config is safe to edit by hand. Stack item metadata is not.\n");
+    try w.writeAll("# Use `stako stack config <name>` to inspect the daemon's parsed view.\n");
     try w.writeAll("\n");
     try w.writeAll("description = \"default stack\"\n");
     try w.writeAll("created_at = ");
@@ -120,7 +120,7 @@ pub fn writeDefaults(w: anytype, created_at: []const u8) !void {
 }
 
 test "writeDefaults round-trips through parser" {
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.testing.allocator);
     try writeDefaults(out.writer(std.testing.allocator), "2026-05-10T14:00:00Z");
 

@@ -50,7 +50,6 @@ const Scratch = struct {
 fn initNotesRoot(allocator: std.mem.Allocator, root: []const u8) !void {
     var r = try init_mod.run(allocator, .{
         .root = root,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xD3D0,
@@ -501,7 +500,7 @@ test "cli: init on a fresh dir exits 0 and prints created list" {
     var s = try Scratch.create(a, "init-fresh");
     defer s.deinit();
 
-    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--yes", "--now=2026-05-10T14:00:00Z", "--seed=0x1234" });
+    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--now=2026-05-10T14:00:00Z", "--seed=0x1234" });
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 0), r.code);
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "created:") != null);
@@ -519,7 +518,7 @@ test "cli: init --quiet suppresses per-line output but prints a summary" {
     var s = try Scratch.create(a, "init-quiet");
     defer s.deinit();
 
-    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--yes", "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x5678" });
+    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x5678" });
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 0), r.code);
     // No per-line `created:` block under --quiet.
@@ -536,11 +535,11 @@ test "cli: init re-run prints the `already initialized` line and exits 0" {
     var s = try Scratch.create(a, "init-rerun");
     defer s.deinit();
 
-    var r1 = try runCli(a, &.{ "init", "--root", s.abs_path, "--yes", "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
+    var r1 = try runCli(a, &.{ "init", "--root", s.abs_path, "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
     defer r1.deinit();
     try std.testing.expectEqual(@as(u8, 0), r1.code);
 
-    var r2 = try runCli(a, &.{ "init", "--root", s.abs_path, "--yes", "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
+    var r2 = try runCli(a, &.{ "init", "--root", s.abs_path, "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
     defer r2.deinit();
     try std.testing.expectEqual(@as(u8, 0), r2.code);
     try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "already initialized") != null);
@@ -554,7 +553,7 @@ test "cli: init on a missing root creates it" {
     const root = try std.fs.path.join(a, &.{ s.abs_path, "stako" });
     defer a.free(root);
 
-    var r = try runCli(a, &.{ "init", "--root", root, "--yes", "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
+    var r = try runCli(a, &.{ "init", "--root", root, "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x7" });
     defer r.deinit();
     try std.testing.expectEqual(@as(u8, 0), r.code);
     var d = try std.fs.openDirAbsolute(root, .{});
@@ -574,29 +573,27 @@ test "cli: init --now= malformed rejected at parse time (exit 2)" {
     try std.testing.expect(std.mem.indexOf(u8, r.stderr, "BadFlagValue") != null);
 }
 
-test "cli: init without --yes does not auto-init git on a non-git root" {
-    const a = std.testing.allocator;
-    var s = try Scratch.create(a, "init-no-yes");
-    defer s.deinit();
-
-    var r = try runCli(a, &.{ "init", "--root", s.abs_path, "--quiet", "--now=2026-05-10T14:00:00Z", "--seed=0x99" });
-    defer r.deinit();
-    try std.testing.expectEqual(@as(u8, 0), r.code);
-
-    // Layout landed, but .git was NOT created because --yes was absent.
-    var d = try std.fs.openDirAbsolute(s.abs_path, .{});
-    defer d.close();
-    d.access("state/local_token", .{}) catch return error.LayoutNotCreated;
-    if (d.access(".git", .{})) |_| {
-        return error.GitInitShouldHaveBeenSkipped;
-    } else |_| {}
-}
-
 test "cli: routine list and show read routines through the live daemon" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "routine-read");
     defer s.deinit();
     try initNotesRoot(a, s.abs_path);
+
+    {
+        const routine_path = try std.fs.path.join(a, &.{ s.abs_path, "routines", "planning.toml" });
+        defer a.free(routine_path);
+        var f = try std.fs.cwd().createFile(routine_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\version = 1
+            \\description = "Plan generated work."
+            \\thread = "builder"
+            \\
+            \\[[step]]
+            \\prompts = ["../prompts/planning.md"]
+            \\
+        );
+    }
 
     var drv = try buildDriver(a, s.abs_path);
     defer drv.deinit();
@@ -607,13 +604,13 @@ test "cli: routine list and show read routines through the live daemon" {
     defer r1.deinit();
     try std.testing.expectEqual(@as(u8, 0), r1.code);
     try std.testing.expect(std.mem.indexOf(u8, r1.stdout, "\"routines\":[") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r1.stdout, "\"name\":\"admin-review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r1.stdout, "\"name\":\"planning\"") != null);
 
-    var r2 = try runCli(a, &.{ "routine", "show", "admin-review", "--root", s.abs_path });
+    var r2 = try runCli(a, &.{ "routine", "show", "planning", "--root", s.abs_path });
     defer r2.deinit();
     try std.testing.expectEqual(@as(u8, 0), r2.code);
-    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "\"name\":\"admin-review\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "\"description\":\"Review recent stack results and decide what to do next.\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "\"name\":\"planning\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2.stdout, "\"description\":\"Plan generated work.\"") != null);
 }
 
 test "cli: top-level new add start flow" {

@@ -243,7 +243,7 @@ pub const Supervisor = struct {
                 try self.handleSleepItem(stack_name, &item);
                 continue;
             }
-            if ((item.kind == .clear or item.kind == .@"new") and item.thread != null) {
+            if ((item.kind == .clear or item.kind == .new) and item.thread != null) {
                 try self.handleThreadLocalCommand(stack_name, &item);
                 running_in_stack += 1;
                 continue;

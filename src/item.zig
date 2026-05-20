@@ -19,7 +19,7 @@ pub const Kind = enum {
     prompt,
     compact,
     clear,
-    @"new",
+    new,
     sleep,
     review,
 
@@ -28,7 +28,7 @@ pub const Kind = enum {
             .{ "prompt", Kind.prompt },
             .{ "compact", Kind.compact },
             .{ "clear", Kind.clear },
-            .{ "new", Kind.@"new" },
+            .{ "new", Kind.new },
             .{ "sleep", Kind.sleep },
             .{ "review", Kind.review },
         };
@@ -43,7 +43,7 @@ pub const Kind = enum {
             .prompt => "prompt",
             .compact => "compact",
             .clear => "clear",
-            .@"new" => "new",
+            .new => "new",
             .sleep => "sleep",
             .review => "review",
         };
@@ -53,12 +53,12 @@ pub const Kind = enum {
 pub const Command = enum {
     compact,
     clear,
-    @"new",
+    new,
 
     pub fn fromString(s: []const u8) ?Command {
         if (std.mem.eql(u8, s, "compact")) return .compact;
         if (std.mem.eql(u8, s, "clear")) return .clear;
-        if (std.mem.eql(u8, s, "new")) return .@"new";
+        if (std.mem.eql(u8, s, "new")) return .new;
         return null;
     }
 
@@ -66,7 +66,7 @@ pub const Command = enum {
         return switch (self) {
             .compact => "compact",
             .clear => "clear",
-            .@"new" => "new",
+            .new => "new",
         };
     }
 
@@ -74,7 +74,7 @@ pub const Command = enum {
         return switch (self) {
             .compact => .compact,
             .clear => .clear,
-            .@"new" => .@"new",
+            .new => .new,
         };
     }
 };
@@ -892,7 +892,7 @@ pub fn validate(item: *const Item, diag: *ValidationDiagnostic) ValidationError!
                 return error.ClearHasBody;
             }
         },
-        .@"new" => {},
+        .new => {},
     }
 
     // Workdir presence is parsed but its allowlist check is deferred to

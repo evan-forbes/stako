@@ -45,7 +45,6 @@ const Scratch = struct {
 fn initNotesRoot(allocator: std.mem.Allocator, root: []const u8) !void {
     var r = try init_mod.run(allocator, .{
         .root = root,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xD3D0,
@@ -232,6 +231,13 @@ fn dirExistsPath(path: []const u8) bool {
     var d = std.fs.cwd().openDir(path, .{}) catch return false;
     d.close();
     return true;
+}
+
+fn pathListContains(paths: []const []const u8, needle: []const u8) bool {
+    for (paths) |p| {
+        if (std.mem.eql(u8, p, needle)) return true;
+    }
+    return false;
 }
 
 const WakeCounter = struct {
@@ -847,6 +853,112 @@ test "mutation: append routine writes ordinary items in one commit and one wake"
     const log = try readFileAlloc(a, log_path);
     defer a.free(log);
     try std.testing.expect(std.mem.indexOf(u8, log, "\"action\":\"append_routine\"") != null);
+}
+
+test "mutation: append routine creates missing thread in target stack only" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "append-routine-stack-thread");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try makeRealRepo(a, s.abs_path);
+
+    const routines_dir = try std.fs.path.join(a, &.{ s.abs_path, "routines" });
+    defer a.free(routines_dir);
+    try std.fs.cwd().makePath(routines_dir);
+    const prompt_dir = try std.fs.path.join(a, &.{ s.abs_path, "prompts", "planning" });
+    defer a.free(prompt_dir);
+    try std.fs.cwd().makePath(prompt_dir);
+    {
+        const routine_path = try std.fs.path.join(a, &.{ s.abs_path, "routines", "planning.toml" });
+        defer a.free(routine_path);
+        var f = try std.fs.cwd().createFile(routine_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(
+            \\version = 1
+            \\thread = "admin"
+            \\
+            \\[[step]]
+            \\prompts = ["../prompts/planning/research.md"]
+            \\
+        );
+    }
+    {
+        const prompt_path = try std.fs.path.join(a, &.{ s.abs_path, "prompts", "planning", "research.md" });
+        defer a.free(prompt_path);
+        var f = try std.fs.cwd().createFile(prompt_path, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("Research the task.");
+    }
+
+    var audit_writer = try audit_mod.Writer.init(a, s.abs_path);
+    defer audit_writer.deinit();
+    var registry = try stack_mod.StackRegistry.init(a, s.abs_path, &audit_writer, true);
+    defer registry.deinit();
+    var wakes = WakeCounter{};
+    registry.setPostCommitHook(&wakes, countWake);
+    const client = registry.localClient("local", "/internal/routine-test");
+
+    switch (client.createStack(.{ .name = "other", .created_at_override = "2026-05-17T12:00:00.000Z" })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            ok.deinit();
+        },
+        .err => return error.UnexpectedCreateStackFailure,
+    }
+    switch (client.ensureThread("other", .{
+        .stack = "other",
+        .name = "admin",
+        .target_provider = "openai",
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            ok.deinit();
+        },
+        .err => return error.UnexpectedCreateThreadFailure,
+    }
+    wakes.count = 0;
+
+    var routine = try client.readRoutine("planning");
+    defer routine.deinit();
+    const baseline_commits = try countCommits(a, s.abs_path);
+    const result = client.appendRoutine("default", .{
+        .stack = "default",
+        .routine = &routine,
+        .created_at_override = "2026-05-17T12:00:00.000Z",
+    });
+    switch (result) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+            try std.testing.expect(pathListContains(ok.output.paths, "stacks/default/threads/admin.toml"));
+        },
+        .err => |e| {
+            std.debug.print("appendRoutine failed: {any}\n", .{e});
+            return error.UnexpectedAppendRoutineFailure;
+        },
+    }
+
+    try std.testing.expectEqual(baseline_commits + 1, try countCommits(a, s.abs_path));
+    try std.testing.expectEqual(@as(usize, 1), wakes.count);
+
+    const default_thread_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "default", "threads", "admin.toml" });
+    defer a.free(default_thread_path);
+    const default_thread = try readFileAlloc(a, default_thread_path);
+    defer a.free(default_thread);
+    try std.testing.expect(std.mem.indexOf(u8, default_thread, "name = \"admin\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default_thread, "provider = \"openai\"") == null);
+
+    const other_thread_path = try std.fs.path.join(a, &.{ s.abs_path, "stacks", "other", "threads", "admin.toml" });
+    defer a.free(other_thread_path);
+    const other_thread = try readFileAlloc(a, other_thread_path);
+    defer a.free(other_thread);
+    try std.testing.expect(std.mem.indexOf(u8, other_thread, "provider = \"openai\"") != null);
+
+    var item = try client.readItem("default", "0001");
+    defer item.deinit();
+    try std.testing.expect(item.thread != null);
+    try std.testing.expectEqualStrings("admin", item.thread.?.name);
 }
 
 test "mutation: append routine validation failure leaves stack unchanged" {

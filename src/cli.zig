@@ -156,7 +156,6 @@ pub fn parseDaemonArgs(args: []const []const u8) UsageError!DaemonArgs {
 pub const InitArgs = struct {
     /// Defaults to the user's visible stako notes root when --root is absent.
     root: []const u8 = paths.DEFAULT_NOTES_ROOT,
-    yes: bool = false,
     quiet: bool = false,
     /// Hidden: override `created_at` for deterministic fixture regeneration.
     /// Use only via `tools/regen_*` workflows; not documented in --help.
@@ -170,9 +169,7 @@ pub fn parseInitArgs(args: []const []const u8) UsageError!InitArgs {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--yes") or std.mem.eql(u8, a, "-y")) {
-            out.yes = true;
-        } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
+        if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
             out.quiet = true;
         } else if (try flagValue(args, &i, "--root", "-r", "--root=")) |v| {
             out.root = v;
@@ -971,7 +968,6 @@ fn runInit(
 
     var report = init_mod.run(allocator, .{
         .root = root,
-        .yes = parsed.yes,
         .quiet = parsed.quiet,
         .now_override = parsed.now_override,
         .rng_seed_override = parsed.rng_seed_override,
@@ -1100,10 +1096,9 @@ fn printDaemonUsage(w: anytype) !void {
 
 fn printInitUsage(w: anytype) !void {
     try w.writeAll(
-        \\Usage: stako init [--root, -r <path>] [--yes, -y] [--quiet, -q]
+        \\Usage: stako init [--root, -r <path>] [--quiet, -q]
         \\
         \\  --root, -r <path>   Path to the notes root (default: ~/stako).
-        \\  --yes, -y           Skip prompts; auto-init git when needed.
         \\  --quiet, -q         Suppress per-line output; print a summary only.
         \\
     );
@@ -1180,7 +1175,6 @@ fn printReport(w: anytype, r: *const init_mod.Report, quiet: bool) !void {
 test "parseInitArgs: defaults" {
     const a = try parseInitArgs(&.{});
     try std.testing.expectEqualStrings(paths.DEFAULT_NOTES_ROOT, a.root);
-    try std.testing.expect(!a.yes);
     try std.testing.expect(!a.quiet);
 }
 
@@ -1200,8 +1194,7 @@ test "parseInitArgs: -r short flag" {
 }
 
 test "parseInitArgs: flags" {
-    const a = try parseInitArgs(&.{ "-y", "-q" });
-    try std.testing.expect(a.yes);
+    const a = try parseInitArgs(&.{"-q"});
     try std.testing.expect(a.quiet);
 }
 
@@ -1242,12 +1235,10 @@ test "parseInitArgs: -r requires value" {
 }
 
 test "parseInitArgs: flag ordering does not matter" {
-    const a = try parseInitArgs(&.{ "-y", "--root", "/tmp/x", "-q" });
-    try std.testing.expect(a.yes);
+    const a = try parseInitArgs(&.{ "--root", "/tmp/x", "-q" });
     try std.testing.expect(a.quiet);
     try std.testing.expectEqualStrings("/tmp/x", a.root);
-    const b = try parseInitArgs(&.{ "--root", "/tmp/x", "-y", "-q" });
-    try std.testing.expect(b.yes);
+    const b = try parseInitArgs(&.{ "-q", "--root", "/tmp/x" });
     try std.testing.expect(b.quiet);
     try std.testing.expectEqualStrings("/tmp/x", b.root);
 }

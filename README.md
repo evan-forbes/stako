@@ -14,9 +14,11 @@ stako init                     # bootstraps ~/stako with the standard layout
 stako daemon start             # serves the loopback API
 ```
 
-`init` creates `~/stako/` with `prompts/`, `routines/`, `stacks/`, an `AGENTS.md` primer, a `config.toml`, and a local auth token. Run subsequent commands in another terminal.
+`init` creates `~/stako/` with empty `prompts/` and `routines/` directories, `stacks/default/stack.toml`, an `AGENTS.md` primer, a documented `config.toml`, and a local auth token. Run subsequent commands in another terminal.
 
-### 2. Create a stack
+## Human CLI authoring
+
+### 1. Create a stack
 
 A stack lives at `~/stako/stacks/<name>/`. Every step it runs produces a commit in the notes-root git repo, scoped to that stack's files. Inputs you register on an item (file, commit, or prior item) become explicit context the agent sees.
 
@@ -24,7 +26,7 @@ A stack lives at `~/stako/stacks/<name>/`. Every step it runs produces a commit 
 stako new add-rate-limiter
 ```
 
-### 3. Write prompts
+### 2. Write prompts
 
 Prompts live in `~/stako/prompts/` as plain markdown. Tell the agent what to read, what to do, and what to write back.
 
@@ -34,7 +36,7 @@ Prompts live in `~/stako/prompts/` as plain markdown. Tell the agent what to rea
   review.md
 ```
 
-### 4. Write a routine
+### 3. Write a routine
 
 A routine in `~/stako/routines/<name>.toml` is an ordered list of steps that apply prompts. Steps on the same thread run in one agent context. A step can switch threads to run on a different harness.
 
@@ -58,7 +60,7 @@ prompts = ["../prompts/rate-limiter/review.md"]
 
 The builder writes the implementation commit. Each reviewer reads that commit on its own thread, so Claude and Codex give independent audits.
 
-### 5. Queue it and start
+### 4. Queue it and start
 
 ```sh
 stako add implement-and-review add-rate-limiter
@@ -67,6 +69,44 @@ stako stack show add-rate-limiter
 ```
 
 `add` appends the routine to the stack. `start` resumes execution. `stack show` displays items and status.
+
+## Programmatic Python authoring
+
+The Python SDK is a thin local client for generated workflows. It writes prompt and routine source files under the notes root, then uses the daemon API for stack creation, thread targeting, queue mutation, and start/resume. It does not edit stack item metadata directly.
+
+```python
+from stako import Client, Prompt, Routine, Stack
+
+client = Client(root="~/stako")
+
+routine = (
+    Routine("implement-and-review")
+    .thread("builder", provider="openai", model="gpt-5")
+    .thread("reviewer", provider="anthropic")
+    .prompt(
+        Prompt.combine(
+            Prompt.text("Read the registered inputs."),
+            Prompt.from_file("docs/rate-limiter-notes.md"),
+        ),
+        thread="builder",
+    )
+    .prompt(
+        "Review the builder's commit for correctness and missing tests.",
+        thread="reviewer",
+    )
+    .compact(thread="builder")
+)
+
+Stack(client, "add-rate-limiter").create().add(routine).start()
+```
+
+This materializes files like:
+
+```text
+~/stako/prompts/generated/implement-and-review/step-0001.md
+~/stako/prompts/generated/implement-and-review/step-0002.md
+~/stako/routines/implement-and-review.toml
+```
 
 ## How fixups happen
 

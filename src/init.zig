@@ -26,11 +26,6 @@ pub const Options = struct {
     /// Absolute or cwd-relative path to the notes root. Caller resolves
     /// "cwd default vs --root flag" before calling.
     root: []const u8,
-    /// When true: skip prompts; auto `git init` non-git roots; proceed inside
-    /// existing git repos without asking. When false: skip git init (the
-    /// layout itself is still created). CLI exposes this as `--yes`/`-y`;
-    /// tests always pass true.
-    yes: bool = true,
     /// When true: emit only PASS/FAIL summary rather than per-line creates.
     /// Tests pass true to keep test output uncluttered.
     quiet: bool = false,
@@ -110,23 +105,16 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
     if (git_state == .repo_here) {
         // Already a git repo in this dir; nothing to do for git.
     } else if (git_state == .parent_repo) {
-        // Design decision (resolved-was-to-decide section): proceed and let
-        // the CLI layer surface a warning to the user.
         report.inside_existing_git = true;
-    } else if (opts.yes) {
+    } else {
         try gitInitHere(&root_dir);
         report.git_initialized = true;
-    } else {
-        // Without --yes we still go ahead and create the layout, but the CLI
-        // layer is expected to have prompted; for now treat unattended-no-flag
-        // as "skip git init". The init step itself doesn't depend on git.
     }
 
     // 2. Directory layout.
     try ensureDir(&root_dir, "stacks", &report, r_arena);
     try ensureDir(&root_dir, "stacks/default", &report, r_arena);
     try ensureDir(&root_dir, "prompts", &report, r_arena);
-    try ensureDir(&root_dir, "prompts/admin-review", &report, r_arena);
     try ensureDir(&root_dir, "routines", &report, r_arena);
     try ensureDir(&root_dir, "state", &report, r_arena);
 
@@ -147,25 +135,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
         );
     }
 
-    // 4. Built-in admin routine and prompt assets.
-    try writeFileIfAbsent(
-        &root_dir,
-        "routines/admin-review.toml",
-        &report,
-        r_arena,
-        .{ .admin_routine = {} },
-        null,
-    );
-    try writeFileIfAbsent(
-        &root_dir,
-        "prompts/admin-review/evaluate.md",
-        &report,
-        r_arena,
-        .{ .admin_prompt = {} },
-        null,
-    );
-
-    // 5. AGENTS.md — concise primer agents discover at the root.
+    // 4. AGENTS.md — concise primer agents discover at the root.
     try writeFileIfAbsent(
         &root_dir,
         "AGENTS.md",
@@ -175,7 +145,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
         null,
     );
 
-    // 6. config.toml — single per-root config file, gitignored.
+    // 5. config.toml — single per-root config file, gitignored.
     try writeFileIfAbsent(
         &root_dir,
         "config.toml",
@@ -185,7 +155,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
         null,
     );
 
-    // 7. state/local_token — generated once, perms 0600, gitignored.
+    // 6. state/local_token — generated once, perms 0600, gitignored.
     // Token bytes are produced lazily inside writeFileIfAbsent so we don't
     // burn kernel entropy on idempotent re-init runs.
     try writeFileIfAbsent(
@@ -197,7 +167,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Report {
         0o600,
     );
 
-    // 8. .gitignore — append missing lines.
+    // 7. .gitignore — append missing lines.
     try appendGitignoreLines(&root_dir, &report, r_arena);
 
     return report;
@@ -326,8 +296,6 @@ fn chmodIfPosix(root_dir: *std.fs.Dir, rel: []const u8, mode: u32) !void {
 
 const FileSpec = union(enum) {
     stack_defaults: struct { created_at: []const u8 },
-    admin_routine,
-    admin_prompt,
     agents_md,
     config,
     /// Generated lazily inside `writeFileIfAbsent` to avoid wasted entropy
@@ -350,13 +318,11 @@ fn writeFileIfAbsent(
     }
 
     // Build content in a buffer first so we can write atomically.
-    var buf = std.ArrayList(u8){};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(arena);
     const w = buf.writer(arena);
     switch (spec) {
         .stack_defaults => |sd| try stack_config.writeDefaults(w, sd.created_at),
-        .admin_routine => try writeAdminRoutine(w),
-        .admin_prompt => try writeAdminPrompt(w),
         .agents_md => try writeAgentsMd(w),
         .config => try writeConfig(w),
         .local_token => |seed| {
@@ -407,89 +373,68 @@ fn writeAtomic(root_dir: *std.fs.Dir, rel: []const u8, content: []const u8) !voi
     };
 }
 
-fn writeAdminRoutine(w: anytype) !void {
-    try w.writeAll(
-        \\version = 1
-        \\description = "Review recent stack results and decide what to do next."
-        \\thread = "admin"
-        \\
-        \\[[step]]
-        \\prompts = ["../prompts/admin-review/evaluate.md"]
-        \\
-    );
-}
-
-fn writeAdminPrompt(w: anytype) !void {
-    try w.writeAll(
-        \\Review the registered item and commit inputs from recent stack work.
-        \\
-        \\Write any useful decision, summary, or follow-up notes as ordinary files in the workdir or notes tree. Use one of these decision labels when you write a decision:
-        \\
-        \\- proceed
-        \\- needs follow-up
-        \\- done
-        \\
-        \\Include the evidence that led to the decision and any recommended follow-up prompts. Do not modify stack metadata directly.
-        \\
-    );
-}
-
 fn writeAgentsMd(w: anytype) !void {
     try w.writeAll(
         \\# Agents guide
         \\
-        \\This is a stako notes root. Stako queues prompt work onto stacks and
-        \\runs it through coding-agent harnesses.
+        \\This is a stako notes root. Stako queues prompts and routines onto
+        \\named stacks, then drives coding-agent harnesses through the local
+        \\daemon. Inputs and outputs are recorded as git commits.
         \\
-        \\## Layout
+        \\## Safe mutation
         \\
-        \\- `prompts/<name>.md` — reusable prompt text.
-        \\- `routines/<name>.toml` — ordered steps that combine prompts.
-        \\- `stacks/<stack>/` — work queues.
+        \\- Write prompt source files under `prompts/`.
+        \\- Write routine TOML under `routines/`.
+        \\- Create stacks with `stako new <stack>`.
+        \\- Queue work with `stako add <routine> <stack>`.
+        \\- Resume work with `stako start <stack>`.
+        \\
+        \\Do not edit stack item metadata by hand. Stack state under
+        \\`stacks/<stack>/` is daemon-owned; use the CLI or loopback API for
+        \\queue changes, starts, retries, cancellations, and thread updates.
         \\
         \\## Writing prompts
         \\
-        \\Plain markdown. Tell the agent what to read, what to do, and what
-        \\to write back. Keep prose in prompt files, not in routine TOML.
-        \\Multi-file prompts are conventional: split a long prompt into
-        \\`prompts/<routine>/intro.md`, `body.md`, etc.
+        \\Prompt files are plain markdown. Put the instructions, context, and
+        \\expected outputs in prompt files, not in routine TOML. Long prompts
+        \\can be split across multiple files and combined by a routine step.
         \\
         \\## Writing routines
         \\
         \\A routine is `routines/<name>.toml` with one or more `[[step]]`
-        \\blocks. Prompt paths are relative to the routine file.
+        \\blocks. Prompt paths are relative to the routine file. Each step
+        \\runs on a named thread; steps with the same thread reuse that agent
+        \\session when possible. Provider, model, and related routing settings
+        \\belong to the thread, not to individual steps.
         \\
         \\```toml
-        \\thread = "admin"
+        \\thread = "builder"
         \\
         \\[[step]]
-        \\prompts = ["../prompts/planning/intro.md", "../prompts/planning/body.md"]
+        \\prompts = ["../prompts/example/implement.md"]
         \\
         \\[[step]]
-        \\command = "compact"
+        \\thread = "reviewer"
+        \\prompts = ["../prompts/example/review.md"]
         \\
         \\[[step]]
         \\thread = "builder"
-        \\prompts = ["../prompts/planning/build.md"]
+        \\command = "compact"
         \\```
         \\
-        \\- `prompts = [...]` concatenates those files into one prompt item.
-        \\- Set root `thread = "..."` for the default; override per-step when needed.
-        \\- Use `command = "compact"` for compact steps.
+        \\Create another stack with `stako new <name>` when work needs its
+        \\own queue, thread history, and config.
         \\
-        \\## Running stako
+        \\## Common commands
         \\
         \\```sh
-        \\stako daemon start                 # serve the loopback API
-        \\stako new <stack>                  # create a stack
-        \\stako add <routine> <stack>        # append a routine to it
-        \\stako start <stack>                # resume execution
-        \\stako stack show <stack>           # inspect items + status
-        \\stako routine list                 # list available routines
+        \\stako daemon start
+        \\stako new <stack>
+        \\stako add <routine> <stack>
+        \\stako start <stack>
+        \\stako stack show <stack>
+        \\stako routine list
         \\```
-        \\
-        \\Do not edit stack item metadata by hand — go through `stako add` /
-        \\`stako start` so the daemon stays consistent.
         \\
     );
 }
@@ -555,7 +500,7 @@ fn appendGitignoreLines(
     }
 
     // Determine which lines are missing.
-    var missing = std.ArrayList([]const u8){};
+    var missing: std.ArrayList([]const u8) = .empty;
     defer missing.deinit(arena);
     for (GITIGNORE_LINES) |line| {
         if (!gitignoreContainsLine(existing, line)) {
@@ -569,7 +514,7 @@ fn appendGitignoreLines(
     }
 
     // Compose new contents = existing + (optional newline) + new lines.
-    var out = std.ArrayList(u8){};
+    var out: std.ArrayList(u8) = .empty;
     defer out.deinit(arena);
     if (existing.len > 0) {
         try out.appendSlice(arena, existing);

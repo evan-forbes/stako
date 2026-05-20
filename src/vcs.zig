@@ -146,9 +146,11 @@ pub fn commit(
     // Note: we need the message path relative to the repo root because we cd
     // into it. `.git/STAKO_COMMIT_MSG` works.
     const commit_argv = [_][]const u8{
-        "-c", name_arg,
-        "-c", email_arg,
-        "commit", "--no-gpg-sign", "--allow-empty-message", "-F", ".git/STAKO_COMMIT_MSG",
+        "-c",                    name_arg,
+        "-c",                    email_arg,
+        "commit",                "--no-gpg-sign",
+        "--allow-empty-message", "-F",
+        ".git/STAKO_COMMIT_MSG",
     };
     const commit_out = try runGit(allocator, repo_root, &commit_argv, true);
     defer allocator.free(commit_out);

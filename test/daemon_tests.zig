@@ -42,7 +42,6 @@ const Scratch = struct {
 fn initNotesRoot(allocator: std.mem.Allocator, root: []const u8) !void {
     var r = try init_mod.run(allocator, .{
         .root = root,
-        .yes = true,
         .quiet = true,
         .now_override = "2026-05-10T14:00:00Z",
         .rng_seed_override = 0xD3D0,
@@ -723,22 +722,19 @@ test "daemon: bearer-auth negative paths surface 401 over HTTP" {
     try drv.serve(3);
 
     // (1) Missing Authorization header on a mutation route.
-    const r1 = try httpRequestRaw(a, drv.daemon.bound_port,
-        "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    const r1 = try httpRequestRaw(a, drv.daemon.bound_port, "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
     defer a.free(r1);
     const p1 = splitResponse(r1);
     try std.testing.expectEqual(@as(u16, 401), p1.status);
     try std.testing.expect(std.mem.indexOf(u8, p1.body, "\"code\":\"identity_required\"") != null);
 
     // (2) Wrong scheme (Basic).
-    const r2 = try httpRequestRaw(a, drv.daemon.bound_port,
-        "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Basic abcdef\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    const r2 = try httpRequestRaw(a, drv.daemon.bound_port, "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Basic abcdef\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
     defer a.free(r2);
     try std.testing.expectEqual(@as(u16, 401), splitResponse(r2).status);
 
     // (3) Wrong token (right shape, wrong bytes).
-    const r3 = try httpRequestRaw(a, drv.daemon.bound_port,
-        "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    const r3 = try httpRequestRaw(a, drv.daemon.bound_port, "POST /stacks HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
     defer a.free(r3);
     try std.testing.expectEqual(@as(u16, 401), splitResponse(r3).status);
 }
@@ -956,9 +952,7 @@ test "F3: POST with Content-Length: 0 on a mutation route handled cleanly" {
     // applies the resume mutation. The assertion is "no 500/crash"; the
     // exact 2xx/4xx is recorded for the regression guard.
     const token = drv.daemon.token.bytes;
-    const req = try std.fmt.allocPrint(a,
-        "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Length: 0\r\n\r\n",
-        .{token});
+    const req = try std.fmt.allocPrint(a, "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Length: 0\r\n\r\n", .{token});
     defer a.free(req);
     const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
     defer a.free(resp);
@@ -984,9 +978,7 @@ test "F3: request body exceeding MAX_BODY_BYTES is rejected with 400 validation_
     const body = try a.alloc(u8, body_size);
     defer a.free(body);
     @memset(body, 'a');
-    const head = try std.fmt.allocPrint(a,
-        "POST /stacks/demo/items HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n",
-        .{ token, body_size });
+    const head = try std.fmt.allocPrint(a, "POST /stacks/demo/items HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{ token, body_size });
     defer a.free(head);
     const req = try a.alloc(u8, head.len + body.len);
     defer a.free(req);
@@ -1013,9 +1005,7 @@ test "F3: Authorization header lookup is case-insensitive in both name and schem
 
     // Lowercase header name + lowercase scheme.
     {
-        const req = try std.fmt.allocPrint(a,
-            "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nauthorization: bearer {s}\r\nContent-Length: 0\r\n\r\n",
-            .{token});
+        const req = try std.fmt.allocPrint(a, "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nauthorization: bearer {s}\r\nContent-Length: 0\r\n\r\n", .{token});
         defer a.free(req);
         const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
         defer a.free(resp);
@@ -1028,9 +1018,7 @@ test "F3: Authorization header lookup is case-insensitive in both name and schem
 
     // ALLCAPS header name + canonical scheme.
     {
-        const req = try std.fmt.allocPrint(a,
-            "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAUTHORIZATION: Bearer {s}\r\nContent-Length: 0\r\n\r\n",
-            .{token});
+        const req = try std.fmt.allocPrint(a, "POST /stacks/demo/resume HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAUTHORIZATION: Bearer {s}\r\nContent-Length: 0\r\n\r\n", .{token});
         defer a.free(req);
         const resp = try httpRequestRaw(a, drv.daemon.bound_port, req);
         defer a.free(resp);
