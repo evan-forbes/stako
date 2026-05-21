@@ -33,8 +33,7 @@ class Transport(Protocol):
         path: str,
         body: bytes | None,
         headers: dict[str, str],
-    ) -> tuple[int, bytes]:
-        ...
+    ) -> tuple[int, bytes]: ...
 
 
 class HttpTransport:
@@ -73,13 +72,29 @@ class Client:
     def stack(self, name: str) -> Stack:
         return Stack(self, name)
 
+    def write_prompt(self, rel_path: str, text: str) -> Path:
+        # Caller owns returned path. Writes a routine template prompt under
+        # <root>/prompts/, refusing paths that escape that directory. Affects
+        # future routine appends only — not items already on a stack.
+        base = (self.root / "prompts").resolve()
+        target = (self.root / "prompts" / rel_path).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError:
+            raise ValueError(f"prompt path escapes prompts/: {rel_path!r}") from None
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
     def get(self, path: str) -> Any:
         return self.request("GET", path)
 
     def post(self, path: str, payload: dict[str, Any] | None = None) -> Any:
         return self.request("POST", path, payload or {})
 
-    def request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+    def request(
+        self, method: str, path: str, payload: dict[str, Any] | None = None
+    ) -> Any:
         body = None
         headers = {
             "Accept": "application/json",
@@ -89,7 +104,9 @@ class Client:
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        status, raw = self.transport.request(self.host, self.port, method, path, body, headers)
+        status, raw = self.transport.request(
+            self.host, self.port, method, path, body, headers
+        )
         if status >= 400:
             raise ApiError(status, path, raw)
         if not raw:
@@ -137,36 +154,62 @@ class Stack:
         self.client.post(f"/stacks/{self.name}/resume", {})
         return self
 
+    def get_prompt(self, item_id: str) -> str | None:
+        data = self.client.get(f"/stacks/{self.name}/items/{item_id}/prompt")
+        return (data or {}).get("prompt")
+
+    def edit_prompt(self, item_id: str, prompt: str) -> Stack:
+        # Overwrite a queued item's prompt in place. The daemon rejects
+        # non-queued items with a 409.
+        self.client.post(
+            f"/stacks/{self.name}/items/{item_id}/prompt", {"prompt": prompt}
+        )
+        return self
+
+    def rerun(self, item_id: str, prompt: str, *, thread_mode: str = "fresh") -> Stack:
+        # Fork a finished (or any) item: append a new item with the edited
+        # prompt, copying the original's kind/slug/thread and recording lineage
+        # via `parents`. The original item and its history are left intact.
+        item = self.client.get(f"/stacks/{self.name}/items/{item_id}") or {}
+        payload: dict[str, Any] = {
+            "kind": item.get("kind", "prompt"),
+            "slug": item.get("slug", "rerun"),
+            "prompt": prompt,
+            "parents": [item_id],
+        }
+        # thread_mode only applies alongside a thread; a thread-less item reruns
+        # as a standalone fresh context.
+        thread = item.get("thread")
+        if isinstance(thread, dict) and thread.get("name"):
+            payload["thread"] = thread["name"]
+            payload["thread_mode"] = thread_mode
+        self.client.post(f"/stacks/{self.name}/items", payload)
+        return self
+
 
 class Prompt:
-    def __init__(self, kind: str, value: str | Path | list[Prompt]):
-        self.kind = kind
-        self.value = value
+    """Prompt text resolved eagerly: files are read and parts joined at construction."""
+
+    SEPARATOR = "\n\n---\n\n"
+
+    def __init__(self, body: str):
+        self.body = body
 
     @classmethod
     def text(cls, text: str) -> Prompt:
-        return cls("text", text)
+        return cls(text)
 
     @classmethod
     def from_file(cls, path: str | Path) -> Prompt:
-        return cls("file", Path(path).expanduser())
+        return cls(Path(path).expanduser().read_text(encoding="utf-8"))
 
     @classmethod
     def combine(cls, *parts: str | Prompt) -> Prompt:
-        prompts = [p if isinstance(p, Prompt) else Prompt.text(p) for p in parts]
-        return cls("combine", prompts)
+        bodies = [part.body if isinstance(part, Prompt) else part for part in parts]
+        return cls(cls.SEPARATOR.join(bodies))
 
     def render(self) -> str:
-        if self.kind == "text":
-            return str(self.value)
-        if self.kind == "file":
-            return Path(self.value).read_text(encoding="utf-8")
-        if self.kind == "combine":
-            return "\n\n---\n\n".join(part.render() for part in self.value)  # type: ignore[union-attr]
-        raise ValueError(f"unknown prompt kind: {self.kind}")
-
-    def fingerprint(self) -> str:
-        return self.render()
+        return self.body
 
 
 @dataclass
@@ -212,7 +255,11 @@ class Routine:
         thread: str,
     ) -> Routine:
         _check_name(thread, "thread")
-        prompt = text_or_prompt if isinstance(text_or_prompt, Prompt) else Prompt.text(text_or_prompt)
+        prompt = (
+            text_or_prompt
+            if isinstance(text_or_prompt, Prompt)
+            else Prompt.text(text_or_prompt)
+        )
         self._steps.append(_Step("prompt", thread, prompt))
         return self
 
@@ -237,8 +284,10 @@ class Routine:
             lines.append("[[step]]")
             lines.append(f"thread = {_toml_string(step.thread)}")
             if step.kind == "prompt":
+                if step.prompt is None:
+                    raise ValueError("prompt step is missing its prompt")
                 prompt_path = prompt_dir / f"step-{index:04d}.md"
-                prompt_path.write_text(step.prompt.render(), encoding="utf-8")  # type: ignore[union-attr]
+                prompt_path.write_text(step.prompt.render(), encoding="utf-8")
                 rel = f"../prompts/generated/{name}/{prompt_path.name}"
                 lines.append(f"prompts = [{_toml_string(rel)}]")
             elif step.kind == "compact":
@@ -267,6 +316,16 @@ class Routine:
             out.append({"name": name, "target": target})
         return out
 
+    def overwrite_prompt(self, root: str | Path, step_index: int, text: str) -> Path:
+        # Caller owns returned path. Rewrites this routine's generated step
+        # prompt (1-based `step_index`) so the next append uses the new text.
+        name = self._ensure_name()
+        prompt_dir = Path(root).expanduser() / "prompts" / "generated" / name
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        path = prompt_dir / f"step-{step_index:04d}.md"
+        path.write_text(text, encoding="utf-8")
+        return path
+
     def _ensure_name(self) -> str:
         if self.name is None:
             digest = hashlib.sha256()
@@ -284,7 +343,7 @@ class Routine:
                 digest.update(step.thread.encode())
                 digest.update(b"\0")
                 if step.prompt is not None:
-                    digest.update(step.prompt.fingerprint().encode())
+                    digest.update(step.prompt.render().encode())
                 digest.update(b"\0")
             self.name = f"routine-{digest.hexdigest()[:12]}"
         return self.name

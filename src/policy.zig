@@ -10,8 +10,8 @@
 //! - `*` — wildcard, all actions allowed (typical local-user default).
 //! - `stack.create` — create new stacks.
 //! - `stack.<name>.<verb>` — per-stack action where `<verb>` ∈
-//!   `append`, `insert`, `retry`, `cancel`, `supersede`, `pause`, `resume`,
-//!   `config`. The name may be `*` (any stack). The verb may be `*`
+//!   `append`, `insert`, `retry`, `cancel`, `supersede`, `edit`, `pause`,
+//!   `resume`, `config`. The name may be `*` (any stack). The verb may be `*`
 //!   (any verb on the named stack).
 //! - `provider.<name>` — dispatch through a provider; `<name>` ∈
 //!   `anthropic`, `openai`, `google`. The name may be `*` (any provider).
@@ -58,6 +58,7 @@ pub const Action = enum {
     retry_item,
     cancel_item,
     supersede_item,
+    update_item_prompt,
     pause_stack,
     resume_stack,
     update_stack_config,
@@ -73,6 +74,7 @@ pub const Action = enum {
             .retry_item => "retry_item",
             .cancel_item => "cancel_item",
             .supersede_item => "supersede_item",
+            .update_item_prompt => "update_item_prompt",
             .pause_stack => "pause_stack",
             .resume_stack => "resume_stack",
             .update_stack_config => "update_stack_config",
@@ -91,6 +93,7 @@ pub const Action = enum {
             .retry_item => "retry",
             .cancel_item => "cancel",
             .supersede_item => "supersede",
+            .update_item_prompt => "edit",
             .pause_stack => "pause",
             .resume_stack => "resume",
             .update_stack_config => "config",

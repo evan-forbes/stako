@@ -733,6 +733,75 @@ test "mutation: append item then cancel produces two commits + two audit lines" 
     try std.testing.expectEqual(baseline_commits + 3, new_commits);
 }
 
+test "mutation: edit prompt rewrites a queued item; non-queued edit is rejected" {
+    const a = std.testing.allocator;
+    var s = try Scratch.create(a, "edit-prompt");
+    defer s.deinit();
+    try initNotesRoot(a, s.abs_path);
+    try makeRealRepo(a, s.abs_path);
+    const baseline_commits = try countCommits(a, s.abs_path);
+
+    var drv = Driver{ .allocator = a, .daemon = try startDaemonWithGit(a, s.abs_path) };
+    defer drv.deinit();
+    try drv.startWorker();
+    try drv.serve(6);
+
+    // Create stack + append a prompt item carrying an initial prompt body.
+    {
+        const req = try buildPostRequest(a, "/stacks", drv.daemon.token.bytes, "{\"name\":\"demo\"}");
+        defer a.free(req);
+        const resp = try httpRaw(a, drv.daemon.bound_port, req);
+        defer a.free(resp);
+        try std.testing.expectEqual(@as(u16, 200), splitResponse(resp).status);
+    }
+    {
+        const body = "{\"kind\":\"prompt\",\"slug\":\"hello\",\"prompt\":\"original\",\"target\":{\"match\":\"any\"}}";
+        const req = try buildPostRequest(a, "/stacks/demo/items", drv.daemon.token.bytes, body);
+        defer a.free(req);
+        const resp = try httpRaw(a, drv.daemon.bound_port, req);
+        defer a.free(resp);
+        try std.testing.expectEqual(@as(u16, 200), splitResponse(resp).status);
+    }
+    // Edit the queued item's prompt.
+    {
+        const req = try buildPostRequest(a, "/stacks/demo/items/0001/prompt", drv.daemon.token.bytes, "{\"prompt\":\"edited body\"}");
+        defer a.free(req);
+        const resp = try httpRaw(a, drv.daemon.bound_port, req);
+        defer a.free(resp);
+        try std.testing.expectEqual(@as(u16, 200), splitResponse(resp).status);
+    }
+    // GET the prompt back: it reflects the edit. The prompt read is policy-gated
+    // (like /output), so the loopback token is required.
+    {
+        const req = try std.fmt.allocPrint(a, "GET /stacks/demo/items/0001/prompt HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAuthorization: Bearer {s}\r\n\r\n", .{drv.daemon.token.bytes});
+        defer a.free(req);
+        const resp = try httpRaw(a, drv.daemon.bound_port, req);
+        defer a.free(resp);
+        const r = splitResponse(resp);
+        try std.testing.expectEqual(@as(u16, 200), r.status);
+        try std.testing.expect(std.mem.indexOf(u8, r.body, "edited body") != null);
+    }
+    // Cancel → terminal; a subsequent edit is rejected with 409.
+    {
+        const req = try buildPostRequest(a, "/stacks/demo/items/0001/cancel", drv.daemon.token.bytes, "{}");
+        defer a.free(req);
+        const resp = try httpRaw(a, drv.daemon.bound_port, req);
+        defer a.free(resp);
+        try std.testing.expectEqual(@as(u16, 200), splitResponse(resp).status);
+    }
+    {
+        const req = try buildPostRequest(a, "/stacks/demo/items/0001/prompt", drv.daemon.token.bytes, "{\"prompt\":\"too late\"}");
+        defer a.free(req);
+        const resp = try httpRaw(a, drv.daemon.bound_port, req);
+        defer a.free(resp);
+        // A state-machine violation surfaces as 400 invalid_status_transition.
+        try std.testing.expectEqual(@as(u16, 400), splitResponse(resp).status);
+    }
+    // create + append + edit + cancel = 4 commits; GET and the rejected edit add none.
+    const new_commits = try countCommits(a, s.abs_path);
+    try std.testing.expectEqual(baseline_commits + 4, new_commits);
+}
+
 test "mutation: append routine writes ordinary items in one commit and one wake" {
     const a = std.testing.allocator;
     var s = try Scratch.create(a, "append-routine");

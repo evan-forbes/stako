@@ -13,12 +13,15 @@
 //!     GET  /stacks/{name}/config                     → JSON config view
 //!     GET  /stacks/{name}/items                      → JSON list of items
 //!     GET  /stacks/{name}/items/{id}                 → JSON item detail
+//!     GET  /stacks/{name}/items/{id}/prompt          → JSON {prompt}
+//!     GET  /stacks/{name}/items/{id}/rendered-prompt → JSON {rendered_prompt, exists}
 //!     GET  /stacks/{name}/events                     → SSE event stream
 //!     GET  /providers                                → JSON provider status list
 //!     GET  /providers/{name}                         → JSON provider status
 //!     POST /stacks                                   → create stack
 //!     POST /stacks/{name}/items                      → append item
 //!     POST /stacks/{name}/items/{id}/...             → item transitions
+//!     POST /stacks/{name}/items/{id}/prompt          → overwrite a queued item's prompt
 //!     POST /stacks/{name}/config                     → patch stack config
 
 const std = @import("std");
@@ -486,6 +489,8 @@ const Route = enum {
     stack_item_get,
     stack_item_output_get,
     stack_item_output_summary_get,
+    stack_item_prompt_get, // GET /stacks/{name}/items/{id}/prompt
+    stack_item_rendered_prompt_get, // GET /stacks/{name}/items/{id}/rendered-prompt
     stack_threads_list,
     stack_thread_get,
     routines_list,
@@ -498,6 +503,7 @@ const Route = enum {
     item_retry, // POST /stacks/{name}/items/{id}/retry
     item_cancel, // POST /stacks/{name}/items/{id}/cancel
     item_supersede, // POST /stacks/{name}/items/{id}/supersede
+    item_update_prompt, // POST /stacks/{name}/items/{id}/prompt
     stack_pause, // POST /stacks/{name}/pause
     stack_resume, // POST /stacks/{name}/resume
     stack_threads_create, // POST /stacks/{name}/threads
@@ -523,6 +529,7 @@ const Route = enum {
             .item_retry,
             .item_cancel,
             .item_supersede,
+            .item_update_prompt,
             .stack_pause,
             .stack_resume,
             .stack_threads_create,
@@ -543,6 +550,7 @@ const Route = enum {
             .item_retry => .retry_item,
             .item_cancel => .cancel_item,
             .item_supersede => .supersede_item,
+            .item_update_prompt => .update_item_prompt,
             .stack_pause => .pause_stack,
             .stack_resume => .resume_stack,
             .stack_threads_create, .stack_thread_patch, .stack_thread_archive => .update_stack_config,
@@ -556,6 +564,7 @@ const Route = enum {
             .stacks_list => .stacks_create,
             .stack_config_get => .stack_config_post,
             .stack_items_list => .items_append,
+            .stack_item_prompt_get => .item_update_prompt,
             .stack_threads_list => .stack_threads_create,
             .stack_thread_get => .stack_thread_patch,
             else => self,
@@ -660,6 +669,10 @@ pub fn matchRoute(target: []const u8) RouteMatch {
                 return .{ .route = .stack_item_output_get, .stack = name, .item = id };
             if (std.mem.eql(u8, tail, "output/summary"))
                 return .{ .route = .stack_item_output_summary_get, .stack = name, .item = id };
+            if (std.mem.eql(u8, tail, "prompt"))
+                return .{ .route = .stack_item_prompt_get, .stack = name, .item = id };
+            if (std.mem.eql(u8, tail, "rendered-prompt"))
+                return .{ .route = .stack_item_rendered_prompt_get, .stack = name, .item = id };
             if (std.mem.eql(u8, tail, "insert"))
                 return .{ .route = .item_insert, .stack = name, .item = id };
             if (std.mem.eql(u8, tail, "retry"))
@@ -739,6 +752,8 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         .stack_item_get => if (wants_html) try respondItemHtml(self, req, m.stack, m.item) else try respondStackItemGet(self, req, m.stack, m.item),
         .stack_item_output_get => try respondItemOutputGet(self, req, m.stack, m.item),
         .stack_item_output_summary_get => try respondItemOutputSummaryGet(self, req, m.stack, m.item),
+        .stack_item_prompt_get => try respondItemPromptGet(self, req, m.stack, m.item),
+        .stack_item_rendered_prompt_get => try respondItemRenderedPromptGet(self, req, m.stack, m.item),
         .stack_threads_list => try respondThreadsList(self, req, m.stack),
         .stack_thread_get => if (wants_html) try respondThreadHtml(self, req, m.stack, m.thread) else try respondThreadGet(self, req, m.stack, m.thread),
         .routines_list => try respondRoutinesList(self, req),
@@ -754,6 +769,7 @@ fn route(self: *Daemon, req: *std.http.Server.Request) !void {
         .item_retry => try handleTransitionRoute(self, req, m.stack, m.item, .retry, form_body != null),
         .item_cancel => try handleTransitionRoute(self, req, m.stack, m.item, .cancel, form_body != null),
         .item_supersede => try handleTransition(self, req, m.stack, m.item, .supersede),
+        .item_update_prompt => try handleUpdatePrompt(self, req, m.stack, m.item, form_body),
         .stack_pause => try handlePauseResume(self, req, m.stack, true, form_body != null),
         .stack_resume => try handlePauseResume(self, req, m.stack, false, form_body != null),
         .stack_threads_create => try handleCreateThread(self, req, m.stack),
@@ -831,6 +847,8 @@ fn routeNeedsReadPolicy(route_match: Route) bool {
     return switch (route_match) {
         .stack_item_output_get,
         .stack_item_output_summary_get,
+        .stack_item_prompt_get,
+        .stack_item_rendered_prompt_get,
         .stack_threads_list,
         .stack_thread_get,
         .routines_list,
@@ -866,7 +884,7 @@ fn authorizeRead(self: *Daemon, req: *std.http.Server.Request, m: RouteMatch) !v
 fn capabilitySlug(action: policy.Action, stack: []const u8, buf: []u8) []const u8 {
     return switch (action) {
         .create_stack => "stack.create",
-        .read_stack, .append_item, .insert_item, .retry_item, .cancel_item, .supersede_item, .pause_stack, .resume_stack, .update_stack_config => blk: {
+        .read_stack, .append_item, .insert_item, .retry_item, .cancel_item, .supersede_item, .update_item_prompt, .pause_stack, .resume_stack, .update_stack_config => blk: {
             const verb: []const u8 = switch (action) {
                 .read_stack => "read",
                 .append_item => "append",
@@ -874,6 +892,7 @@ fn capabilitySlug(action: policy.Action, stack: []const u8, buf: []u8) []const u
                 .retry_item => "retry",
                 .cancel_item => "cancel",
                 .supersede_item => "supersede",
+                .update_item_prompt => "edit",
                 .pause_stack => "pause",
                 .resume_stack => "resume",
                 .update_stack_config => "config",
@@ -1023,6 +1042,7 @@ fn policyActionToAudit(a: policy.Action) audit.Action {
         .retry_item => .retry_item,
         .cancel_item => .cancel_item,
         .supersede_item => .supersede_item,
+        .update_item_prompt => .update_item_prompt,
         .pause_stack => .pause_stack,
         .resume_stack => .resume_stack,
         .update_stack_config => .update_stack_config,
@@ -1396,6 +1416,92 @@ fn respondItemOutputSummaryGet(
     try respondJson(req, buf.items);
 }
 
+/// Resolve the on-disk item directory (`<id>-<slug>`) for an item, or respond
+/// with the matching error and return null. Caller frees the returned path.
+fn itemDirAbsOrRespond(self: *Daemon, req: *std.http.Server.Request, name: []const u8, id: []const u8, api_path: []const u8) !?[]u8 {
+    if (!storage.isValidStackName(name) or !item_mod.isValidId(id)) {
+        try respondError(req, .validation_failed, "invalid stack name or item id", &.{});
+        return null;
+    }
+    const client = localClient(self, api_path);
+    var item = client.readItem(name, id) catch |e| switch (e) {
+        error.NotFound => {
+            try respondError(req, .not_found, "item not found", &.{ .{ .key = "stack", .value = name }, .{ .key = "id", .value = id } });
+            return null;
+        },
+        error.BadItemId => {
+            try respondError(req, .validation_failed, "invalid item id", &.{.{ .key = "id", .value = id }});
+            return null;
+        },
+        else => {
+            try respondError(req, .internal, @errorName(e), &.{});
+            return null;
+        },
+    };
+    defer item.deinit();
+    const dir_name = try std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ item.id, item.slug });
+    defer self.allocator.free(dir_name);
+    return try std.fs.path.join(self.allocator, &.{ self.notes_root_abs, "stacks", name, dir_name });
+}
+
+fn respondItemPromptGet(self: *Daemon, req: *std.http.Server.Request, name: []const u8, id: []const u8) !void {
+    const dir_abs = (try itemDirAbsOrRespond(self, req, name, id, "GET /stacks/{name}/items/{id}/prompt")) orelse return;
+    defer self.allocator.free(dir_abs);
+    const body = readSmallFile(self.allocator, dir_abs, "prompt.md") catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
+    defer if (body) |b| self.allocator.free(b);
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    const w = buf.writer(self.allocator);
+    if (body) |b| {
+        try w.writeAll("{\"prompt\":\"");
+        try errors.writeJsonString(w, b);
+        try w.writeAll("\"}");
+    } else {
+        try w.writeAll("{\"prompt\":null}");
+    }
+    try respondJson(req, buf.items);
+}
+
+fn respondItemRenderedPromptGet(self: *Daemon, req: *std.http.Server.Request, name: []const u8, id: []const u8) !void {
+    const dir_abs = (try itemDirAbsOrRespond(self, req, name, id, "GET /stacks/{name}/items/{id}/rendered-prompt")) orelse return;
+    defer self.allocator.free(dir_abs);
+
+    var buf = std.ArrayList(u8){};
+    defer buf.deinit(self.allocator);
+    const w = buf.writer(self.allocator);
+
+    // `?meta=1` returns only existence + byte size, so a client can probe a
+    // large rendered prompt before downloading it.
+    if (std.mem.indexOf(u8, req.head.target, "meta=1") != null) {
+        const size = statSmallFile(self.allocator, dir_abs, "rendered_prompt.md") catch null;
+        if (size) |n| {
+            try w.print("{{\"exists\":true,\"bytes\":{d}}}", .{n});
+        } else {
+            try w.writeAll("{\"exists\":false,\"bytes\":0}");
+        }
+        try respondJson(req, buf.items);
+        return;
+    }
+
+    const body = readSmallFile(self.allocator, dir_abs, "rendered_prompt.md") catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
+    defer if (body) |b| self.allocator.free(b);
+    if (body) |b| {
+        try w.writeAll("{\"rendered_prompt\":\"");
+        try errors.writeJsonString(w, b);
+        try w.writeAll("\",\"exists\":true}");
+    } else {
+        try w.writeAll("{\"rendered_prompt\":null,\"exists\":false}");
+    }
+    try respondJson(req, buf.items);
+}
+
 fn respondThreadsList(self: *Daemon, req: *std.http.Server.Request, name: []const u8) !void {
     if (!storage.isValidStackName(name)) {
         try respondError(req, .validation_failed, "invalid stack name", &.{.{ .key = "name", .value = name }});
@@ -1436,9 +1542,21 @@ fn respondThreadGet(self: *Daemon, req: *std.http.Server.Request, stack_name: []
         },
     };
     defer thread.deinit();
+
+    const all_items = client.listItems(stack_name) catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
+    defer client.freeItemList(all_items);
+    var filtered = std.ArrayList(storage.ItemSummary){};
+    defer filtered.deinit(self.allocator);
+    for (all_items) |it| {
+        if (it.thread_name) |tn| if (std.mem.eql(u8, tn, thread_name)) try filtered.append(self.allocator, it);
+    }
+
     var buf = std.ArrayList(u8){};
     defer buf.deinit(self.allocator);
-    try writeThreadJson(buf.writer(self.allocator), &thread);
+    try writeThreadJson(buf.writer(self.allocator), &thread, filtered.items);
     try respondJson(req, buf.items);
 }
 
@@ -1594,6 +1712,7 @@ fn respondStackHtml(self: *Daemon, req: *std.http.Server.Request, name: []const 
         // Daemon is loopback-only (see `isLoopbackHost`), so embedding the
         // mutation token in HTML served to the browser stays local.
         .local_token = self.token.bytes,
+        .enable_sse = self.sse_hub != null,
     }) catch {
         try respondError(req, .internal, "failed to render stack", &.{});
         return;
@@ -1729,9 +1848,21 @@ fn respondThreadHtml(self: *Daemon, req: *std.http.Server.Request, stack_name: [
         },
     };
     defer thread.deinit();
+
+    const all_items = client.listItems(stack_name) catch |e| {
+        try respondError(req, .internal, @errorName(e), &.{});
+        return;
+    };
+    defer client.freeItemList(all_items);
+    var filtered = std.ArrayList(storage.ItemSummary){};
+    defer filtered.deinit(self.allocator);
+    for (all_items) |it| {
+        if (it.thread_name) |tn| if (std.mem.eql(u8, tn, thread_name)) try filtered.append(self.allocator, it);
+    }
+
     var buf = std.ArrayList(u8){};
     defer buf.deinit(self.allocator);
-    html.renderThread(self.allocator, &buf, .{ .stack = stack_name, .thread = &thread }) catch {
+    html.renderThread(self.allocator, &buf, .{ .stack = stack_name, .thread = &thread, .items = filtered.items }) catch {
         try respondError(req, .internal, "failed to render thread", &.{});
         return;
     };
@@ -1767,6 +1898,20 @@ fn readSmallFile(
         return null;
     }
     return try allocator.realloc(buf, n);
+}
+
+/// Size of a file under `dir`, or null if it does not exist. Used by the
+/// rendered-prompt `?meta=1` probe so clients can avoid downloading a large body.
+fn statSmallFile(allocator: std.mem.Allocator, dir_abs: []const u8, name: []const u8) !?u64 {
+    const path = try std.fs.path.join(allocator, &.{ dir_abs, name });
+    defer allocator.free(path);
+    var f = std.fs.cwd().openFile(path, .{}) catch |e| switch (e) {
+        error.FileNotFound => return null,
+        else => return e,
+    };
+    defer f.close();
+    const st = try f.stat();
+    return st.size;
 }
 
 // ---------- JSON writers (typed views) ----------
@@ -1878,6 +2023,21 @@ fn writeItemJson(w: anytype, it: *const item_mod.Item) !void {
             try errors.writeJsonString(w, s);
             try w.writeAll("\"");
         }
+        try w.writeAll("}");
+    }
+    if (it.thread) |th| {
+        try w.writeAll(",\"thread\":{\"name\":\"");
+        try errors.writeJsonString(w, th.name);
+        try w.print("\",\"mode\":\"{s}\"}}", .{th.mode.toString()});
+    }
+    if (it.inputs) |inp| {
+        try w.writeAll(",\"inputs\":{");
+        var first = true;
+        if (inp.items) |arr| try writeJsonArrayField(w, "items", arr, &first);
+        if (inp.files) |arr| try writeJsonArrayField(w, "files", arr, &first);
+        if (inp.commits) |arr| try writeJsonArrayField(w, "commits", arr, &first);
+        if (!first) try w.writeAll(",");
+        try w.print("\"mode\":\"{s}\"", .{inp.mode.toString()});
         try w.writeAll("}");
     }
     if (it.sleep) |s| {
@@ -2012,7 +2172,7 @@ fn writeThreadSummaryListJson(w: anytype, threads: []const storage.ThreadSummary
     try w.writeAll("]}");
 }
 
-fn writeThreadJson(w: anytype, th: *const stack_thread.Thread) !void {
+fn writeThreadJson(w: anytype, th: *const stack_thread.Thread, items: []const storage.ItemSummary) !void {
     try w.writeAll("{\"name\":\"");
     try errors.writeJsonString(w, th.name);
     try w.writeAll("\",\"status\":\"");
@@ -2040,6 +2200,8 @@ fn writeThreadJson(w: anytype, th: *const stack_thread.Thread) !void {
         if (s.last_transcript_path) |v| try writeOptionalStringMember(w, "last_transcript_path", v, &first);
         try w.writeAll("}");
     }
+    try w.writeAll(",\"items\":");
+    try writeItemSummaryListJson(w, items);
     try w.writeAll("}");
 }
 
@@ -2213,12 +2375,14 @@ const ParsedItemBody = struct {
     input_mode: ?item_mod.InputMode = null,
     thread_name: ?[]const u8 = null,
     thread_mode: ?item_mod.ThreadMode = null,
+    parents: ?[]const []const u8 = null,
     sleep_until: ?[]const u8 = null,
 
     fn deinit(self: *ParsedItemBody, allocator: std.mem.Allocator) void {
         if (self.input_items) |v| allocator.free(v);
         if (self.input_files) |v| allocator.free(v);
         if (self.input_commits) |v| allocator.free(v);
+        if (self.parents) |v| allocator.free(v);
     }
 };
 
@@ -2335,6 +2499,11 @@ fn parseItemBody(allocator: std.mem.Allocator, req: *std.http.Server.Request, ob
             out.deinit(allocator);
             return null;
         };
+    }
+    out.parents = try optionalStringArray(allocator, req, obj, "parents");
+    if (obj.get("parents") != null and out.parents == null) {
+        out.deinit(allocator);
+        return null;
     }
     return out;
 }
@@ -2486,6 +2655,7 @@ fn handleAppendItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
         .input_mode = parsed.input_mode,
         .thread_name = parsed.thread_name,
         .thread_mode = parsed.thread_mode,
+        .parents = parsed.parents,
         .sleep_until = parsed.sleep_until,
     };
 
@@ -2516,11 +2686,45 @@ fn handleInsertItem(self: *Daemon, req: *std.http.Server.Request, stack: []const
         .input_mode = parsed.input_mode,
         .thread_name = parsed.thread_name,
         .thread_mode = parsed.thread_mode,
+        .parents = parsed.parents,
         .sleep_until = parsed.sleep_until,
     };
 
     const client = localClient(self, "POST /stacks/{name}/items/{id}/insert");
     try respondMutationResult(req, self.allocator, client.insertItem(stack, input), stack, ref);
+}
+
+/// Handle POST /stacks/{name}/items/{id}/prompt. Accepts a JSON body
+/// `{"prompt":"..."}` (programmatic clients) or, when the auth path consumed a
+/// form-encoded body, a `prompt=...` field (the browser edit form).
+fn handleUpdatePrompt(self: *Daemon, req: *std.http.Server.Request, stack: []const u8, id: []const u8, form_body: ?[]const u8) !void {
+    const client = localClient(self, "POST /stacks/{name}/items/{id}/prompt");
+    if (form_body) |fb| {
+        const owned = (try formFieldValue(self.allocator, fb, "prompt")) orelse {
+            try respondError(req, .validation_failed, "missing form field `prompt`", &.{});
+            return;
+        };
+        defer self.allocator.free(owned);
+        try respondMutationResult(req, self.allocator, client.updateItemPrompt(stack, .{ .stack = stack, .id = id, .prompt = owned }), stack, id);
+        return;
+    }
+    var json = (try readJsonValue(self, req)) orelse return;
+    defer json.deinit();
+    const obj = (try expectObject(req, json.parsed.value)) orelse return;
+    const prompt = (try requiredString(req, obj, "prompt")) orelse return;
+    try respondMutationResult(req, self.allocator, client.updateItemPrompt(stack, .{ .stack = stack, .id = id, .prompt = prompt }), stack, id);
+}
+
+/// Extract one field from an `application/x-www-form-urlencoded` body,
+/// URL-decoded. Returns a fresh allocation (caller frees), or null if absent.
+fn formFieldValue(allocator: std.mem.Allocator, body: []const u8, key: []const u8) !?[]u8 {
+    var it = std.mem.splitScalar(u8, body, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], key)) continue;
+        return try formUrlDecode(allocator, pair[eq + 1 ..]);
+    }
+    return null;
 }
 
 fn handleTransition(
@@ -3124,6 +3328,16 @@ test "matchRoute: known paths" {
     try std.testing.expectEqual(Route.stack_item_get, m4.route);
     try std.testing.expectEqualStrings("smoke", m4.stack);
     try std.testing.expectEqualStrings("0001", m4.item);
+
+    const m5 = matchRoute("/stacks/smoke/items/0001/prompt");
+    try std.testing.expectEqual(Route.stack_item_prompt_get, m5.route);
+    try std.testing.expectEqualStrings("0001", m5.item);
+    // POST on the same path promotes to the edit mutation.
+    try std.testing.expectEqual(Route.item_update_prompt, m5.route.promotePost());
+
+    const m6 = matchRoute("/stacks/smoke/items/0001/rendered-prompt");
+    try std.testing.expectEqual(Route.stack_item_rendered_prompt_get, m6.route);
+    try std.testing.expectEqualStrings("0001", m6.item);
 }
 
 test "matchRoute: unknown" {

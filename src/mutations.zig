@@ -629,6 +629,112 @@ pub fn applyTransition(
     };
 }
 
+// ---------- edit a queued item's prompt ----------
+
+pub const UpdateItemPromptInput = struct {
+    stack: []const u8,
+    id: []const u8,
+    /// New prompt body, written verbatim to the item's `prompt.md`.
+    prompt: []const u8,
+};
+
+/// Overwrite the prompt body of a queued prompt/review item. Rewrites
+/// `prompt.md`, drops any stale `rendered_prompt.md` (the supervisor
+/// regenerates it at dispatch), and bumps `updated_at`.
+pub fn applyUpdateItemPrompt(
+    allocator: std.mem.Allocator,
+    notes_root_abs: []const u8,
+    ident: IdentityCtx,
+    input: UpdateItemPromptInput,
+) Error!MutationOutput {
+    if (!storage.isValidStackName(input.stack)) return error.InvalidName;
+    if (!item_mod.isValidId(input.id)) return error.ValidationFailed;
+    if (input.prompt.len > prompt_materializer.MAX_INPUT_BYTES) return error.ValidationFailed;
+    const stack_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, "stacks", input.stack });
+    defer allocator.free(stack_abs);
+    if (!dirExists(stack_abs)) return error.NotFound;
+
+    const item_dir_name = (try findItemDir(allocator, stack_abs, input.id)) orelse return error.NotFound;
+    defer allocator.free(item_dir_name);
+    const meta_abs = try std.fs.path.join(allocator, &.{ stack_abs, item_dir_name, "meta.toml" });
+    defer allocator.free(meta_abs);
+
+    var src_buf: []u8 = undefined;
+    {
+        var f = try std.fs.cwd().openFile(meta_abs, .{});
+        defer f.close();
+        const stat = try f.stat();
+        src_buf = try allocator.alloc(u8, stat.size);
+        _ = try f.readAll(src_buf);
+    }
+    defer allocator.free(src_buf);
+    var diag: item_mod.ParseDiagnostic = .{};
+    var item = item_mod.parseSlice(allocator, src_buf, &diag) catch return error.ValidationFailed;
+    defer item.deinit();
+
+    // Editing in place is only safe before the item runs.
+    if (item.status != .queued) return error.InvalidStateTransition;
+    // Only prompt-bearing kinds have a prompt.md to overwrite.
+    if (item.kind != .prompt and item.kind != .review) return error.ValidationFailed;
+    // Items whose body is composed from a `prompts = [...]` file list have no
+    // single prompt.md; those are edited at the source files instead.
+    if (item.prompts != null) return error.ValidationFailed;
+
+    const prompt_abs = try std.fs.path.join(allocator, &.{ stack_abs, item_dir_name, "prompt.md" });
+    defer allocator.free(prompt_abs);
+    {
+        var f = try std.fs.cwd().createFile(prompt_abs, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(input.prompt);
+    }
+
+    var ts_buf: [40]u8 = undefined;
+    const now_str = audit.nowRfc3339Millis(&ts_buf);
+    item.updated_at = try item.arena.allocator().dupe(u8, now_str);
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    try item_mod.write(&item, out.writer(allocator));
+    {
+        var f = try std.fs.cwd().createFile(meta_abs, .{ .truncate = true });
+        defer f.close();
+        try f.writeAll(out.items);
+    }
+
+    var paths_list = std.ArrayList([]u8){};
+    errdefer {
+        for (paths_list.items) |p| allocator.free(p);
+        paths_list.deinit(allocator);
+    }
+    try paths_list.append(allocator, try itemMetaRel(allocator, input.stack, item_dir_name));
+    try paths_list.append(allocator, try std.fmt.allocPrint(allocator, "stacks/{s}/{s}/prompt.md", .{ input.stack, item_dir_name }));
+    if (try prompt_materializer.renderedPromptExists(allocator, notes_root_abs, input.stack, item_dir_name)) {
+        const rendered_rel = try prompt_materializer.renderedPromptRel(allocator, input.stack, item_dir_name);
+        const rendered_abs = try std.fs.path.join(allocator, &.{ notes_root_abs, rendered_rel });
+        defer allocator.free(rendered_abs);
+        std.fs.cwd().deleteFile(rendered_abs) catch {};
+        try appendPathUnique(allocator, &paths_list, rendered_rel);
+    }
+
+    const subject = try std.fmt.allocPrint(allocator, "item: edit prompt {s}", .{input.id});
+    const body = try std.fmt.allocPrint(allocator, "stack: {s}\nitem: {s}\nidentity: {s}\napi: {s}\n", .{ input.stack, input.id, ident.identity, ident.api_path });
+    const target = try std.fmt.allocPrint(allocator, "stack/{s}/item/{s}", .{ input.stack, input.id });
+    const details_buf = try allocator.alloc(u8, input.id.len);
+    @memcpy(details_buf, input.id);
+    const details = try allocator.alloc(audit.DetailKV, 1);
+    details[0] = .{ .key = "id", .value = details_buf };
+
+    return .{
+        .allocator = allocator,
+        .paths = try paths_list.toOwnedSlice(allocator),
+        .commit_subject = subject,
+        .commit_body = body,
+        .audit_action = .update_item_prompt,
+        .audit_target = target,
+        .audit_details = details,
+        .detail_storage = details_buf,
+    };
+}
+
 // ---------- runtime-initiated transitions ----------
 
 /// Status targets the runtime/session-manager may set. Internal-only.

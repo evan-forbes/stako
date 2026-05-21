@@ -568,6 +568,59 @@ test "renderItem: no controls for running item (mutation layer rejects mid-run c
     try std.testing.expect(std.mem.indexOf(u8, out.items, "<form") == null);
 }
 
+test "renderItem: queued prompt item renders an editable prompt form" {
+    const a = std.testing.allocator;
+    var root = try SmokeRoot.create(a, "item-edit-form");
+    defer root.deinit();
+    var reader = try storage.Reader.init(a, root.abs_path);
+    defer reader.deinit();
+    var item = try reader.readItem("smoke", "0002"); // queued prompt
+    defer item.deinit();
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderItem(a, &out, .{
+        .stack = "smoke",
+        .item = &item,
+        .prompt_body = "current body",
+        .transcript_jsonl = null,
+        .enable_sse = false,
+        .local_token = "0123456789abcdef0123456789abcdef",
+    });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "action=\"/stacks/smoke/items/0002/prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<textarea name=\"prompt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "current body</textarea>") != null);
+    // The read-only <pre> prompt block is replaced by the editable form.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<pre class=\"prompt\">current body") == null);
+}
+
+test "renderThread: lists items that run on the thread with input/output links" {
+    const a = std.testing.allocator;
+    var diag: stako.stack_thread.ParseDiagnostic = .{};
+    var thread = try stako.stack_thread.parseSlice(a,
+        \\version = 1
+        \\name = "builder"
+        \\status = "active"
+        \\created_at = 2026-05-10T14:00:00Z
+        \\updated_at = 2026-05-10T14:00:00Z
+        \\
+    , &diag);
+    defer thread.deinit();
+
+    const items = [_]storage.ItemSummary{
+        .{ .id = "0001", .slug = "impl", .kind = "prompt", .status = "completed", .thread_name = "builder" },
+        .{ .id = "0002", .slug = "review", .kind = "review", .status = "queued", .thread_name = "builder" },
+    };
+
+    var out = std.ArrayList(u8){};
+    defer out.deinit(a);
+    try html.renderThread(a, &out, .{ .stack = "smoke", .thread = &thread, .items = &items });
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<h2>Items</h2>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "/stacks/smoke/items/0001\">0001</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "/stacks/smoke/items/0001#rendered-prompt\">prompt</a>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "/stacks/smoke/items/0002#output\">output</a>") != null);
+}
+
 test "renderItem: hostile token never breaks out of hidden-input attribute" {
     // Defense-in-depth: the local token is a hex string by construction
     // (see `local_token.zig`), but the renderer still runs every dynamic

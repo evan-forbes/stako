@@ -45,6 +45,9 @@ pub fn run(
         .retry => return try runTransition(allocator, &client, args, "retry", stdout, stderr),
         .cancel => return try runTransition(allocator, &client, args, "cancel", stdout, stderr),
         .supersede => return try runSupersede(allocator, &client, args, stdout, stderr),
+        .edit_prompt => return try runEditPrompt(allocator, &client, args, stdout, stderr),
+        .rerun => return try runRerun(allocator, &client, args, stdout, stderr),
+        .item => return try runItem(allocator, &client, args, stdout, stderr),
         .pause => return try runPauseResume(allocator, &client, args, true, stdout, stderr),
         .@"resume" => return try runPauseResume(allocator, &client, args, false, stdout, stderr),
         .output => return try runOutput(allocator, &client, args, stdout, stderr),
@@ -740,6 +743,245 @@ fn buildSupersedeBody(allocator: std.mem.Allocator, replacement: []const u8) ![]
     return try body.toOwnedSlice(allocator);
 }
 
+fn runItem(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    if (args.show_prompt or args.show_rendered) {
+        const sub: []const u8 = if (args.show_rendered) "rendered-prompt" else "prompt";
+        const field: []const u8 = if (args.show_rendered) "rendered_prompt" else "prompt";
+        const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/{s}", .{ args.name, args.item_id, sub });
+        defer allocator.free(path);
+        var resp = http_client.get(client, path) catch |e| return reportClientError(e, client, path, stderr);
+        defer resp.deinit();
+        if (resp.status != 200) return reportApiError(resp.status, resp.body, path, args.flags.verbose, stderr);
+        if (args.flags.json) {
+            try stdout.writeAll(resp.body);
+            try stdout.writeAll("\n");
+            return 0;
+        }
+        // Human mode: print the field unescaped via a real JSON parse.
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch {
+            try stdout.writeAll(resp.body);
+            try stdout.writeAll("\n");
+            return 0;
+        };
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get(field)) |v| if (v == .string) {
+                try stdout.writeAll(v.string);
+                if (v.string.len == 0 or v.string[v.string.len - 1] != '\n') try stdout.writeAll("\n");
+            };
+        }
+        return 0;
+    }
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}", .{ args.name, args.item_id });
+    defer allocator.free(path);
+    var resp = http_client.get(client, path) catch |e| return reportClientError(e, client, path, stderr);
+    defer resp.deinit();
+    if (resp.status != 200) return reportApiError(resp.status, resp.body, path, args.flags.verbose, stderr);
+    try stdout.writeAll(resp.body);
+    try stdout.writeAll("\n");
+    return 0;
+}
+
+fn runEditPrompt(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    const prompt = resolveEditedPrompt(allocator, client, args, stderr) catch |e| switch (e) {
+        error.PromptUnavailable => return 2,
+        else => return e,
+    };
+    defer allocator.free(prompt);
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/prompt", .{ args.name, args.item_id });
+    defer allocator.free(path);
+    const body = try buildPromptBody(allocator, prompt);
+    defer allocator.free(body);
+    return postAndReport(client, path, body, args.flags, stdout, stderr);
+}
+
+fn runRerun(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stdout: anytype,
+    stderr: anytype,
+) !u8 {
+    // Fork: append a NEW item carrying the edited prompt, copying the original's
+    // kind/slug/thread and recording lineage via `parents`. The original item,
+    // its output, and its commit are left untouched.
+    const item_path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}", .{ args.name, args.item_id });
+    defer allocator.free(item_path);
+    var item_resp = http_client.get(client, item_path) catch |e| return reportClientError(e, client, item_path, stderr);
+    defer item_resp.deinit();
+    if (item_resp.status != 200) return reportApiError(item_resp.status, item_resp.body, item_path, args.flags.verbose, stderr);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, item_resp.body, .{}) catch {
+        try stderr.writeAll("stako: could not parse item response\n");
+        return 1;
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) {
+        try stderr.writeAll("stako: unexpected item response\n");
+        return 1;
+    }
+    const obj = parsed.value.object;
+    const kind = jsonStringField(obj, "kind") orelse "prompt";
+    const slug = jsonStringField(obj, "slug") orelse "rerun";
+    var thread_name: ?[]const u8 = null;
+    if (obj.get("thread")) |tv| if (tv == .object) if (tv.object.get("name")) |nv| if (nv == .string) {
+        thread_name = nv.string;
+    };
+
+    const prompt = resolveEditedPrompt(allocator, client, args, stderr) catch |e| switch (e) {
+        error.PromptUnavailable => return 2,
+        else => return e,
+    };
+    defer allocator.free(prompt);
+
+    var body = std.ArrayList(u8){};
+    defer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{\"kind\":\"");
+    try writeJsonStr(w, kind);
+    try w.writeAll("\",\"slug\":\"");
+    try writeJsonStr(w, slug);
+    try w.writeAll("\",\"prompt\":\"");
+    try writeJsonStr(w, prompt);
+    try w.writeAll("\",\"parents\":[\"");
+    try writeJsonStr(w, args.item_id);
+    try w.writeAll("\"]");
+    // thread_mode only applies alongside a thread; a thread-less item reruns
+    // as a standalone fresh context.
+    if (thread_name) |tn| {
+        const mode = if (args.thread_mode.len > 0) args.thread_mode else "fresh";
+        try w.writeAll(",\"thread\":\"");
+        try writeJsonStr(w, tn);
+        try w.writeAll("\",\"thread_mode\":\"");
+        try writeJsonStr(w, mode);
+        try w.writeAll("\"");
+    }
+    try w.writeAll("}");
+
+    const post_path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items", .{args.name});
+    defer allocator.free(post_path);
+    return postAndReport(client, post_path, body.items, args.flags, stdout, stderr);
+}
+
+fn jsonStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    if (obj.get(key)) |v| if (v == .string) return v.string;
+    return null;
+}
+
+fn buildPromptBody(allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+    var body = std.ArrayList(u8){};
+    errdefer body.deinit(allocator);
+    const w = body.writer(allocator);
+    try w.writeAll("{\"prompt\":\"");
+    try writeJsonStr(w, prompt);
+    try w.writeAll("\"}");
+    return body.toOwnedSlice(allocator);
+}
+
+/// Resolve the prompt text for edit-prompt/rerun. Precedence: `--prompt-file`,
+/// `--prompt <text>`, `--stdin`, else `$EDITOR` seeded with the item's current
+/// prompt. Prints its own diagnostics and returns `error.PromptUnavailable`
+/// (the caller maps that to exit code 2). Caller frees the returned bytes.
+fn resolveEditedPrompt(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stderr: anytype,
+) ![]u8 {
+    if (args.prompt_file.len > 0) {
+        return readPromptFile(allocator, args.prompt_file) catch |e| {
+            try stderr.print("stako: failed to read --prompt-file: {s}\n", .{@errorName(e)});
+            return error.PromptUnavailable;
+        };
+    }
+    if (args.prompt_inline.len > 0) return allocator.dupe(u8, args.prompt_inline);
+    if (args.prompt_stdin) {
+        var buf: [4096]u8 = undefined;
+        var fr = std.fs.File.stdin().reader(&buf);
+        return fr.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch |e| {
+            try stderr.print("stako: failed to read stdin: {s}\n", .{@errorName(e)});
+            return error.PromptUnavailable;
+        };
+    }
+    return editPromptViaEditor(allocator, client, args, stderr);
+}
+
+fn editPromptViaEditor(
+    allocator: std.mem.Allocator,
+    client: *http_client.Client,
+    args: cli.StackArgs,
+    stderr: anytype,
+) ![]u8 {
+    const editor = std.process.getEnvVarOwned(allocator, "EDITOR") catch {
+        try stderr.writeAll("stako: no prompt source; pass --prompt-file, --prompt, --stdin, or set $EDITOR\n");
+        return error.PromptUnavailable;
+    };
+    defer allocator.free(editor);
+
+    const seed = fetchCurrentPrompt(allocator, client, args) catch null;
+    defer if (seed) |s| allocator.free(s);
+
+    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/stako-edit-{d}-{x}.md", .{ std.time.milliTimestamp(), std.crypto.random.int(u32) });
+    defer allocator.free(tmp_path);
+    {
+        var f = std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .exclusive = true }) catch {
+            try stderr.writeAll("stako: failed to create temp file for editor\n");
+            return error.PromptUnavailable;
+        };
+        defer f.close();
+        if (seed) |s| try f.writeAll(s);
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    var child = std.process.Child.init(&.{ editor, tmp_path }, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch {
+        try stderr.print("stako: failed to launch editor `{s}`\n", .{editor});
+        return error.PromptUnavailable;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            try stderr.writeAll("stako: editor exited non-zero; aborting\n");
+            return error.PromptUnavailable;
+        },
+        else => {
+            try stderr.writeAll("stako: editor terminated abnormally; aborting\n");
+            return error.PromptUnavailable;
+        },
+    }
+    return readPromptFile(allocator, tmp_path) catch {
+        try stderr.writeAll("stako: failed to read edited prompt\n");
+        return error.PromptUnavailable;
+    };
+}
+
+/// GET the item's current prompt.md, or null if absent/unreadable. Caller frees.
+fn fetchCurrentPrompt(allocator: std.mem.Allocator, client: *http_client.Client, args: cli.StackArgs) !?[]u8 {
+    const path = try std.fmt.allocPrint(allocator, "/stacks/{s}/items/{s}/prompt", .{ args.name, args.item_id });
+    defer allocator.free(path);
+    var resp = try http_client.get(client, path);
+    defer resp.deinit();
+    if (resp.status != 200) return null;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value == .object) if (parsed.value.object.get("prompt")) |v| if (v == .string) return try allocator.dupe(u8, v.string);
+    return null;
+}
+
 fn runPauseResume(
     allocator: std.mem.Allocator,
     client: *http_client.Client,
@@ -822,7 +1064,13 @@ fn writeJsonStr(w: anytype, s: []const u8) !void {
             '"' => try w.writeAll("\\\""),
             '\\' => try w.writeAll("\\\\"),
             '\n' => try w.writeAll("\\n"),
-            else => try w.writeByte(c),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => if (c < 0x20) {
+                try w.print("\\u{x:0>4}", .{c});
+            } else {
+                try w.writeByte(c);
+            },
         }
     }
 }

@@ -180,6 +180,14 @@ pub fn parseEvent(line: []const u8) ?ParsedEvent {
     };
 }
 
+/// Look up a top-level string field in a `data` JSON object literal (the
+/// `data_json` of a `ParsedEvent`). Returns the raw, still-JSON-escaped value
+/// or null. Used by the HTML transcript renderer to surface salient fields
+/// (e.g. a tool name or changed path) without a full JSON parse.
+pub fn dataStringField(data_json: []const u8, comptime key: []const u8) ?[]const u8 {
+    return findStringField(data_json, "\"" ++ key ++ "\":");
+}
+
 fn findStringField(src: []const u8, key_with_colon: []const u8) ?[]const u8 {
     const idx = std.mem.indexOf(u8, src, key_with_colon) orelse return null;
     var i = idx + key_with_colon.len;

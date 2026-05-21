@@ -10,7 +10,7 @@ Stako is a Zig CLI + daemon — a stack-based meta-harness that drives `claude` 
 
 ## Use the Zig skill
 
-When writing, reviewing, or debugging any Zig file, load `.claude/skills/zig/SKILL.md` (Codex: `.codex/skills/zig/SKILL.md`) and follow its breaking-changes table and quick-fixes index. The `references/` directory has 51 std-library docs scoped to 0.15.x — open the relevant one rather than guessing API shapes.
+When writing, reviewing, or debugging any Zig file, load `.claude/skills/zig/SKILL.md` for Claude or the shared `zig` skill for Codex, then follow its breaking-changes table and quick-fixes index. The skill's `references/` directory has 51 std-library docs scoped to 0.15.x — open the relevant one rather than guessing API shapes.
 
 If you hit a compile error, check the Quick Fixes table in `SKILL.md` first.
 

@@ -24,6 +24,7 @@ const item_mod = @import("item.zig");
 const stack_config = @import("stack_config.zig");
 const stack_thread = @import("stack_thread.zig");
 const storage = @import("storage.zig");
+const events = @import("events.zig");
 
 /// Escape one byte sequence for safe inclusion in HTML text or attribute
 /// values. Escapes `<`, `>`, `&`, `"`, `'`. The same escaper covers both
@@ -104,6 +105,29 @@ pub const STYLE_CSS: []const u8 =
     \\section.controls button:hover { background: #f0f0f0; }
 ;
 
+/// Shared client-side helpers for the live SSE scripts on the stack and item
+/// pages. `setStatus` repaints a status badge; `eventSummary` derives a
+/// one-line description of an event — all consumed via `textContent` only, so
+/// untrusted payload text can never inject markup. Status is derived from
+/// `session_started`/`session_ended` because the daemon emits no `item_status`
+/// event kind.
+pub const LIVE_HELPERS_JS: []const u8 =
+    \\function setStatus(el, s){ if(!el) return; el.textContent = s; el.className = "badge status-" + s; }
+    \\function eventSummary(d){
+    \\  var x = d.data || {};
+    \\  switch (d.kind) {
+    \\    case "message": return (x.role ? x.role + ": " : "") + (x.text || "").slice(0, 200);
+    \\    case "tool_call": return "tool " + (x.tool || "");
+    \\    case "tool_result": return "result " + (x.call_id || "");
+    \\    case "file_changed": return (x.op ? x.op + " " : "") + (x.path || "");
+    \\    case "command_executed": return (x.cmd || "").slice(0, 200) + (x.exit_code != null ? " (" + x.exit_code + ")" : "");
+    \\    case "session_started": return "harness " + (x.harness || "");
+    \\    case "session_ended": return (x.terminal_status || "");
+    \\    default: return "";
+    \\  }
+    \\}
+;
+
 /// Page header written by every renderer. `title` is escaped.
 fn writeHeader(w: anytype, title: []const u8) !void {
     try w.writeAll("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>");
@@ -157,6 +181,9 @@ pub const StackPageInput = struct {
     /// caller is responsible for that gate. Pages render without the form
     /// when null (used by snapshot tests and JSON callers).
     local_token: ?[]const u8 = null,
+    /// When true, append an inline SSE script so item status badges update
+    /// live as sessions start and end. Opt-in so snapshot tests stay JS-free.
+    enable_sse: bool = false,
 };
 
 /// Render `/stacks/<name>`.
@@ -221,7 +248,9 @@ pub fn renderStack(
     } else {
         try w.writeAll("<table><thead><tr><th>id</th><th>slug</th><th>kind</th><th>status</th></tr></thead><tbody>");
         for (input.items) |it| {
-            try w.writeAll("<tr><td><a href=\"/stacks/");
+            try w.writeAll("<tr data-item=\"");
+            try escape(w, it.id);
+            try w.writeAll("\"><td><a href=\"/stacks/");
             try escape(w, input.name);
             try w.writeAll("/items/");
             try escape(w, it.id);
@@ -253,6 +282,33 @@ pub fn renderStack(
             try w.writeAll("</td></tr>");
         }
         try w.writeAll("</tbody></table>");
+    }
+
+    // Optional SSE wiring: repaint item status badges live as sessions start
+    // and end. Each item row carries `data-item="<id>"`; the badge has
+    // `data-status`. Untrusted ids go through `CSS.escape` in the selector.
+    if (input.enable_sse) {
+        try w.writeAll("<script>(function(){");
+        try w.writeAll(LIVE_HELPERS_JS);
+        try w.writeAll("var es = new EventSource(\"/stacks/");
+        try escape(w, input.name);
+        try w.writeAll("/events\");");
+        try w.writeAll(
+            \\es.onmessage = function(ev){
+            \\  try {
+            \\    var d = JSON.parse(ev.data);
+            \\    if (!d.item) return;
+            \\    var sel = (window.CSS && CSS.escape) ? CSS.escape(d.item) : d.item;
+            \\    var row = document.querySelector('[data-item="' + sel + '"]');
+            \\    if (!row) return;
+            \\    var badge = row.querySelector("[data-status]");
+            \\    if (d.kind === "session_started") setStatus(badge, "running");
+            \\    else if (d.kind === "session_ended" && d.data && d.data.terminal_status) setStatus(badge, d.data.terminal_status);
+            \\  } catch (e) {}
+            \\};
+            \\})();
+        );
+        try w.writeAll("</script>");
     }
     try writeFooter(w);
 }
@@ -316,6 +372,21 @@ fn writeStatusBadge(w: anytype, status: []const u8) !void {
     try w.writeAll("\" data-status>");
     try escape(w, status);
     try w.writeAll("</span>");
+}
+
+/// Editable prompt form for a queued item. Posts `prompt` + `_token` as a
+/// plain HTML form (works without JS). The textarea is prefilled with the
+/// current prompt body, HTML-escaped.
+fn writeItemPromptEditForm(w: anytype, stack: []const u8, id: []const u8, prompt_body: ?[]const u8, token: []const u8) !void {
+    try w.writeAll("<h2>Prompt</h2><section class=\"controls\"><form method=\"POST\" action=\"/stacks/");
+    try escape(w, stack);
+    try w.writeAll("/items/");
+    try escape(w, id);
+    try w.writeAll("/prompt\"><input type=\"hidden\" name=\"_token\" value=\"");
+    try escape(w, token);
+    try w.writeAll("\"><textarea name=\"prompt\" rows=\"12\" style=\"width:100%;box-sizing:border-box;\">");
+    if (prompt_body) |b| try escape(w, b);
+    try w.writeAll("</textarea><br><button type=\"submit\">Save prompt</button></form></section>");
 }
 
 // ---------- page: item detail ----------
@@ -454,8 +525,14 @@ pub fn renderItem(
         try writeItemControls(w, input.stack, input.item.id, input.item.status.toString(), tok);
     }
 
-    // Prompt body.
-    if (input.prompt_body) |body| {
+    // Prompt body. A queued prompt/review item with a local token gets an
+    // inline edit form; everything else shows the read-only body.
+    const editable = input.local_token != null and
+        input.item.status == .queued and
+        (input.item.kind == .prompt or input.item.kind == .review);
+    if (editable) {
+        try writeItemPromptEditForm(w, input.stack, input.item.id, input.prompt_body, input.local_token.?);
+    } else if (input.prompt_body) |body| {
         try w.writeAll("<h2>Prompt</h2><pre class=\"prompt\">");
         try escape(w, body);
         try w.writeAll("</pre>");
@@ -472,7 +549,7 @@ pub fn renderItem(
     }
 
     if (input.output_summary) |summary| {
-        try w.writeAll("<h2>Output Summary</h2><pre class=\"prompt\">");
+        try w.writeAll("<h2 id=\"output\">Output Summary</h2><pre class=\"prompt\">");
         try escape(w, summary);
         try w.writeAll("</pre>");
     }
@@ -494,37 +571,35 @@ pub fn renderItem(
     // stack-level event stream the daemon already exposes (see
     // `design_web_view.md` SSE protocol).
     if (input.enable_sse) {
-        try w.writeAll("<script>");
-        try w.writeAll(
-            \\(function(){
-            \\  var es = new EventSource("/stacks/
-        );
+        try w.writeAll("<script>(function(){");
+        try w.writeAll(LIVE_HELPERS_JS);
+        try w.writeAll("var es = new EventSource(\"/stacks/");
         try escape(w, input.stack);
         try w.writeAll("/events\");");
         try w.writeAll(
-            \\  var transcriptUl = document.querySelector("ul.transcript") || (function(){var u=document.createElement("ul");u.className="transcript";var h=document.querySelectorAll("h2");(h[h.length-1]||document.body).insertAdjacentElement("afterend",u);return u;})();
-            \\  var statusEl = document.querySelector("[data-status]");
-            \\  var itemId =
+            \\var transcriptUl = document.querySelector("ul.transcript") || (function(){var u=document.createElement("ul");u.className="transcript";var h=document.querySelectorAll("h2");(h[h.length-1]||document.body).insertAdjacentElement("afterend",u);return u;})();
+            \\var statusEl = document.querySelector("[data-status]");
+            \\var itemId =
         );
         try writeJsStringLiteral(w, input.item.id);
         try w.writeAll(";");
         try w.writeAll(
-            \\  es.onmessage = function(ev){
-            \\    try {
-            \\      var d = JSON.parse(ev.data);
-            \\      if (d.item && d.item !== itemId) return;
-            \\      if (d.kind === "item_status" && statusEl && d.data && d.data.to) {
-            \\        statusEl.textContent = d.data.to;
-            \\        statusEl.className = "badge status-" + d.data.to;
-            \\      } else {
-            \\        var li = document.createElement("li");
-            \\        var ks = document.createElement("span"); ks.className = "transcript-kind"; ks.textContent = d.kind;
-            \\        var ts = document.createElement("span"); ts.className = "transcript-ts"; ts.textContent = " " + (d.ts||"");
-            \\        li.appendChild(ks); li.appendChild(ts);
-            \\        transcriptUl.appendChild(li);
-            \\      }
-            \\    } catch (e) {}
-            \\  };
+            \\es.onmessage = function(ev){
+            \\  try {
+            \\    var d = JSON.parse(ev.data);
+            \\    if (d.item && d.item !== itemId) return;
+            \\    if (d.kind === "session_started") setStatus(statusEl, "running");
+            \\    else if (d.kind === "session_ended" && d.data && d.data.terminal_status) setStatus(statusEl, d.data.terminal_status);
+            \\    if (d.kind === "message_chunk") return;
+            \\    var li = document.createElement("li");
+            \\    var ks = document.createElement("span"); ks.className = "transcript-kind"; ks.textContent = d.kind;
+            \\    var ts = document.createElement("span"); ts.className = "transcript-ts"; ts.textContent = " " + (d.ts||"");
+            \\    li.appendChild(ks); li.appendChild(ts);
+            \\    var sum = eventSummary(d);
+            \\    if (sum) { var sp = document.createElement("span"); sp.textContent = " — " + sum; li.appendChild(sp); }
+            \\    transcriptUl.appendChild(li);
+            \\  } catch (e) {}
+            \\};
             \\})();
         );
         try w.writeAll("</script>");
@@ -536,6 +611,9 @@ pub fn renderItem(
 pub const ThreadPageInput = struct {
     stack: []const u8,
     thread: *const stack_thread.Thread,
+    /// Items that run on this thread, in id order. Each links to its item page
+    /// plus its rendered prompt (input) and output (result).
+    items: []const storage.ItemSummary = &.{},
 };
 
 pub fn renderThread(
@@ -605,6 +683,39 @@ pub fn renderThread(
         }
     }
     try w.writeAll("</dl>");
+
+    // Items that ran (or are queued) on this thread, with links to each item's
+    // rendered prompt (the exact text passed to the harness) and output.
+    try w.writeAll("<h2>Items</h2>");
+    if (input.items.len == 0) {
+        try w.writeAll("<p><em>No items on this thread.</em></p>");
+    } else {
+        try w.writeAll("<table><thead><tr><th>id</th><th>slug</th><th>kind</th><th>status</th><th>input</th><th>output</th></tr></thead><tbody>");
+        for (input.items) |it| {
+            try w.writeAll("<tr><td><a href=\"/stacks/");
+            try escape(w, input.stack);
+            try w.writeAll("/items/");
+            try escape(w, it.id);
+            try w.writeAll("\">");
+            try escape(w, it.id);
+            try w.writeAll("</a></td><td>");
+            try escape(w, it.slug);
+            try w.writeAll("</td><td>");
+            try escape(w, it.kind);
+            try w.writeAll("</td><td>");
+            try writeStatusBadge(w, it.status);
+            try w.writeAll("</td><td><a href=\"/stacks/");
+            try escape(w, input.stack);
+            try w.writeAll("/items/");
+            try escape(w, it.id);
+            try w.writeAll("#rendered-prompt\">prompt</a></td><td><a href=\"/stacks/");
+            try escape(w, input.stack);
+            try w.writeAll("/items/");
+            try escape(w, it.id);
+            try w.writeAll("#output\">output</a></td></tr>");
+        }
+        try w.writeAll("</tbody></table>");
+    }
     try writeFooter(w);
 }
 
@@ -630,8 +741,72 @@ fn renderChangedPaths(w: anytype, raw: []const u8) !void {
 /// trailing `<li>` so a transcript full of malformed lines doesn't render
 /// identically to an empty transcript — otherwise a real diagnostic surface
 /// would silently disappear behind "No events recorded."
+/// HTML-escape `s`, truncated to at most `max` bytes with an ellipsis. Used to
+/// keep per-event transcript summaries to one line; the full payload remains in
+/// the raw `<pre>` block and the item's output files.
+fn escapeTruncated(w: anytype, s: []const u8, max: usize) !void {
+    if (s.len <= max) {
+        try escape(w, s);
+        return;
+    }
+    try escape(w, s[0..max]);
+    try w.writeAll("…");
+}
+
+/// Append a one-line, human-readable summary of an event's salient `data`
+/// fields after the kind/timestamp. Unknown shapes get nothing (the raw `<pre>`
+/// still renders the full payload). All values flow through `escape`.
+fn writeEventSummary(w: anytype, p: events.ParsedEvent) !void {
+    const data = p.data_json;
+    switch (p.kind) {
+        .message => if (events.dataStringField(data, "text")) |t| {
+            try w.writeAll(" <span>— ");
+            if (events.dataStringField(data, "role")) |role| {
+                try escape(w, role);
+                try w.writeAll(": ");
+            }
+            try escapeTruncated(w, t, 200);
+            try w.writeAll("</span>");
+        },
+        .tool_call => if (events.dataStringField(data, "tool")) |t| {
+            try w.writeAll(" <span>— tool ");
+            try escape(w, t);
+            try w.writeAll("</span>");
+        },
+        .tool_result => if (events.dataStringField(data, "call_id")) |t| {
+            try w.writeAll(" <span>— result ");
+            try escape(w, t);
+            try w.writeAll("</span>");
+        },
+        .file_changed => if (events.dataStringField(data, "path")) |path| {
+            try w.writeAll(" <span>— ");
+            if (events.dataStringField(data, "op")) |op| {
+                try escape(w, op);
+                try w.writeByte(' ');
+            }
+            try escape(w, path);
+            try w.writeAll("</span>");
+        },
+        .command_executed => if (events.dataStringField(data, "cmd")) |t| {
+            try w.writeAll(" <span>— ");
+            try escapeTruncated(w, t, 200);
+            try w.writeAll("</span>");
+        },
+        .session_started => if (events.dataStringField(data, "harness")) |t| {
+            try w.writeAll(" <span>— harness ");
+            try escape(w, t);
+            try w.writeAll("</span>");
+        },
+        .session_ended => if (events.dataStringField(data, "terminal_status")) |t| {
+            try w.writeAll(" <span>— ");
+            try escape(w, t);
+            try w.writeAll("</span>");
+        },
+        else => {},
+    }
+}
+
 fn renderTranscript(w: anytype, raw: []const u8) !void {
-    const events = @import("events.zig");
     try w.writeAll("<ul class=\"transcript\">");
     var count: usize = 0;
     var skipped: usize = 0;
@@ -647,6 +822,7 @@ fn renderTranscript(w: anytype, raw: []const u8) !void {
         try w.writeAll("</span> <span class=\"transcript-ts\">");
         try escape(w, p.ts);
         try w.writeAll("</span>");
+        try writeEventSummary(w, p);
         // For human-friendly browsing, emit the raw `data` JSON inside a
         // <pre> so users can inspect it. Treat as untrusted: escape it.
         if (p.data_json.len > 0 and !std.mem.eql(u8, p.data_json, "{}")) {

@@ -425,6 +425,27 @@ fn writeAgentsMd(w: anytype) !void {
         \\Create another stack with `stako new <name>` when work needs its
         \\own queue, thread history, and config.
         \\
+        \\## Driving stako programmatically
+        \\
+        \\Besides the CLI, stako exposes a loopback JSON API on
+        \\`http://127.0.0.1:<port>` (`[daemon].port` in `config.toml`,
+        \\default 7421). Authenticate with the header
+        \\`Authorization: Bearer <token>`, the contents of
+        \\`state/local_token`. The `stako` Python SDK wraps it:
+        \\
+        \\```python
+        \\from stako import Client, Routine, Stack
+        \\
+        \\c = Client(root="~/stako")
+        \\r = Routine("fix").thread("builder").prompt("Fix the test.", thread="builder")
+        \\Stack(c, "default").add(r).start()
+        \\```
+        \\
+        \\Key endpoints: `POST /stacks`, `POST /stacks/{s}/threads`,
+        \\`POST /stacks/{s}/routines/{r}`, `POST /stacks/{s}/items`,
+        \\`POST /stacks/{s}/resume`, `GET /stacks/{s}` (status),
+        \\`GET /stacks/{s}/events` (SSE).
+        \\
         \\## Common commands
         \\
         \\```sh

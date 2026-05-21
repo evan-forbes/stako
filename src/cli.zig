@@ -214,6 +214,9 @@ pub const StackAction = enum {
     retry,
     cancel,
     supersede,
+    edit_prompt,
+    rerun,
+    item,
     pause,
     @"resume",
     output,
@@ -241,6 +244,13 @@ pub const StackAction = enum {
             .{ .name = "cx", .value = .cancel },
             .{ .name = "supersede", .value = .supersede },
             .{ .name = "sup", .value = .supersede },
+            .{ .name = "edit-prompt", .value = .edit_prompt },
+            .{ .name = "edit", .value = .edit_prompt },
+            .{ .name = "ep", .value = .edit_prompt },
+            .{ .name = "rerun", .value = .rerun },
+            .{ .name = "rr", .value = .rerun },
+            .{ .name = "item", .value = .item },
+            .{ .name = "it", .value = .item },
             .{ .name = "pause", .value = .pause },
             .{ .name = "p", .value = .pause },
             .{ .name = "resume", .value = .@"resume" },
@@ -296,8 +306,15 @@ pub const StackArgs = struct {
     kind: []const u8 = "",
     /// `add` / `insert`: target shorthand `provider[/model]` or `match=any`.
     target: []const u8 = "",
-    /// `add` / `insert`: prompt body filename. `-` means stdin (not v1).
+    /// `add` / `insert` / `edit-prompt` / `rerun`: prompt body filename.
     prompt_file: []const u8 = "",
+    /// `edit-prompt` / `rerun`: inline prompt text (`--prompt`).
+    prompt_inline: []const u8 = "",
+    /// `edit-prompt` / `rerun`: read the prompt from stdin (`--stdin`).
+    prompt_stdin: bool = false,
+    /// `item`: print only the prompt (`--prompt`) or rendered prompt (`--rendered`).
+    show_prompt: bool = false,
+    show_rendered: bool = false,
     /// `add` / `insert`: explicit slug (else derived from prompt file or
     /// auto-generated).
     slug: []const u8 = "",
@@ -396,6 +413,36 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
                 continue;
             }
         }
+        if (out.action == .edit_prompt or out.action == .rerun) {
+            if (try flagValue(args, &i, "--prompt-file", "-f", "--prompt-file=")) |v| {
+                out.prompt_file = v;
+                continue;
+            }
+            if (try flagValue(args, &i, "--prompt", null, "--prompt=")) |v| {
+                out.prompt_inline = v;
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--stdin")) {
+                out.prompt_stdin = true;
+                continue;
+            }
+            if (out.action == .rerun) {
+                if (try flagValue(args, &i, "--thread-mode", null, "--thread-mode=")) |v| {
+                    out.thread_mode = v;
+                    continue;
+                }
+            }
+        }
+        if (out.action == .item) {
+            if (std.mem.eql(u8, a, "--prompt")) {
+                out.show_prompt = true;
+                continue;
+            }
+            if (std.mem.eql(u8, a, "--rendered")) {
+                out.show_rendered = true;
+                continue;
+            }
+        }
         if (out.action == .thread_create) {
             if (try flagValue(args, &i, "--provider", null, "--provider=")) |v| {
                 out.target = v;
@@ -462,7 +509,7 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
                     else => return error.BadFlagValue,
                 }
             },
-            .retry, .cancel => {
+            .retry, .cancel, .edit_prompt, .rerun, .item => {
                 // positionals: <name> <id>
                 switch (positional_seen) {
                     0 => out.name = a,
@@ -492,7 +539,7 @@ pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
         .run_routine => if (out.name.len == 0 or out.routine_name.len == 0) return error.NoSubcommand,
         .add => if (out.name.len == 0 or out.kind.len == 0) return error.NoSubcommand,
         .insert => if (out.name.len == 0 or out.ref.len == 0 or out.kind.len == 0) return error.NoSubcommand,
-        .retry, .cancel => if (out.name.len == 0 or out.item_id.len == 0) return error.NoSubcommand,
+        .retry, .cancel, .edit_prompt, .rerun, .item => if (out.name.len == 0 or out.item_id.len == 0) return error.NoSubcommand,
         .supersede => if (out.name.len == 0 or out.item_id.len == 0 or out.replacement.len == 0) return error.NoSubcommand,
     }
     return out;
@@ -1115,6 +1162,12 @@ fn printStackUsage(w: anytype) !void {
         \\  new          <name>   Create a stack.
         \\  run-routine <stack> <routine>
         \\                        Append a routine to a stack.
+        \\  edit-prompt, ep <stack> <id> [--prompt-file f | --prompt t | --stdin]
+        \\                        Overwrite a queued item's prompt (else opens $EDITOR).
+        \\  rerun, rr <stack> <id> [--prompt-file f | --prompt t | --stdin]
+        \\                        Fork a finished item with an edited prompt.
+        \\  item, it <stack> <id> [--prompt | --rendered]
+        \\                        Show an item, or its prompt / rendered prompt.
         \\  pause|resume <name>   Pause or resume a stack.
         \\
         \\Flags (common to every API subcommand):
@@ -1221,6 +1274,37 @@ test "parseInitArgs: --now= malformed rejected" {
 
 test "parseInitArgs: --seed= malformed rejected" {
     try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--seed=notanumber"}));
+}
+
+test "parseStackArgs: edit-prompt aliases + sources" {
+    inline for (.{ "edit-prompt", "edit", "ep" }) |name| {
+        const a = try parseStackArgs(&.{ name, "demo", "0001", "--prompt-file", "p.md" });
+        try std.testing.expectEqual(StackAction.edit_prompt, a.action);
+        try std.testing.expectEqualStrings("demo", a.name);
+        try std.testing.expectEqualStrings("0001", a.item_id);
+        try std.testing.expectEqualStrings("p.md", a.prompt_file);
+    }
+    const inline_arg = try parseStackArgs(&.{ "ep", "demo", "0001", "--prompt", "new body" });
+    try std.testing.expectEqualStrings("new body", inline_arg.prompt_inline);
+    const stdin_arg = try parseStackArgs(&.{ "ep", "demo", "0001", "--stdin" });
+    try std.testing.expect(stdin_arg.prompt_stdin);
+    // Missing item id is a usage error.
+    try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{ "ep", "demo" }));
+}
+
+test "parseStackArgs: rerun carries thread-mode" {
+    const a = try parseStackArgs(&.{ "rr", "demo", "0003", "--thread-mode", "resume" });
+    try std.testing.expectEqual(StackAction.rerun, a.action);
+    try std.testing.expectEqualStrings("0003", a.item_id);
+    try std.testing.expectEqualStrings("resume", a.thread_mode);
+}
+
+test "parseStackArgs: item show flags" {
+    const p = try parseStackArgs(&.{ "item", "demo", "0001", "--prompt" });
+    try std.testing.expectEqual(StackAction.item, p.action);
+    try std.testing.expect(p.show_prompt and !p.show_rendered);
+    const r = try parseStackArgs(&.{ "it", "demo", "0001", "--rendered" });
+    try std.testing.expect(r.show_rendered and !r.show_prompt);
 }
 
 test "parseInitArgs: --seed= hex and decimal both accepted" {

@@ -103,6 +103,10 @@ pub const Stack = struct {
         return self.runMutationLocked(ident, .{ .transition = input });
     }
 
+    pub fn updateItemPrompt(self: *Stack, ident: mutations.IdentityCtx, input: mutations.UpdateItemPromptInput) MutationResult {
+        return self.runMutationLocked(ident, .{ .update_item_prompt = input });
+    }
+
     pub fn runtimeTransitionItem(self: *Stack, ident: mutations.IdentityCtx, input: mutations.RuntimeTransitionInput) MutationResult {
         return self.runMutationLocked(ident, .{ .runtime_transition = input });
     }
@@ -441,6 +445,11 @@ pub const StackClient = struct {
         return st.transitionItem(self.ident(), input);
     }
 
+    pub fn updateItemPrompt(self: *const StackClient, stack_name: []const u8, input: mutations.UpdateItemPromptInput) MutationResult {
+        const st = self.registry.getStack(stack_name) orelse return .{ .err = .not_found };
+        return st.updateItemPrompt(self.ident(), input);
+    }
+
     pub fn runtimeTransitionItem(self: *const StackClient, stack_name: []const u8, input: mutations.RuntimeTransitionInput) MutationResult {
         const st = self.registry.getStack(stack_name) orelse return .{ .err = .not_found };
         return st.runtimeTransitionItem(self.ident(), input);
@@ -489,6 +498,7 @@ const MutationKind = union(enum) {
     append_routine: mutations.AppendRoutineInput,
     insert_item: mutations.InsertItemInput,
     transition: mutations.TransitionInput,
+    update_item_prompt: mutations.UpdateItemPromptInput,
     pause_stack: struct { stack: []const u8 },
     resume_stack: struct { stack: []const u8 },
     config_patch: struct { stack: []const u8, patches: []const mutations.ConfigPatch },
@@ -514,6 +524,7 @@ const MutationKind = union(enum) {
             .append_routine => |inp| mutations.applyAppendRoutine(allocator, notes_root_abs, ident, inp),
             .insert_item => |inp| mutations.applyInsertItem(allocator, notes_root_abs, ident, inp),
             .transition => |inp| mutations.applyTransition(allocator, notes_root_abs, ident, inp),
+            .update_item_prompt => |inp| mutations.applyUpdateItemPrompt(allocator, notes_root_abs, ident, inp),
             .pause_stack => |p| mutations.applySetPaused(allocator, notes_root_abs, ident, p.stack, true),
             .resume_stack => |p| mutations.applySetPaused(allocator, notes_root_abs, ident, p.stack, false),
             .config_patch => |p| mutations.applyConfigPatch(allocator, notes_root_abs, ident, p.stack, p.patches),
@@ -558,6 +569,7 @@ const MutationKind = union(enum) {
     fn itemMetaPreflight(self: MutationKind) ?ItemTarget {
         return switch (self) {
             .transition => |inp| .{ .stack = inp.stack, .id = inp.id },
+            .update_item_prompt => |inp| .{ .stack = inp.stack, .id = inp.id },
             .runtime_transition => |inp| .{ .stack = inp.stack, .id = inp.id },
             else => null,
         };

@@ -38,6 +38,9 @@ pub const ItemSummary = struct {
     slug: []const u8,
     kind: []const u8,
     status: []const u8,
+    /// Name of the thread this item runs on, if any. Lets callers group items
+    /// by thread without a full item parse.
+    thread_name: ?[]const u8 = null,
 };
 
 pub const ThreadSummary = struct {
@@ -317,6 +320,7 @@ pub const Reader = struct {
             .slug = try self.allocator.dupe(u8, parsed.slug),
             .kind = try self.allocator.dupe(u8, parsed.kind.toString()),
             .status = try self.allocator.dupe(u8, parsed.status.toString()),
+            .thread_name = if (parsed.thread) |th| try self.allocator.dupe(u8, th.name) else null,
         };
     }
 
@@ -371,6 +375,7 @@ fn freeOwnedSummaries(a: std.mem.Allocator, items: []const ItemSummary) void {
         a.free(s.slug);
         a.free(s.kind);
         a.free(s.status);
+        if (s.thread_name) |t| a.free(t);
     }
 }
 
