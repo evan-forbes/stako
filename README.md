@@ -126,6 +126,48 @@ stack.edit_prompt("0001", "Revised …")    # overwrite a queued item in place
 stack.rerun("0002", "Try again, but …")   # fork a finished item with a new prompt
 ```
 
+### Script inputs: pass a params TOML, not a CLI
+
+A script that drives stako should take its inputs from a **params TOML**, not from a hand-rolled `argparse` CLI. The file has exactly two tables:
+
+- `[stako]` — fields the SDK knows about, **typed and validated**: `root`, `port`, `host`, `stack`, and a `[stako.inputs]` table (`files`, `items`, `commits`, `mode`). Unknown keys here are an error.
+- `[params]` — the script's own values, **free-form** and passed through untouched. Put anything the script needs here.
+
+Any other top-level key is rejected, so the boundary stays clear.
+
+```toml
+# run-workflow.toml
+[stako]
+root  = "~/stako"
+stack = "add-rate-limiter"
+
+[stako.inputs]
+files = ["docs/rate-limiter-notes.md"]
+mode  = "append"
+
+[params]
+target_module = "ratelimit"
+max_retries   = 3
+```
+
+`Params.load()` finds the file from the first CLI argument, falling back to `$STAKO_PARAMS` — no argument parsing to write:
+
+```python
+from stako import Params, Routine
+
+params = Params.load()                         # argv[1], else $STAKO_PARAMS
+stack = params.target_stack()                  # Client + stack from [stako]
+
+routine = (
+    Routine("implement")
+    .thread("builder", provider="anthropic")
+    .prompt(f"Implement {params.get('target_module')}.", thread="builder")
+)
+stack.add(routine, inputs=params.stako.inputs).start()
+```
+
+Run it as `python run-workflow.py run-workflow.toml` (or `STAKO_PARAMS=run-workflow.toml python run-workflow.py`). `params.stako` is the typed view; `params.params` (and `params.get(key)`) is the script's free-form table.
+
 ## HTTP API (write your own client)
 
 The SDK is a thin wrapper over a loopback JSON API; drive stako from any language:

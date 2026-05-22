@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
+import os
 import re
+import sys
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -13,6 +15,9 @@ from typing import Any, Protocol
 DEFAULT_PORT = 7421
 DEFAULT_ROOT = Path.home() / "stako"
 NAME_RE = re.compile(r"^[a-z0-9_-]+$")
+STAKO_PARAMS_ENV = "STAKO_PARAMS"
+_VALID_STAKO_KEYS = frozenset({"root", "port", "host", "stack", "inputs"})
+_VALID_INPUT_KEYS = frozenset({"items", "files", "commits", "mode"})
 
 
 class ApiError(RuntimeError):
@@ -22,6 +27,10 @@ class ApiError(RuntimeError):
         self.body = body
         detail = body.decode("utf-8", errors="replace")
         super().__init__(f"stako API request failed: {status} {path}: {detail}")
+
+
+class ParamsError(ValueError):
+    """A params TOML was missing, malformed, or carried unexpected keys."""
 
 
 class Transport(Protocol):
@@ -142,11 +151,14 @@ class Stack:
         self.client.post("/stacks", payload)
         return self
 
-    def add(self, routine: Routine, inputs: dict[str, Any] | None = None) -> Stack:
+    def add(
+        self, routine: Routine, inputs: Inputs | dict[str, Any] | None = None
+    ) -> Stack:
         routine.materialize(self.client.root)
         for thread in routine.thread_targets():
             self.client.post(f"/stacks/{self.name}/threads", thread)
-        payload = {"inputs": inputs} if inputs else {}
+        resolved = _inputs_payload(inputs)
+        payload = {"inputs": resolved} if resolved else {}
         self.client.post(f"/stacks/{self.name}/routines/{routine.name}", payload)
         return self
 
@@ -347,6 +359,202 @@ class Routine:
                 digest.update(b"\0")
             self.name = f"routine-{digest.hexdigest()[:12]}"
         return self.name
+
+
+@dataclass
+class Inputs:
+    """Context registered on queued work: prior items, files, and commits.
+
+    Mirrors the daemon's `inputs` table. `mode` is "append" or "prepend"
+    (None leaves the daemon default).
+    """
+
+    items: list[str] = field(default_factory=list)
+    files: list[str] = field(default_factory=list)
+    commits: list[str] = field(default_factory=list)
+    mode: str | None = None
+
+    def as_payload(self) -> dict[str, Any]:
+        # Caller owns returned dict. Emits only the fields that were set, so the
+        # daemon receives an empty object instead of empty arrays when unused.
+        payload: dict[str, Any] = {}
+        if self.items:
+            payload["items"] = list(self.items)
+        if self.files:
+            payload["files"] = list(self.files)
+        if self.commits:
+            payload["commits"] = list(self.commits)
+        if self.mode is not None:
+            payload["mode"] = self.mode
+        return payload
+
+
+@dataclass
+class StakoParams:
+    """The typed, SDK-validated half of a params TOML's `[stako]` table."""
+
+    root: str | None = None
+    port: int | None = None
+    host: str = "127.0.0.1"
+    stack: str | None = None
+    inputs: Inputs = field(default_factory=Inputs)
+
+
+class Params:
+    """A script's parsed params TOML.
+
+    The file has exactly two optional tables: `[stako]`, whose keys are typed
+    and validated into `self.stako`, and `[params]`, the script's own free-form
+    values, exposed untouched as `self.params`. Any other top-level key is an
+    error. This is the convention scripts use instead of building their own CLI.
+    """
+
+    def __init__(self, stako: StakoParams, params: dict[str, Any]):
+        self.stako = stako
+        self.params = params
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path | None = None,
+        *,
+        argv: list[str] | None = None,
+        environ: dict[str, str] | None = None,
+    ) -> Params:
+        # Resolve the file from (in order) `path`, the first CLI argument, then
+        # $STAKO_PARAMS — no argparse needed. `argv`/`environ` are injectable
+        # for tests.
+        resolved = cls._resolve_path(path, argv, environ)
+        try:
+            with resolved.open("rb") as f:
+                data = tomllib.load(f)
+        except FileNotFoundError:
+            raise ParamsError(f"params file not found: {resolved}") from None
+        except tomllib.TOMLDecodeError as e:
+            raise ParamsError(f"invalid TOML in {resolved}: {e}") from e
+        return cls.from_dict(data, source=resolved)
+
+    @classmethod
+    def from_dict(
+        cls, data: dict[str, Any], *, source: Path | None = None
+    ) -> Params:
+        where = f" in {source}" if source is not None else ""
+        unexpected = set(data) - {"stako", "params"}
+        if unexpected:
+            keys = ", ".join(sorted(unexpected))
+            raise ParamsError(
+                f"unexpected top-level key(s){where}: {keys}; put Stako fields "
+                "under [stako] and script values under [params]"
+            )
+        params = data.get("params", {})
+        if not isinstance(params, dict):
+            raise ParamsError(f"[params]{where} must be a table")
+        return cls(cls._parse_stako(data.get("stako", {}), where), params)
+
+    def client(self, *, transport: Transport | None = None) -> Client:
+        return Client(
+            root=self.stako.root,
+            port=self.stako.port,
+            host=self.stako.host,
+            transport=transport,
+        )
+
+    def target_stack(self, client: Client | None = None) -> Stack:
+        if not self.stako.stack:
+            raise ParamsError("[stako] has no stack; cannot resolve target stack")
+        return (client or self.client()).stack(self.stako.stack)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        # Convenience read of a `[params]` value.
+        return self.params.get(key, default)
+
+    @staticmethod
+    def _resolve_path(
+        path: str | Path | None,
+        argv: list[str] | None,
+        environ: dict[str, str] | None,
+    ) -> Path:
+        if path is not None:
+            return Path(path).expanduser()
+        argv = sys.argv if argv is None else argv
+        if len(argv) > 1 and argv[1]:
+            return Path(argv[1]).expanduser()
+        env = os.environ if environ is None else environ
+        env_path = env.get(STAKO_PARAMS_ENV)
+        if env_path:
+            return Path(env_path).expanduser()
+        raise ParamsError(
+            "no params file: pass its path as the first argument or set "
+            f"${STAKO_PARAMS_ENV}"
+        )
+
+    @staticmethod
+    def _parse_stako(raw: Any, where: str) -> StakoParams:
+        if not isinstance(raw, dict):
+            raise ParamsError(f"[stako]{where} must be a table")
+        unexpected = set(raw) - _VALID_STAKO_KEYS
+        if unexpected:
+            keys = ", ".join(sorted(unexpected))
+            raise ParamsError(f"unknown [stako] key(s){where}: {keys}")
+        stako = StakoParams()
+        if "root" in raw:
+            stako.root = _expect_str(raw["root"], "stako.root", where)
+        if "host" in raw:
+            stako.host = _expect_str(raw["host"], "stako.host", where)
+        if "stack" in raw:
+            name = _expect_str(raw["stack"], "stako.stack", where)
+            _check_name(name, "stack")
+            stako.stack = name
+        if "port" in raw:
+            port = raw["port"]
+            if not isinstance(port, int) or isinstance(port, bool):
+                raise ParamsError(f"stako.port{where} must be an integer")
+            stako.port = port
+        if "inputs" in raw:
+            stako.inputs = Params._parse_inputs(raw["inputs"], where)
+        return stako
+
+    @staticmethod
+    def _parse_inputs(raw: Any, where: str) -> Inputs:
+        if not isinstance(raw, dict):
+            raise ParamsError(f"[stako.inputs]{where} must be a table")
+        unexpected = set(raw) - _VALID_INPUT_KEYS
+        if unexpected:
+            keys = ", ".join(sorted(unexpected))
+            raise ParamsError(f"unknown [stako.inputs] key(s){where}: {keys}")
+        inputs = Inputs()
+        for key in ("items", "files", "commits"):
+            if key in raw:
+                value = _expect_str_list(raw[key], f"stako.inputs.{key}", where)
+                setattr(inputs, key, value)
+        if "mode" in raw:
+            mode = _expect_str(raw["mode"], "stako.inputs.mode", where)
+            if mode not in {"append", "prepend"}:
+                raise ParamsError(
+                    f"stako.inputs.mode{where} must be 'append' or 'prepend'"
+                )
+            inputs.mode = mode
+        return inputs
+
+
+def _inputs_payload(inputs: Inputs | dict[str, Any] | None) -> dict[str, Any] | None:
+    if inputs is None:
+        return None
+    if isinstance(inputs, Inputs):
+        return inputs.as_payload() or None
+    return inputs or None
+
+
+def _expect_str(value: Any, field_name: str, where: str) -> str:
+    if not isinstance(value, str):
+        raise ParamsError(f"{field_name}{where} must be a string")
+    return value
+
+
+def _expect_str_list(value: Any, field_name: str, where: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise ParamsError(f"{field_name}{where} must be an array of strings")
+    return list(value)
 
 
 def _check_name(name: str, label: str) -> None:

@@ -337,7 +337,7 @@ pub const Manager = struct {
             .stack = input.stack,
             .id = input.item_id,
             .to = .running,
-        });
+        }, sess);
 
         // Emit a daemon-side session_started event with start metadata.
         {
@@ -465,15 +465,76 @@ pub const TerminalReason = enum {
     canceled,
 };
 
-fn applyTransition(registry: *stack_mod.StackRegistry, input: stack_mod.RuntimeTransitionInput) void {
+fn applyTransition(registry: *stack_mod.StackRegistry, input: stack_mod.RuntimeTransitionInput, sess: ?*Session) void {
     const client = registry.localClient("system", "runtime");
     switch (client.runtimeTransitionItem(input.stack, input)) {
         .ok => |ok_value| {
             var ok = ok_value;
             ok.deinit();
         },
-        .err => {},
+        .err => |kind| {
+            emitRuntimeTransitionError(sess, input, kind);
+            std.log.err("runtime transition failed: stack={s} item={s} to={s} error={s}", .{
+                input.stack,
+                input.id,
+                runtimeStatusName(input.to),
+                mutationFailureName(kind),
+            });
+        },
     }
+}
+
+fn emitRuntimeTransitionError(sess: ?*Session, input: stack_mod.RuntimeTransitionInput, kind: stack_mod.MutationFailureKind) void {
+    const s = sess orelse return;
+    var b = std.ArrayList(u8){};
+    defer b.deinit(s.allocator);
+    b.writer(s.allocator).print(
+        "{{\"message\":\"runtime_transition_failed\",\"transition\":\"{s}\",\"error\":\"{s}\",\"recoverable\":false}}",
+        .{ runtimeStatusName(input.to), mutationFailureName(kind) },
+    ) catch return;
+    const data_owned = b.toOwnedSlice(s.allocator) catch return;
+    defer s.allocator.free(data_owned);
+    const ev: events.Event = .{
+        .stack = s.stack,
+        .item = s.item_id,
+        .kind = .@"error",
+        .data_json = data_owned,
+    };
+    s.transcript.append(ev) catch {};
+    if (s.manager.hub) |h| h.publish(ev) catch {};
+}
+
+fn runtimeStatusName(status: stack_mod.RuntimeTargetStatus) []const u8 {
+    return switch (status) {
+        .running => "running",
+        .completed => "completed",
+        .failed => "failed",
+        .canceled => "canceled",
+        .blocked => "blocked",
+        .paused => "paused",
+        .queued => "queued",
+    };
+}
+
+fn mutationFailureName(kind: stack_mod.MutationFailureKind) []const u8 {
+    return switch (kind) {
+        .invalid_name => "invalid_name",
+        .name_reserved => "name_reserved",
+        .already_exists => "already_exists",
+        .not_found => "not_found",
+        .state_conflict => "state_conflict",
+        .internal_state_only => "internal_state_only",
+        .validation_failed => "validation_failed",
+        .vcs_conflict => "vcs_conflict",
+        .vcs_dirty => "vcs_dirty",
+        .git_not_found => "git_not_found",
+        .git_failed => "git_failed",
+        .bad_config_key => "bad_config_key",
+        .bad_config_value => "bad_config_value",
+        .bad_thread_key => "bad_thread_key",
+        .bad_thread_value => "bad_thread_value",
+        .internal => "internal",
+    };
 }
 
 /// Cap on a single line's buffered length. A vendor CLI emitting a
@@ -789,7 +850,7 @@ fn onExitMain(s: *Session, term_opt: ?std.process.Child.Term) void {
     };
     if (tag == .failed) input.failed_reason = "subprocess_nonzero_exit";
     if (tag == .canceled) input.canceled_by = "system";
-    applyTransition(s.manager.stack_registry, input);
+    applyTransition(s.manager.stack_registry, input, s);
 }
 
 /// Extract a JSON string value for `key_with_colon` (e.g. `"\"foo\":"`)

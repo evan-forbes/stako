@@ -700,6 +700,15 @@ fn routeWithOwnership(self: *Daemon, req: *std.http.Server.Request, conn: std.ne
 
 fn route(self: *Daemon, req: *std.http.Server.Request) !void {
     var m = matchRoute(req.head.target);
+    var route_arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer route_arena.deinit();
+    const route_alloc = route_arena.allocator();
+    if (m.stack.len > 0) m.stack = try route_alloc.dupe(u8, m.stack);
+    if (m.item.len > 0) m.item = try route_alloc.dupe(u8, m.item);
+    if (m.thread.len > 0) m.thread = try route_alloc.dupe(u8, m.thread);
+    if (m.routine.len > 0) m.routine = try route_alloc.dupe(u8, m.routine);
+    if (m.provider.len > 0) m.provider = try route_alloc.dupe(u8, m.provider);
+
     const method = req.head.method;
     const is_get = method == .GET or method == .HEAD;
     const is_post = method == .POST;

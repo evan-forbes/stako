@@ -62,6 +62,7 @@ const CodexEventType = enum {
     turn_failed,
     @"error",
     thread_error,
+    item_started,
     item_completed,
     item_updated,
     unknown,
@@ -73,6 +74,7 @@ const CodexEventType = enum {
         if (std.mem.eql(u8, s, "turn.failed")) return .turn_failed;
         if (std.mem.eql(u8, s, "error")) return .@"error";
         if (std.mem.eql(u8, s, "thread.error")) return .thread_error;
+        if (std.mem.eql(u8, s, "item.started")) return .item_started;
         if (std.mem.eql(u8, s, "item.completed")) return .item_completed;
         if (std.mem.eql(u8, s, "item.updated")) return .item_updated;
         return .unknown;
@@ -134,6 +136,9 @@ fn parseStderrLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const 
     _ = impl;
     const line = stripEol(raw);
     if (line.len == 0) return allocator.alloc(adapter.OwnedEvent, 0);
+    if (std.mem.eql(u8, line, "Reading additional input from stdin...")) {
+        return allocator.alloc(adapter.OwnedEvent, 0);
+    }
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -243,6 +248,7 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
             const msg = findStringValue(line, "\"message\":") orelse "error";
             try emitError(allocator, &out, msg, true);
         },
+        .item_started => {},
         .item_completed, .item_updated => {
             const item = findObjectValue(line, "\"item\":") orelse {
                 return out.toOwnedSlice(allocator);
@@ -281,7 +287,7 @@ fn parseLine(impl: *anyopaque, allocator: std.mem.Allocator, raw: []const u8) an
                 .unknown => {},
             }
         },
-        .unknown => try emitError(allocator, &out, "adapter_unknown_event", true),
+        .unknown => try emitUnknownEvent(allocator, &out, type_str),
     }
 
     return out.toOwnedSlice(allocator);
@@ -506,6 +512,29 @@ fn emitError(
     try w.writeAll("\",\"recoverable\":");
     try w.writeAll(if (recoverable) "true" else "false");
     try w.writeAll("}");
+    const storage = try buf.toOwnedSlice(allocator);
+    try out.append(allocator, .{
+        .ev = .{
+            .stack = "",
+            .item = "",
+            .kind = .@"error",
+            .data_json = storage,
+        },
+        .storage = storage,
+    });
+}
+
+fn emitUnknownEvent(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(adapter.OwnedEvent),
+    type_str: []const u8,
+) !void {
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"message\":\"adapter_unknown_event\",\"event_type\":\"");
+    try writeParsedJsonStringContent(w, type_str);
+    try w.writeAll("\",\"recoverable\":true}");
     const storage = try buf.toOwnedSlice(allocator);
     try out.append(allocator, .{
         .ev = .{
@@ -752,6 +781,15 @@ test "codex: parseStderrLine emits one recoverable error per non-empty line" {
     try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"recoverable\":true") != null);
 }
 
+test "codex: parseStderrLine ignores stdin informational line" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseStderrLine(a, "Reading additional input from stdin...\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 0), evs.len);
+}
+
 test "codex: parseStderrLine empty line yields zero events" {
     const a = std.testing.allocator;
     var ad = try create(a);
@@ -759,6 +797,27 @@ test "codex: parseStderrLine empty line yields zero events" {
     const evs = try ad.parseStderrLine(a, "\n");
     defer adapter.freeOwnedSlice(a, evs);
     try std.testing.expectEqual(@as(usize, 0), evs.len);
+}
+
+test "codex: item.started is non-semantic" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"item.started\",\"item\":{\"item_type\":\"reasoning\"}}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 0), evs.len);
+}
+
+test "codex: unknown event reports event type" {
+    const a = std.testing.allocator;
+    var ad = try create(a);
+    defer ad.deinit(a);
+    const evs = try ad.parseLine(a, "{\"type\":\"turn.weird\"}\n");
+    defer adapter.freeOwnedSlice(a, evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expectEqual(events.Kind.@"error", evs[0].ev.kind);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"message\":\"adapter_unknown_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, evs[0].ev.data_json, "\"event_type\":\"turn.weird\"") != null);
 }
 
 test "codex: on_exit clean exit + ran_to_completion=false → canceled" {

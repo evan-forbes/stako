@@ -3,7 +3,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from stako import Client, Prompt, Routine, Stack
+from stako import (
+    Client,
+    Inputs,
+    Params,
+    ParamsError,
+    Prompt,
+    Routine,
+    Stack,
+)
 
 
 class FakeTransport:
@@ -210,6 +218,130 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(
             path, root / "prompts" / "generated" / "ship-it" / "step-0001.md"
         )
+
+
+class ParamsTests(unittest.TestCase):
+    PARAMS_TOML = """
+[stako]
+root = "~/stako"
+port = 8123
+stack = "add-rate-limiter"
+
+[stako.inputs]
+files = ["docs/spec.md"]
+items = ["0001"]
+mode = "prepend"
+
+[params]
+target_module = "ratelimit"
+max_retries = 3
+"""
+
+    def write_params(self, text: str) -> Path:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".toml", delete=False, encoding="utf-8"
+        )
+        tmp.write(text)
+        tmp.close()
+        path = Path(tmp.name)
+        self.addCleanup(path.unlink)
+        return path
+
+    def test_load_parses_typed_stako_and_free_form_params(self):
+        path = self.write_params(self.PARAMS_TOML)
+
+        params = Params.load(path)
+
+        self.assertEqual(params.stako.root, "~/stako")
+        self.assertEqual(params.stako.port, 8123)
+        self.assertEqual(params.stako.stack, "add-rate-limiter")
+        self.assertEqual(params.stako.inputs.files, ["docs/spec.md"])
+        self.assertEqual(params.stako.inputs.items, ["0001"])
+        self.assertEqual(params.stako.inputs.mode, "prepend")
+        self.assertEqual(params.params["target_module"], "ratelimit")
+        self.assertEqual(params.get("max_retries"), 3)
+        self.assertIsNone(params.get("missing"))
+
+    def test_resolves_path_from_argv_then_env(self):
+        path = self.write_params(self.PARAMS_TOML)
+
+        from_argv = Params.load(argv=["script.py", str(path)])
+        self.assertEqual(from_argv.stako.stack, "add-rate-limiter")
+
+        from_env = Params.load(argv=["script.py"], environ={"STAKO_PARAMS": str(path)})
+        self.assertEqual(from_env.stako.stack, "add-rate-limiter")
+
+    def test_missing_path_raises(self):
+        with self.assertRaises(ParamsError):
+            Params.load(argv=["script.py"], environ={})
+
+    def test_rejects_unexpected_top_level_key(self):
+        with self.assertRaises(ParamsError):
+            Params.from_dict({"stako": {}, "extra": {}})
+
+    def test_rejects_unknown_stako_key(self):
+        with self.assertRaises(ParamsError):
+            Params.from_dict({"stako": {"prot": 9000}})
+
+    def test_rejects_bad_input_mode_and_bad_types(self):
+        with self.assertRaises(ParamsError):
+            Params.from_dict({"stako": {"inputs": {"mode": "sideways"}}})
+        with self.assertRaises(ParamsError):
+            Params.from_dict({"stako": {"port": "8123"}})
+        with self.assertRaises(ParamsError):
+            Params.from_dict({"stako": {"inputs": {"files": "docs/spec.md"}}})
+
+    def test_inputs_as_payload_omits_empty_fields(self):
+        self.assertEqual(Inputs().as_payload(), {})
+        self.assertEqual(
+            Inputs(files=["a.md"], mode="append").as_payload(),
+            {"files": ["a.md"], "mode": "append"},
+        )
+
+    def test_client_and_target_stack_built_from_params(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "state").mkdir()
+        (root / "state" / "local_token").write_text("tok123\n", encoding="utf-8")
+        (root / "config.toml").write_text("[daemon]\nport = 9001\n", encoding="utf-8")
+
+        params = Params.from_dict({"stako": {"root": str(root), "stack": "demo"}})
+        transport = FakeTransport()
+        stack = params.target_stack(params.client(transport=transport))
+
+        self.assertEqual(stack.name, "demo")
+        self.assertEqual(stack.client.port, 9001)
+
+    def test_target_stack_without_stack_raises(self):
+        with self.assertRaises(ParamsError):
+            Params.from_dict({"stako": {}}).target_stack()
+
+    def test_add_accepts_typed_inputs(self):
+        tmp, root = self.make_root()
+        self.addCleanup(tmp.cleanup)
+        transport = FakeTransport()
+        client = Client(root=root, transport=transport)
+        routine = Routine("ship-it").thread("builder").prompt("go", thread="builder")
+
+        Stack(client, "demo").create().add(
+            routine, inputs=Inputs(items=["0001"], mode="append")
+        )
+
+        queue_call = next(
+            c for c in transport.calls if c["path"] == "/stacks/demo/routines/ship-it"
+        )
+        self.assertEqual(
+            queue_call["body"], {"inputs": {"items": ["0001"], "mode": "append"}}
+        )
+
+    def make_root(self):
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        (root / "state").mkdir()
+        (root / "state" / "local_token").write_text("tok123\n", encoding="utf-8")
+        (root / "config.toml").write_text("[daemon]\nport = 8123\n", encoding="utf-8")
+        return tmp, root
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ pub fn assertPathsClean(
     paths: []const []const u8,
 ) Error!void {
     if (paths.len == 0) return;
-    var argv = std.ArrayList([]const u8){};
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "status", "--porcelain", "--" });
     for (paths) |p| try argv.append(allocator, p);
@@ -101,7 +101,7 @@ pub fn commit(
     if (opts.paths.len == 0) return error.GitFailed;
 
     // Stage. Use `git add -- <paths>`. `-A` would touch unrelated files.
-    var add_argv = std.ArrayList([]const u8){};
+    var add_argv: std.ArrayList([]const u8) = .empty;
     defer add_argv.deinit(allocator);
     try add_argv.appendSlice(allocator, &.{ "add", "--" });
     for (opts.paths) |p| try add_argv.append(allocator, p);
@@ -116,7 +116,7 @@ pub fn commit(
     }
 
     // Compose the commit message.
-    var msg = std.ArrayList(u8){};
+    var msg: std.ArrayList(u8) = .empty;
     defer msg.deinit(allocator);
     try msg.appendSlice(allocator, opts.subject);
     if (opts.body) |b| {
@@ -133,8 +133,14 @@ pub fn commit(
     const email_arg = try std.fmt.allocPrint(allocator, "user.email={s}", .{opts.author_email});
     defer allocator.free(email_arg);
 
-    // We pass the message via a file to avoid argv escaping pitfalls.
-    const msg_path = try std.fs.path.join(allocator, &.{ repo_root, ".git", "STAKO_COMMIT_MSG" });
+    // Keep the message file in the command cwd, not `.git`: when the notes
+    // root is inside a parent worktree there is no local `.git` directory.
+    const msg_name = try std.fmt.allocPrint(allocator, ".stako-commit-msg-{d}-{d}", .{
+        std.os.linux.getpid(),
+        std.time.nanoTimestamp(),
+    });
+    defer allocator.free(msg_name);
+    const msg_path = try std.fs.path.join(allocator, &.{ repo_root, msg_name });
     defer allocator.free(msg_path);
     {
         var f = std.fs.cwd().createFile(msg_path, .{ .truncate = true, .mode = 0o600 }) catch return error.GitFailed;
@@ -143,14 +149,12 @@ pub fn commit(
     }
     defer std.fs.cwd().deleteFile(msg_path) catch {};
 
-    // Note: we need the message path relative to the repo root because we cd
-    // into it. `.git/STAKO_COMMIT_MSG` works.
     const commit_argv = [_][]const u8{
         "-c",                    name_arg,
         "-c",                    email_arg,
         "commit",                "--no-gpg-sign",
         "--allow-empty-message", "-F",
-        ".git/STAKO_COMMIT_MSG",
+        msg_name,
     };
     const commit_out = try runGit(allocator, repo_root, &commit_argv, true);
     defer allocator.free(commit_out);
@@ -183,7 +187,7 @@ pub fn rollbackPaths(
     paths: []const []const u8,
 ) Error!void {
     if (paths.len == 0) return;
-    var reset_argv = std.ArrayList([]const u8){};
+    var reset_argv: std.ArrayList([]const u8) = .empty;
     defer reset_argv.deinit(allocator);
     try reset_argv.appendSlice(allocator, &.{ "reset", "HEAD", "--" });
     for (paths) |p| try reset_argv.append(allocator, p);
@@ -241,7 +245,7 @@ fn runGit(
     args: []const []const u8,
     error_on_nonzero: bool,
 ) Error![]u8 {
-    var argv = std.ArrayList([]const u8){};
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, "git");
     for (args) |a| try argv.append(allocator, a);
@@ -258,9 +262,9 @@ fn runGit(
         else => return error.GitFailed,
     };
 
-    var stdout_buf = std.ArrayList(u8){};
+    var stdout_buf: std.ArrayList(u8) = .empty;
     defer stdout_buf.deinit(allocator);
-    var stderr_buf = std.ArrayList(u8){};
+    var stderr_buf: std.ArrayList(u8) = .empty;
     defer stderr_buf.deinit(allocator);
     child.collectOutput(allocator, &stdout_buf, &stderr_buf, 8 * 1024 * 1024) catch return error.GitFailed;
 
@@ -284,7 +288,7 @@ fn runGitFull(
 ) Error!RunFull {
     _ = capture_stdout;
     _ = capture_stderr;
-    var argv = std.ArrayList([]const u8){};
+    var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
     try argv.append(allocator, "git");
     for (args) |a| try argv.append(allocator, a);
@@ -300,9 +304,9 @@ fn runGitFull(
         else => return error.GitFailed,
     };
 
-    var stdout_buf = std.ArrayList(u8){};
+    var stdout_buf: std.ArrayList(u8) = .empty;
     errdefer stdout_buf.deinit(allocator);
-    var stderr_buf = std.ArrayList(u8){};
+    var stderr_buf: std.ArrayList(u8) = .empty;
     errdefer stderr_buf.deinit(allocator);
     child.collectOutput(allocator, &stdout_buf, &stderr_buf, 8 * 1024 * 1024) catch return error.GitFailed;
 
@@ -381,6 +385,38 @@ test "ensureRealRepo + commit: round-trip works" {
         .subject = "test: no-op",
     });
     try std.testing.expectEqual(false, res2.committed);
+}
+
+test "commit: notes root may be nested inside parent git worktree" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var parent_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent_abs = try tmp.dir.realpath(".", &parent_buf);
+
+    try ensureRealRepo(a, parent_abs);
+    try tmp.dir.makePath("notes");
+    const notes_abs = try std.fs.path.join(a, &.{ parent_abs, "notes" });
+    defer a.free(notes_abs);
+
+    var notes_dir = try std.fs.openDirAbsolute(notes_abs, .{});
+    defer notes_dir.close();
+    try std.testing.expectError(error.FileNotFound, notes_dir.access(".git", .{}));
+    {
+        var f = try notes_dir.createFile("stack.toml", .{ .truncate = true });
+        defer f.close();
+        try f.writeAll("name = \"demo\"\n");
+    }
+
+    const res = try commit(a, notes_abs, .{
+        .paths = &.{"stack.toml"},
+        .subject = "test: add nested notes file",
+    });
+    try std.testing.expect(res.committed);
+
+    const status_out = try runGit(a, parent_abs, &.{ "status", "--porcelain" }, true);
+    defer a.free(status_out);
+    try std.testing.expectEqual(@as(usize, 0), status_out.len);
 }
 
 test "rollbackPaths: restores tracked file edits and removes new files" {

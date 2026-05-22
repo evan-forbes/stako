@@ -570,7 +570,6 @@ const MutationKind = union(enum) {
         return switch (self) {
             .transition => |inp| .{ .stack = inp.stack, .id = inp.id },
             .update_item_prompt => |inp| .{ .stack = inp.stack, .id = inp.id },
-            .runtime_transition => |inp| .{ .stack = inp.stack, .id = inp.id },
             else => null,
         };
     }
@@ -1183,8 +1182,85 @@ test "runtime completion preflights named thread file" {
         .to = .completed,
     } });
     defer freePreflightPaths(a, paths);
-    try std.testing.expect(pathListContains(paths, "stacks/demo/0001-hello/meta.toml"));
+    try std.testing.expect(!pathListContains(paths, "stacks/demo/0001-hello/meta.toml"));
     try std.testing.expect(pathListContains(paths, "stacks/demo/threads/admin.toml"));
+}
+
+test "runtime terminal transition commits over uncommitted running snapshot" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("state");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try tmp.dir.realpath(".", &buf);
+    try vcs.ensureRealRepo(a, abs);
+
+    var aw = try audit.Writer.init(a, abs);
+    defer aw.deinit();
+
+    var reg = try StackRegistry.init(a, abs, &aw, true);
+    defer reg.deinit();
+    const client = reg.localClient("local", "test");
+
+    switch (client.createStack(.{
+        .name = "demo",
+        .created_at_override = "2026-05-10T14:00:00Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+    switch (client.appendItem("demo", .{
+        .stack = "demo",
+        .kind = "prompt",
+        .slug = "hello",
+        .prompt_body = "say hello",
+        .created_at_override = "2026-05-10T14:00:00Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    switch (client.runtimeTransitionItem("demo", .{ .stack = "demo", .id = "0001", .to = .running })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    const meta_rel = "stacks/demo/0001-hello/meta.toml";
+    try std.testing.expectError(error.HasDirtyTarget, vcs.assertPathsClean(a, abs, &.{meta_rel}));
+
+    switch (client.runtimeTransitionItem("demo", .{
+        .stack = "demo",
+        .id = "0001",
+        .to = .completed,
+        .result_harness = "codex",
+        .result_session_id = "session-1",
+        .result_completed_at = "2026-05-10T14:01:00Z",
+    })) {
+        .ok => |ok_value| {
+            var ok = ok_value;
+            defer ok.deinit();
+        },
+        .err => return error.UnexpectedMutationFailure,
+    }
+
+    try vcs.assertPathsClean(a, abs, &.{meta_rel});
+    var f = try tmp.dir.openFile(meta_rel, .{});
+    defer f.close();
+    const stat = try f.stat();
+    const contents = try a.alloc(u8, stat.size);
+    defer a.free(contents);
+    _ = try f.readAll(contents);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "status = \"completed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "session_id = \"session-1\"") != null);
 }
 
 fn writeCompletedItem(dir: *std.fs.Dir, id: []const u8, slug: []const u8) !void {
