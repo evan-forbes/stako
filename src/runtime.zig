@@ -238,6 +238,23 @@ pub const Supervisor = struct {
             var item = client.readItem(stack_name, it.id) catch continue;
             defer item.deinit();
 
+            const parent_state = try self.parentState(client, stack_name, &item);
+            switch (parent_state) {
+                .ready => {},
+                .waiting => continue,
+                .missing => |parent_id| {
+                    _ = parent_id;
+                    const transition_client = self.systemClient("runtime/parent-check");
+                    deinitMutationIfOk(transition_client.runtimeTransitionItem(stack_name, .{
+                        .stack = stack_name,
+                        .id = it.id,
+                        .to = .blocked,
+                        .blocked_reason = "parent_missing",
+                    }));
+                    continue;
+                },
+            }
+
             // Sleep semantics first.
             if (item.kind == .sleep) {
                 try self.handleSleepItem(stack_name, &item);
@@ -269,6 +286,23 @@ pub const Supervisor = struct {
                 },
             }
         }
+    }
+
+    const ParentState = union(enum) {
+        ready,
+        waiting,
+        missing: []const u8,
+    };
+
+    fn parentState(self: *Supervisor, client: stack_mod.StackClient, stack_name: []const u8, item: *const item_mod.Item) !ParentState {
+        _ = self;
+        const parents = item.parents orelse return .ready;
+        for (parents) |parent_id| {
+            var parent = client.readItem(stack_name, parent_id) catch return .{ .missing = parent_id };
+            defer parent.deinit();
+            if (parent.status != .completed) return .waiting;
+        }
+        return .ready;
     }
 
     fn handleSleepItem(self: *Supervisor, stack_name: []const u8, item: *const item_mod.Item) !void {
