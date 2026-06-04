@@ -26,8 +26,20 @@ pub fn createSessionArgv(name: []const u8) [4][]const u8 {
     return .{ "zellij", "attach", "--create-background", name };
 }
 
-pub fn newTabArgv(session: []const u8, thread: []const u8, command: []const u8) [9][]const u8 {
-    return .{ "zellij", "--session", session, "action", "new-tab", "--name", thread, "--", command };
+pub fn newTabArgvAlloc(
+    allocator: std.mem.Allocator,
+    session: []const u8,
+    thread: []const u8,
+    command: []const u8,
+    cwd: []const u8,
+) error{OutOfMemory}![]const []const u8 {
+    // Caller owns the returned slice; element strings are borrowed from the arguments.
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(allocator);
+    try argv.appendSlice(allocator, &.{ "zellij", "--session", session, "action", "new-tab", "--name", thread });
+    if (cwd.len != 0) try argv.appendSlice(allocator, &.{ "--cwd", cwd });
+    try argv.appendSlice(allocator, &.{ "--", command });
+    return argv.toOwnedSlice(allocator);
 }
 
 pub fn listPanesArgv(session: []const u8) [7][]const u8 {
@@ -67,7 +79,8 @@ pub fn Runtime(comptime Adapter: type) type {
                     if (try self.adapter.paneExists(stack.name, thread.pane_id)) continue;
                     if (hasRunningOnThread(runs, thread.name)) continue;
                 }
-                const pane = try self.adapter.ensureThreadTab(stack.name, thread.name, stack.command);
+                const command = if (thread.command.len != 0) thread.command else stack.command;
+                const pane = try self.adapter.ensureThreadTab(stack.name, thread.name, command, stack.cwd);
                 defer {
                     self.allocator.free(pane.tab_id);
                     self.allocator.free(pane.pane_id);
@@ -197,9 +210,10 @@ pub const CommandAdapter = struct {
         self.allocator.free(out);
     }
 
-    pub fn ensureThreadTab(self: *CommandAdapter, session: []const u8, thread: []const u8, command: []const u8) Error!Pane {
-        const tab_argv = newTabArgv(session, thread, command);
-        const tab_out = try self.run(&tab_argv);
+    pub fn ensureThreadTab(self: *CommandAdapter, session: []const u8, thread: []const u8, command: []const u8, cwd: []const u8) Error!Pane {
+        const tab_argv = try newTabArgvAlloc(self.allocator, session, thread, command, cwd);
+        defer self.allocator.free(tab_argv);
+        const tab_out = try self.run(tab_argv);
         defer self.allocator.free(tab_out);
         const tab_id = std.mem.trim(u8, tab_out, " \t\r\n");
         const panes_argv = listPanesArgv(session);
@@ -343,6 +357,7 @@ pub const FakeAdapter = struct {
     session_exists: bool = false,
     created: bool = false,
     panes: std.StringHashMapUnmanaged([]const u8) = .empty,
+    launch_log: std.ArrayList([]const u8) = .empty,
     paste_log: std.ArrayList([]const u8) = .empty,
     dump: []const u8 = "",
     missing_pane: []const u8 = "",
@@ -356,6 +371,8 @@ pub const FakeAdapter = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.panes.deinit(self.allocator);
+        for (self.launch_log.items) |p| self.allocator.free(p);
+        self.launch_log.deinit(self.allocator);
         for (self.paste_log.items) |p| self.allocator.free(p);
         self.paste_log.deinit(self.allocator);
     }
@@ -371,9 +388,9 @@ pub const FakeAdapter = struct {
         self.session_exists = true;
     }
 
-    pub fn ensureThreadTab(self: *FakeAdapter, session: []const u8, thread: []const u8, command: []const u8) Error!Pane {
+    pub fn ensureThreadTab(self: *FakeAdapter, session: []const u8, thread: []const u8, command: []const u8, cwd: []const u8) Error!Pane {
         _ = session;
-        _ = command;
+        try self.launch_log.append(self.allocator, try std.fmt.allocPrint(self.allocator, "{s}:{s}:{s}", .{ thread, command, cwd }));
         const pane_id = try std.fmt.allocPrint(self.allocator, "pane-{s}", .{thread});
         try self.panes.put(self.allocator, try self.allocator.dupe(u8, thread), try self.allocator.dupe(u8, pane_id));
         return .{
@@ -412,11 +429,25 @@ pub const FakeAdapter = struct {
 
 test "zellij action argv targets the stack session" {
     {
-        const argv = newTabArgv("demo", "builder", "codex");
+        const argv = try newTabArgvAlloc(std.testing.allocator, "demo", "builder", "codex", "");
+        defer std.testing.allocator.free(argv);
+        try std.testing.expectEqual(@as(usize, 9), argv.len);
         try std.testing.expectEqualStrings("zellij", argv[0]);
         try std.testing.expectEqualStrings("--session", argv[1]);
         try std.testing.expectEqualStrings("demo", argv[2]);
         try std.testing.expectEqualStrings("action", argv[3]);
+        try std.testing.expectEqualStrings("new-tab", argv[4]);
+        try std.testing.expectEqualStrings("--", argv[7]);
+        try std.testing.expectEqualStrings("codex", argv[8]);
+    }
+    {
+        const argv = try newTabArgvAlloc(std.testing.allocator, "demo", "builder", "codex", "/work/repo");
+        defer std.testing.allocator.free(argv);
+        try std.testing.expectEqual(@as(usize, 11), argv.len);
+        try std.testing.expectEqualStrings("--cwd", argv[7]);
+        try std.testing.expectEqualStrings("/work/repo", argv[8]);
+        try std.testing.expectEqualStrings("--", argv[9]);
+        try std.testing.expectEqualStrings("codex", argv[10]);
     }
     {
         const argv = pasteArgv("demo", "12", "hello");
@@ -446,7 +477,7 @@ test "runUntilIdle completes a dependency chain with FakeAdapter" {
     defer a.free(impl_path);
 
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
         \\+++
@@ -491,6 +522,48 @@ test "runUntilIdle completes a dependency chain with FakeAdapter" {
     try std.testing.expectEqual(store.PromptStatus.completed, impl.status);
 }
 
+test "startStack uses thread command override when present" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
+    defer a.free(root);
+    const builder_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/builder.md", .{&tmp.sub_path});
+    defer a.free(builder_path);
+    const reviewer_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reviewer.md", .{&tmp.sub_path});
+    defer a.free(reviewer_path);
+
+    try tmp.dir.makePath("root");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "/work/repo");
+    defer stack.deinit();
+    try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
+        \\+++
+        \\type = "thread"
+        \\thread = "builder"
+        \\+++
+        \\Build.
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "reviewer.md", .data = 
+        \\+++
+        \\type = "thread"
+        \\thread = "reviewer"
+        \\command = "claude"
+        \\+++
+        \\Review.
+    });
+    try stack.installThreadFile(builder_path);
+    try stack.installThreadFile(reviewer_path);
+
+    var adapter = FakeAdapter{ .allocator = a };
+    defer adapter.deinit();
+    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
+    try runtime.startStack(&stack);
+
+    try std.testing.expectEqual(@as(usize, 2), adapter.launch_log.items.len);
+    try std.testing.expectEqualStrings("builder:codex:/work/repo", adapter.launch_log.items[0]);
+    try std.testing.expectEqualStrings("reviewer:claude:/work/repo", adapter.launch_log.items[1]);
+}
+
 test "runUntilIdle marks only a missing pane running prompt failed" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -507,7 +580,7 @@ test "runUntilIdle marks only a missing pane running prompt failed" {
     defer a.free(ok_path);
 
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "lost.md", .data = 
         \\+++
@@ -579,7 +652,7 @@ test "runUntilIdle marks only a dump-failed running prompt failed" {
     defer a.free(ok_path);
 
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "bad.md", .data = 
         \\+++
@@ -647,7 +720,7 @@ test "completion marker without result file fails the run" {
     defer a.free(prompt_path);
 
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
         \\+++
@@ -691,7 +764,7 @@ test "rendered prompt echoed in pane does not complete the run" {
     defer a.free(prompt_path);
 
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
         \\+++
@@ -746,7 +819,7 @@ test "delivery failure marks only that prompt failed" {
     defer a.free(ok_path);
 
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "bad.md", .data = 
         \\+++
@@ -811,7 +884,7 @@ test "failed dependency blocks queued dependent" {
     defer a.free(impl_path);
 
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
         \\+++
@@ -860,7 +933,7 @@ test "runtime rejects unowned existing zellij session" {
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
     defer a.free(root);
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
 
     const marker = try std.fmt.allocPrint(a, "{s}/stacks/demo/state/zellij-owner", .{root});
@@ -885,7 +958,7 @@ test "runtime targets panes, stores dumps, and completes on done marker" {
     defer a.free(prompt_path);
 
     try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex");
+    var stack = try store.Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
         \\+++

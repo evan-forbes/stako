@@ -12,6 +12,7 @@ pub const Error = error{
 const Options = struct {
     root: []const u8 = paths.DEFAULT_NOTES_ROOT,
     command: []const u8 = "codex",
+    cwd: []const u8 = "",
 };
 
 pub fn dispatch(
@@ -100,16 +101,39 @@ fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8, stdout: *std.I
             opts.command = args[i];
         } else if (std.mem.startsWith(u8, a, "--command=")) {
             opts.command = a["--command=".len..];
+        } else if (std.mem.eql(u8, a, "--cwd")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            opts.cwd = args[i];
+        } else if (std.mem.startsWith(u8, a, "--cwd=")) {
+            opts.cwd = a["--cwd=".len..];
         } else {
             return error.Usage;
         }
     }
+
+    // A stack's cwd is the directory its agent threads launch in. Resolve it to
+    // an absolute, existing path now so every thread tab is independent of where
+    // `stako start` later runs.
+    var cwd_abs: []const u8 = "";
+    if (opts.cwd.len != 0) {
+        cwd_abs = std.fs.cwd().realpathAlloc(allocator, opts.cwd) catch {
+            try stderr.print("cannot resolve --cwd path: {s}\n", .{opts.cwd});
+            return 2;
+        };
+    }
+    defer if (cwd_abs.len != 0) allocator.free(cwd_abs);
+
     const root = try paths.resolveNotesRoot(allocator, opts.root);
     defer allocator.free(root);
     try std.fs.cwd().makePath(root);
-    var stack = try store.Stack.create(allocator, root, name, opts.command);
+    var stack = try store.Stack.create(allocator, root, name, opts.command, cwd_abs);
     defer stack.deinit();
-    try stdout.print("created stack {s} command={s}\n", .{ name, opts.command });
+    if (cwd_abs.len != 0) {
+        try stdout.print("created stack {s} command={s} cwd={s}\n", .{ name, opts.command, cwd_abs });
+    } else {
+        try stdout.print("created stack {s} command={s}\n", .{ name, opts.command });
+    }
     return 0;
 }
 
@@ -183,11 +207,16 @@ fn cmdStatus(allocator: std.mem.Allocator, args: []const []const u8, stdout: *st
     defer allocator.free(root);
     var stack = try store.Stack.open(allocator, root, parsed.name);
     defer stack.deinit();
-    try stdout.print("stack {s} command={s}\n", .{ stack.name, stack.command });
+    if (stack.cwd.len != 0) {
+        try stdout.print("stack {s} command={s} cwd={s}\n", .{ stack.name, stack.command, stack.cwd });
+    } else {
+        try stdout.print("stack {s} command={s}\n", .{ stack.name, stack.command });
+    }
     const threads = try stack.listThreads();
     defer stack.freeThreads(threads);
     for (threads) |thread| {
-        try stdout.print("thread {s} status={s} pane={s}\n", .{ thread.name, thread.status.name(), thread.pane_id });
+        const command = if (thread.command.len != 0) thread.command else stack.command;
+        try stdout.print("thread {s} status={s} command={s} pane={s}\n", .{ thread.name, thread.status.name(), command, thread.pane_id });
     }
     const runs = try stack.listRuns();
     defer stack.freeRuns(runs);
@@ -345,7 +374,7 @@ fn writeStringArray(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value
 fn usage(w: *std.Io.Writer) !void {
     try w.print(
         \\usage:
-        \\  stako new <stack> [--command codex] [--root PATH]
+        \\  stako new <stack> [--command codex] [--cwd PATH] [--root PATH]
         \\  stako add <stack> <thread-or-prompt.md...> [--root PATH]
         \\  stako link <source-prompt.md> <target-prompt.md> [--pre-cmd compact]
         \\  stako start <stack> [--root PATH]

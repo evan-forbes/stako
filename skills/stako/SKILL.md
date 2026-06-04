@@ -36,8 +36,12 @@ Before relying on exact CLI details, read this repo's `README.md`; it is the sou
 Create a stack:
 
 ```sh
-stako new <stack> --command codex
+stako new <stack> --command codex --cwd /path/to/repo
 ```
+
+`--cwd` is the directory the agent threads launch in (the repo they work on),
+resolved to an absolute path at creation time. Omit it to inherit the directory
+`stako start` runs from.
 
 Write a thread file:
 
@@ -49,6 +53,18 @@ thread = "builder"
 
 You are the implementation thread.
 Read the prompt, make the requested change, run checks, and report the result.
+```
+
+`--command` on the stack is the default harness command for every thread. A thread can override it:
+
+```md
++++
+type = "thread"
+thread = "reviewer"
+command = "claude"
++++
+
+Review the implementation for correctness and missing tests.
 ```
 
 Write a prompt file:
@@ -88,7 +104,13 @@ stako output <stack> 001-implement
 
 ## Prompt Front Matter
 
-Prompt files use TOML front matter delimited by `+++`.
+Thread and prompt files use TOML front matter delimited by `+++`.
+
+Thread fields:
+
+- `type = "thread"`: marks the file as a thread file.
+- `thread`: target thread name.
+- `command`: optional harness command for this thread, for example `claude`; defaults to the stack command from `stako new`.
 
 Required fields:
 
@@ -162,7 +184,7 @@ stako link 003-review.md 004-address-review.md --pre-cmd compact
 ## Current CLI
 
 ```sh
-stako new <stack> [--command codex] [--root PATH]
+stako new <stack> [--command codex] [--cwd PATH] [--root PATH]
 stako add <stack> <thread-or-prompt.md...> [--root PATH]
 stako link <source-prompt.md> <target-prompt.md> [--pre-cmd compact]
 stako start <stack> [--root PATH]

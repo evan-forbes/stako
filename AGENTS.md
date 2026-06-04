@@ -1,6 +1,6 @@
 # Agent instructions for stako
 
-Stako is a zellij-first Zig CLI. A stack is a prompt queue; a thread is a long-lived agent session in a zellij tab; prompt files target threads and block with explicit `after = [...]` dependencies. Different threads are the parallelism boundary. Durable content handoff is via `inputs = [...]`, which passes per-prompt `runs/<id>/result.md` file paths and blocks until those prompts complete. Completion is signaled by `runs/<id>/done`; zellij pane dumps are debug output only.
+Stako is a zellij-first Zig CLI. A stack is a prompt queue; a thread is a long-lived agent session in a zellij tab; prompt files target threads and block with explicit `after = [...]` dependencies. Different threads are the parallelism boundary, and thread files can override the stack default harness with `command = "claude"` or `command = "codex"`. Durable content handoff is via `inputs = [...]`, which passes per-prompt `runs/<id>/result.md` file paths and blocks until those prompts complete. Completion is signaled by `runs/<id>/done`; zellij pane dumps are debug output only.
 
 ## Toolchain
 

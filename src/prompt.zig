@@ -41,10 +41,12 @@ pub const Action = enum {
 pub const StackFile = struct {
     allocator: std.mem.Allocator,
     command: []const u8,
+    cwd: []const u8,
     body: []const u8,
 
     pub fn deinit(self: *StackFile) void {
         self.allocator.free(self.command);
+        self.allocator.free(self.cwd);
         self.allocator.free(self.body);
     }
 };
@@ -52,10 +54,12 @@ pub const StackFile = struct {
 pub const ThreadFile = struct {
     allocator: std.mem.Allocator,
     thread: []const u8,
+    command: []const u8,
     body: []const u8,
 
     pub fn deinit(self: *ThreadFile) void {
         self.allocator.free(self.thread);
+        self.allocator.free(self.command);
         self.allocator.free(self.body);
     }
 };
@@ -113,9 +117,11 @@ pub fn parseStackFile(allocator: std.mem.Allocator, source: []const u8) ParseErr
 
     const command = stringField(&doc, "command") orelse "codex";
     if (command.len == 0) return error.MissingCommand;
+    const cwd = stringField(&doc, "cwd") orelse "";
     return .{
         .allocator = allocator,
         .command = try allocator.dupe(u8, command),
+        .cwd = try allocator.dupe(u8, cwd),
         .body = try allocator.dupe(u8, trimBody(split.body)),
     };
 }
@@ -129,9 +135,12 @@ pub fn parseThreadFile(allocator: std.mem.Allocator, source: []const u8) ParseEr
     if (!std.mem.eql(u8, typ, "thread")) return error.BadType;
     const thread = stringField(&doc, "thread") orelse return error.MissingThread;
     if (!isValidName(thread)) return error.BadName;
+    const command = stringField(&doc, "command") orelse "";
+    if (doc.find("", "command") != null and command.len == 0) return error.MissingCommand;
     return .{
         .allocator = allocator,
         .thread = try allocator.dupe(u8, thread),
+        .command = try allocator.dupe(u8, command),
         .body = try allocator.dupe(u8, trimBody(split.body)),
     };
 }
@@ -289,21 +298,25 @@ test "parse stack and thread markdown front matter" {
     var stack = try parseStackFile(std.testing.allocator,
         \\+++
         \\command = "claude"
+        \\cwd = "/work/repo"
         \\+++
         \\Stack rules.
     );
     defer stack.deinit();
     try std.testing.expectEqualStrings("claude", stack.command);
+    try std.testing.expectEqualStrings("/work/repo", stack.cwd);
     try std.testing.expectEqualStrings("Stack rules.", stack.body);
 
     var thread = try parseThreadFile(std.testing.allocator,
         \\+++
         \\type = "thread"
         \\thread = "builder"
+        \\command = "claude"
         \\+++
         \\Thread rules.
     );
     defer thread.deinit();
     try std.testing.expectEqualStrings("builder", thread.thread);
+    try std.testing.expectEqualStrings("claude", thread.command);
     try std.testing.expectEqualStrings("Thread rules.", thread.body);
 }

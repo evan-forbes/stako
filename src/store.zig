@@ -68,6 +68,7 @@ pub const PromptStatus = enum {
 pub const Thread = struct {
     allocator: std.mem.Allocator,
     name: []const u8,
+    command: []const u8,
     prompt_body: []const u8,
     tab_id: []const u8 = "",
     pane_id: []const u8 = "",
@@ -75,6 +76,7 @@ pub const Thread = struct {
 
     pub fn deinit(self: *Thread) void {
         self.allocator.free(self.name);
+        self.allocator.free(self.command);
         self.allocator.free(self.prompt_body);
         self.allocator.free(self.tab_id);
         self.allocator.free(self.pane_id);
@@ -131,9 +133,10 @@ pub const Stack = struct {
     root: []const u8,
     name: []const u8,
     command: []const u8,
+    cwd: []const u8,
     stack_prompt_body: []const u8,
 
-    pub fn create(allocator: std.mem.Allocator, root: []const u8, name: []const u8, command: []const u8) Error!Stack {
+    pub fn create(allocator: std.mem.Allocator, root: []const u8, name: []const u8, command: []const u8, cwd: []const u8) Error!Stack {
         if (!prompt_mod.isValidName(name)) return error.InvalidName;
         var root_dir = try std.fs.cwd().openDir(root, .{});
         defer root_dir.close();
@@ -153,6 +156,8 @@ pub const Stack = struct {
         defer stack_md.deinit(allocator);
         try stack_md.appendSlice(allocator, "+++\ncommand = ");
         try appendTomlString(allocator, &stack_md, command);
+        try stack_md.appendSlice(allocator, "\ncwd = ");
+        try appendTomlString(allocator, &stack_md, cwd);
         try stack_md.appendSlice(allocator, "\n+++\n\n");
         try stack_dir.writeFile(.{ .sub_path = "stack.md", .data = stack_md.items });
         try stack_dir.writeFile(.{ .sub_path = "state/zellij-owner", .data = "stako\n" });
@@ -177,6 +182,7 @@ pub const Stack = struct {
             .root = try allocator.dupe(u8, root),
             .name = try allocator.dupe(u8, name),
             .command = parsed.command,
+            .cwd = parsed.cwd,
             .stack_prompt_body = parsed.body,
         };
     }
@@ -185,6 +191,7 @@ pub const Stack = struct {
         self.allocator.free(self.root);
         self.allocator.free(self.name);
         self.allocator.free(self.command);
+        self.allocator.free(self.cwd);
         self.allocator.free(self.stack_prompt_body);
     }
 
@@ -193,7 +200,7 @@ pub const Stack = struct {
         defer self.allocator.free(src);
         var parsed = try prompt_mod.parseThreadFile(self.allocator, src);
         defer parsed.deinit();
-        try self.writeThread(parsed.thread, parsed.body, "", "", .pending);
+        try self.writeThread(parsed.thread, parsed.command, parsed.body, "", "", .pending);
     }
 
     pub fn addFiles(self: *Stack, paths: []const []const u8) Error![]EnqueueReport {
@@ -209,7 +216,7 @@ pub const Stack = struct {
             if (prompt_mod.parseThreadFile(self.allocator, src)) |thread| {
                 var t = thread;
                 defer t.deinit();
-                try self.writeThread(t.thread, t.body, "", "", .pending);
+                try self.writeThread(t.thread, t.command, t.body, "", "", .pending);
                 continue;
             } else |e| switch (e) {
                 error.BadType, error.MissingId, error.MissingThread => {},
@@ -389,6 +396,7 @@ pub const Stack = struct {
             return .{
                 .allocator = self.allocator,
                 .name = try self.allocator.dupe(u8, parsed.thread),
+                .command = try self.allocator.dupe(u8, parsed.command),
                 .prompt_body = try self.allocator.dupe(u8, parsed.body),
                 .tab_id = try self.allocator.dupe(u8, tab),
                 .pane_id = try self.allocator.dupe(u8, pane),
@@ -398,6 +406,7 @@ pub const Stack = struct {
         return .{
             .allocator = self.allocator,
             .name = try self.allocator.dupe(u8, parsed.thread),
+            .command = try self.allocator.dupe(u8, parsed.command),
             .prompt_body = try self.allocator.dupe(u8, parsed.body),
             .tab_id = try self.allocator.dupe(u8, ""),
             .pane_id = try self.allocator.dupe(u8, ""),
@@ -408,7 +417,7 @@ pub const Stack = struct {
     pub fn setThreadPane(self: *Stack, name: []const u8, tab_id: []const u8, pane_id: []const u8) Error!void {
         var t = try self.readThread(name);
         defer t.deinit();
-        try self.writeThread(name, t.prompt_body, tab_id, pane_id, .ready);
+        try self.writeThread(name, t.command, t.prompt_body, tab_id, pane_id, .ready);
     }
 
     pub fn setRunStatus(self: *Stack, id: []const u8, status: PromptStatus, reason: []const u8) Error!void {
@@ -628,7 +637,7 @@ pub const Stack = struct {
         try dir.writeFile(.{ .sub_path = rel, .data = meta.items });
     }
 
-    fn writeThread(self: *Stack, name: []const u8, body: []const u8, tab_id: []const u8, pane_id: []const u8, status: ThreadStatus) Error!void {
+    fn writeThread(self: *Stack, name: []const u8, command: []const u8, body: []const u8, tab_id: []const u8, pane_id: []const u8, status: ThreadStatus) Error!void {
         if (!prompt_mod.isValidName(name)) return error.InvalidName;
         var dir = try self.openStackDir(.{});
         defer dir.close();
@@ -641,6 +650,10 @@ pub const Stack = struct {
         defer src.deinit(self.allocator);
         try src.appendSlice(self.allocator, "+++\ntype = \"thread\"\nthread = ");
         try appendTomlString(self.allocator, &src, name);
+        if (command.len != 0) {
+            try src.appendSlice(self.allocator, "\ncommand = ");
+            try appendTomlString(self.allocator, &src, command);
+        }
         try src.appendSlice(self.allocator, "\n+++\n\n");
         try src.appendSlice(self.allocator, body);
         try src.append(self.allocator, '\n');
@@ -942,7 +955,7 @@ test "enqueue validates dependencies and stores output" {
     defer a.free(p2_path);
 
     try tmp.dir.makePath("root");
-    var stack = try Stack.create(a, root, "demo", "codex");
+    var stack = try Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
         \\+++
@@ -992,7 +1005,7 @@ test "queue order follows insertion order instead of thread or id sorting" {
     defer a.free(second_path);
 
     try tmp.dir.makePath("root");
-    var stack = try Stack.create(a, root, "demo", "codex");
+    var stack = try Stack.create(a, root, "demo", "codex", "");
     defer stack.deinit();
     try tmp.dir.writeFile(.{ .sub_path = "alpha.md", .data = 
         \\+++
@@ -1045,10 +1058,50 @@ test "stack command is escaped in toml front matter" {
     defer a.free(root);
 
     try tmp.dir.makePath("root");
-    var created = try Stack.create(a, root, "demo", "foo\"bar\nbaz");
+    var created = try Stack.create(a, root, "demo", "foo\"bar\nbaz", "");
     created.deinit();
 
     var reopened = try Stack.open(a, root, "demo");
     defer reopened.deinit();
     try std.testing.expectEqualStrings("foo\"bar\nbaz", reopened.command);
+}
+
+test "thread command overrides stack command when present" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
+    defer a.free(root);
+    const builder_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/builder.md", .{&tmp.sub_path});
+    defer a.free(builder_path);
+    const reviewer_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reviewer.md", .{&tmp.sub_path});
+    defer a.free(reviewer_path);
+
+    try tmp.dir.makePath("root");
+    var stack = try Stack.create(a, root, "demo", "codex", "");
+    defer stack.deinit();
+    try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
+        \\+++
+        \\type = "thread"
+        \\thread = "builder"
+        \\+++
+        \\Build.
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "reviewer.md", .data = 
+        \\+++
+        \\type = "thread"
+        \\thread = "reviewer"
+        \\command = "claude"
+        \\+++
+        \\Review.
+    });
+    try stack.installThreadFile(builder_path);
+    try stack.installThreadFile(reviewer_path);
+
+    var builder = try stack.readThread("builder");
+    defer builder.deinit();
+    var reviewer = try stack.readThread("reviewer");
+    defer reviewer.deinit();
+    try std.testing.expectEqualStrings("", builder.command);
+    try std.testing.expectEqualStrings("claude", reviewer.command);
 }

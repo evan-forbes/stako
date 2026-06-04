@@ -34,8 +34,13 @@ make skill
 Create a stack:
 
 ```sh
-stako new my-work --command codex
+stako new my-work --command codex --cwd ~/src/my-repo
 ```
+
+`--cwd` is the directory the agent threads launch in; it is the repository the
+agents work on. The path is resolved to an absolute path when the stack is
+created, so it does not depend on where you later run `stako start`. Omit it to
+inherit the directory `stako start` runs from.
 
 Write a thread prompt:
 
@@ -48,6 +53,22 @@ thread = "builder"
 You are working in the user's repository.
 Read the task, make the requested change, run the relevant checks, and report the result.
 ```
+
+`--command` on the stack is the default harness command for every thread. A
+thread can override it:
+
+```md
++++
+type = "thread"
+thread = "reviewer"
+command = "claude"
++++
+
+Review the implementation for correctness and missing tests.
+```
+
+With the stack created as `--command codex`, the builder thread launches
+`codex`; this reviewer thread launches `claude`.
 
 Write a prompt:
 
@@ -99,11 +120,15 @@ Thread files define reusable per-thread behavior:
 +++
 type = "thread"
 thread = "reviewer"
+command = "claude"
 +++
 
 Review the latest implementation for correctness, missing tests, and unnecessary complexity.
 Do not make code changes unless explicitly asked.
 ```
+
+Thread `command` is optional. If it is omitted, the thread uses the stack's
+default `command` from `stako new`.
 
 Prompt files define queued work:
 
@@ -201,7 +226,7 @@ stako link 003-review.md 004-address-review.md --pre-cmd compact
 ## CLI
 
 ```sh
-stako new <stack> [--command codex] [--root PATH]
+stako new <stack> [--command codex] [--cwd PATH] [--root PATH]
 stako add <stack> <thread-or-prompt.md...> [--root PATH]
 stako link <source-prompt.md> <target-prompt.md> [--pre-cmd compact]
 stako start <stack> [--root PATH]
