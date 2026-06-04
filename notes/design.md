@@ -1,5 +1,7 @@
 # Stako Design
 
+> Legacy note: this document describes the older daemon/API/routine design. The active large-refactor branch is zellij-first: stacks are prompt queues, threads are durable agent tabs, and synchronization is expressed with prompt `after = [...]` dependencies. See `README.md` for the current source of truth.
+
 Stako is a stack runtime: a daemon that operates persistent queues of agent work, exposes them over a local API, and renders them as a web view. A CLI is the first client of that API.
 
 This document is intentionally narrow. Everything outside this scope (indexing, tags, calendar/sync, project structure, ligi extraction, Neovim plugin, public-internet exposure) lives in `backlog/`.

@@ -1,2 +1,0 @@
-{"v":1,"ts":"2026-05-10T14:00:01.000Z","stack":"smoke","item":"0001","session":"sess-1","kind":"session_started","data":{"harness":"claude","model":"claude-opus-4-7"}}
-{"v":1,"ts":"2026-05-10T14:00:01.500Z","stack":"smoke","item":"0001","session":"sess-1","kind":"message","data":{"text":"hello there","role":"assistant"}}

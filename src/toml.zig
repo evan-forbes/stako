@@ -237,7 +237,7 @@ fn parseString(arena: std.mem.Allocator, source: []const u8, i_ptr: *usize) Pars
     var i = i_ptr.*;
     std.debug.assert(source[i] == '"');
     i += 1;
-    var buf = std.ArrayList(u8){};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(arena);
     while (i < source.len) {
         const c = source[i];
@@ -272,7 +272,7 @@ fn parseStringArray(arena: std.mem.Allocator, source: []const u8, i_ptr: *usize)
     var i = i_ptr.*;
     std.debug.assert(source[i] == '[');
     i += 1;
-    var items = std.ArrayList([]const u8){};
+    var items: std.ArrayList([]const u8) = .empty;
     defer items.deinit(arena);
     while (i < source.len) {
         // skip whitespace and newlines and comments

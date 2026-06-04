@@ -1,7 +1,0 @@
-{"type":"thread.started","thread_id":"th-codex-real","model":"gpt-5"}
-{"type":"turn.started"}
-{"type":"item.completed","item":{"item_type":"reasoning","text":"Working on it."}}
-{"type":"item.completed","item":{"item_type":"command_execution","id":"ce_1","command":"echo hello","exit_code":0}}
-{"type":"item.completed","item":{"item_type":"file_change","id":"fc_1","changes":[{"path":"hello.txt","kind":"create"}]}}
-{"type":"item.completed","item":{"item_type":"agent_message","text":"Hi from codex."}}
-{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":3}}

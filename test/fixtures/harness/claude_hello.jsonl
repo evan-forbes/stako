@@ -1,6 +1,0 @@
-{"kind":"session_started","data":{"harness":"claude","model":"claude-opus-4-7","session":"sess-claude-hello"}}
-{"kind":"turn_started","data":{"turn":0}}
-{"kind":"message_chunk","data":{"text":"Hello, ","role":"assistant"}}
-{"kind":"message_chunk","data":{"text":"world!","role":"assistant"}}
-{"kind":"message","data":{"text":"Hello, world!","role":"assistant"}}
-{"kind":"turn_completed","data":{"turn":0,"usage":{"input_tokens":4,"output_tokens":3}}}

@@ -1,6 +1,6 @@
 # Agent instructions for stako
 
-Stako is a Zig CLI + daemon — a stack-based meta-harness that drives `claude` and `codex` through queued prompts/routines. Inputs and outputs are git commits.
+Stako is a zellij-first Zig CLI. A stack is a prompt queue; a thread is a long-lived agent session in a zellij tab; prompt files target threads and block with explicit `after = [...]` dependencies. Different threads are the parallelism boundary. Durable content handoff is via `inputs = [...]`, which passes per-prompt `runs/<id>/result.md` file paths and blocks until those prompts complete. Completion is signaled by `runs/<id>/done`; zellij pane dumps are debug output only.
 
 ## Toolchain
 

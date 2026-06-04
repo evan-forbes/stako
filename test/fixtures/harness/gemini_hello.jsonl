@@ -1,2 +1,0 @@
-{"kind":"session_started","data":{"harness":"gemini","model":"gemini-2.5-flash","session":"sess-gemini-hello"}}
-{"kind":"message","data":{"text":"Gemini says hi.","role":"assistant"}}

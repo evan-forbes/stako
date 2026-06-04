@@ -1,5 +1,7 @@
 # High-Level Implementation
 
+> Legacy note: this document describes the older daemon/API/routine implementation ladder. The active large-refactor branch is zellij-first: stacks are prompt queues, threads are durable agent tabs, and synchronization is expressed with prompt `after = [...]` dependencies. See `README.md` for the current source of truth.
+
 This document covers *how* the daemon, web view, CLI, provider dispatch, and local workflow get built. The *what* lives in `design.md`.
 
 ## Build Order

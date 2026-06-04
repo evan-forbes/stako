@@ -1,257 +1,226 @@
 # stako
 
-Stako is a stack-based meta-harness for coding agents. You queue prompts and routines onto a stack, and stako drives them through the harnesses you already use (Claude Code, Codex). Inputs and outputs travel as git commits, so the work stays visible and revertable.
+Stako is a tiny queue runner for coding agents.
 
-## Setup (once)
+The model is deliberately small:
 
-**Prerequisites:** `claude` and `codex` on your `PATH` and signed in, plus a Zig toolchain to build from source.
+- A **stack** is a queue of prompt files.
+- A **thread** is one long-lived agent session in a zellij tab.
+- Each prompt targets one thread.
+- Prompts on the same thread run one at a time.
+- Prompts on different threads may run in parallel unless they declare `after`.
+- A thread prompt is prepended every time a prompt is delivered, including after `new`, `clear`, and `compact` actions.
+
+Stako stores the queue on disk, starts one zellij tab per thread, and pastes prompts into the relevant tab. Durable content moves between threads through per-prompt `result.md` files, and completion is signaled by a per-run `done` marker file, not by zellij pane text.
+
+## Install
+
+Prerequisites:
+
+- Zig 0.15.2
+- `zellij`
+- the agent CLI you want to run, usually `codex` or `claude`
 
 ```sh
-make install         # build stako, install to $HOME/.local/bin
-stako init           # bootstrap ~/stako with the standard layout
-stako daemon start   # serve the loopback API (leave running)
+make build
+make install
+make skill
 ```
 
-`init` creates `~/stako/` with `prompts/` and `routines/` directories, `stacks/default/stack.toml`, an `AGENTS.md` primer, a documented `config.toml`, and a local auth token under `state/`. Confirm provider sign-in with `stako auth status`. Run the commands below in another terminal while the daemon runs.
+`make skill` installs the bundled Stako skill for Codex and Claude by symlinking `skills/stako`.
 
-## Human CLI authoring
+## Quick Start
 
-### 1. Create a stack
-
-A stack lives at `~/stako/stacks/<name>/`. Every step it runs produces a commit in the notes-root git repo, scoped to that stack's files. Inputs you register on an item (file, commit, or prior item) become explicit context the agent sees.
+Create a stack:
 
 ```sh
-stako new add-rate-limiter
+stako new my-work --command codex
 ```
 
-### 2. Write prompts
+Write a thread prompt:
 
-Prompts live in `~/stako/prompts/` as plain markdown. Tell the agent what to read, what to do, and what to write back.
-
-```text
-~/stako/prompts/rate-limiter/
-  implement.md
-  review.md
-```
-
-### 3. Write a routine
-
-A routine in `~/stako/routines/<name>.toml` is an ordered list of steps that apply prompts. Steps on the same thread run in one agent context. A step can switch threads to run on a different harness.
-
-> **Threads** are persistent agent sessions scoped to a stack. Same-thread steps share one running context. Different-thread steps run in their own contexts.
-
-`~/stako/routines/implement-and-review.toml`:
-
-```toml
-[[step]]
+```md
++++
+type = "thread"
 thread = "builder"
-prompts = ["../prompts/rate-limiter/implement.md"]
++++
 
-[[step]]
-thread = "claude-review"
-prompts = ["../prompts/rate-limiter/review.md"]
-
-[[step]]
-thread = "codex-review"
-prompts = ["../prompts/rate-limiter/review.md"]
+You are working in the user's repository.
+Read the task, make the requested change, run the relevant checks, and report the result.
 ```
 
-The builder writes the implementation commit. Each reviewer reads that commit on its own thread, so Claude and Codex give independent audits.
+Write a prompt:
 
-### 4. Queue it and start
+```md
++++
+id = "001-plan"
+thread = "builder"
++++
+
+Inspect the repository and write a short implementation plan.
+```
+
+Queue both files:
 
 ```sh
-stako add implement-and-review add-rate-limiter
-stako start add-rate-limiter
-stako stack show add-rate-limiter
+stako add my-work builder.md 001-plan.md
 ```
 
-`add` appends the routine to the stack. `start` resumes execution. `stack show` displays items and status.
-
-## Python SDK
+Start the stack:
 
 ```sh
-pip install ./sdk/python
+stako start my-work
 ```
 
-A thin local client for generated workflows: it writes prompt and routine source files under the notes root, then calls the daemon API for stack creation, thread targeting, queueing, prompt edits, re-runs, and start/resume. It never edits stack state on disk — the daemon owns that.
+`start` watches the stack until it is idle: it polls running prompts for their `done` marker, delivers newly unblocked prompts, and exits when nothing is running or ready.
 
-```python
-from stako import Client, Prompt, Routine, Stack
+Attach to the zellij session:
 
-client = Client(root="~/stako")
-
-routine = (
-    Routine("implement-and-review")
-    # Declare each thread once with its provider/model; steps target it by name.
-    .thread("builder", provider="openai", model="gpt-5")
-    .thread("reviewer", provider="anthropic")
-    # Each .prompt(...) appends one step, in order. Chain as many as you need.
-    .prompt(
-        Prompt.combine(
-            Prompt.text("Read the registered inputs."),
-            Prompt.from_file("docs/rate-limiter-notes.md"),
-        ),
-        thread="builder",
-    )
-    .prompt(
-        "Review the builder's commit for correctness and missing tests.",
-        thread="reviewer",
-    )
-    # Add a new step any time — here a second builder pass that sees the review.
-    .prompt("Address the reviewer's findings and commit the fix.", thread="builder")
-    # .compact(...) appends a step that condenses that thread's context so a long
-    # session keeps running without overflowing the harness's context window.
-    .compact(thread="builder")
-)
-
-Stack(client, "add-rate-limiter").create().add(routine).start()
+```sh
+stako attach my-work
 ```
 
-This materializes one file per prompt step (compact steps carry no file):
+Inspect status and output:
+
+```sh
+stako status my-work
+stako output my-work 001-plan
+```
+
+`stako output` is raw pane dump output for debugging. Downstream prompts read `result.md` files.
+
+## Prompt Files
+
+All input files are Markdown with TOML front matter delimited by `+++`.
+
+Thread files define reusable per-thread behavior:
+
+```md
++++
+type = "thread"
+thread = "reviewer"
++++
+
+Review the latest implementation for correctness, missing tests, and unnecessary complexity.
+Do not make code changes unless explicitly asked.
+```
+
+Prompt files define queued work:
+
+```md
++++
+id = "002-review"
+thread = "reviewer"
+after = ["001-plan"]
+inputs = ["001-plan"]
++++
+
+Review the plan and call out concrete risks before implementation starts.
+```
+
+Fields:
+
+- `id`: unique prompt id within the stack. Use sortable ids such as `001-plan`, `002-implement`, `003-review`.
+- `thread`: target thread name.
+- `after`: optional list of prompt ids that must complete first.
+- `inputs`: optional list of prompt ids whose `result.md` files should be passed to this prompt. Inputs also block until the source prompt completes.
+- `action`: optional thread action: `none`, `new`, `clear`, or `compact`.
+
+`action` sends the matching slash command before the prompt body:
+
+- `new` sends `/new`
+- `clear` sends `/clear`
+- `compact` sends `/compact`
+
+The rendered prompt is always:
+
+1. stack prompt from `stack.md`
+2. target thread prompt
+3. input result file paths from `inputs`
+4. queued prompt body
+5. result file instructions
+6. completion marker instructions
+
+Every run has a predetermined durable result file and completion marker:
 
 ```text
-~/stako/prompts/generated/implement-and-review/step-0001.md
-~/stako/prompts/generated/implement-and-review/step-0002.md
-~/stako/prompts/generated/implement-and-review/step-0003.md
-~/stako/routines/implement-and-review.toml
+<root>/stacks/<stack>/runs/<prompt-id>/result.md
+<root>/stacks/<stack>/runs/<prompt-id>/done
 ```
 
-The same client edits and inspects work after it is queued:
+The agent must write the final downstream handoff content to `result.md`, then create `done`. The marker can be empty, but it must not exist before the result is complete. If `done` exists but `result.md` is missing, Stako marks the run `failed` with `missing_result_file`.
 
-```python
-stack = client.stack("add-rate-limiter")
-stack.get_prompt("0001")                  # current prompt text, or None
-stack.edit_prompt("0001", "Revised …")    # overwrite a queued item in place
-stack.rerun("0002", "Try again, but …")   # fork a finished item with a new prompt
+## Sync And Parallel
+
+Parallelism is implicit. If two queued prompts target different threads and have no unmet dependencies, `stako start` can deliver both.
+
+Synchronization is explicit:
+
+```md
++++
+id = "003-review"
+thread = "reviewer"
+after = ["002-implement"]
++++
+
+Review the implementation produced by 002-implement.
 ```
 
-### Script inputs: pass a params TOML, not a CLI
+Same-thread prompts are serialized. Different-thread prompts block when `after` or `inputs` says they block.
 
-A script that drives stako should take its inputs from a **params TOML**, not from a hand-rolled `argparse` CLI. The file has exactly two tables:
+Content handoff is explicit with `inputs`:
 
-- `[stako]` — fields the SDK knows about, **typed and validated**: `root`, `port`, `host`, `stack`, and a `[stako.inputs]` table (`files`, `items`, `commits`, `mode`). Unknown keys here are an error.
-- `[params]` — the script's own values, **free-form** and passed through untouched. Put anything the script needs here.
+```md
++++
+id = "004-address-review"
+thread = "builder"
+after = ["003-review"]
+inputs = ["003-review"]
+action = "compact"
++++
 
-Any other top-level key is rejected, so the boundary stays clear.
-
-```toml
-# run-workflow.toml
-[stako]
-root  = "~/stako"
-stack = "add-rate-limiter"
-
-[stako.inputs]
-files = ["docs/rate-limiter-notes.md"]
-mode  = "append"
-
-[params]
-target_module = "ratelimit"
-max_retries   = 3
+Address the reviewer findings.
 ```
 
-`Params.load()` finds the file from the first CLI argument, falling back to `$STAKO_PARAMS` — no argument parsing to write:
+When this prompt is delivered, Stako includes the absolute path to:
 
-```python
-from stako import Params, Routine
-
-params = Params.load()                         # argv[1], else $STAKO_PARAMS
-stack = params.target_stack()                  # Client + stack from [stako]
-
-routine = (
-    Routine("implement")
-    .thread("builder", provider="anthropic")
-    .prompt(f"Implement {params.get('target_module')}.", thread="builder")
-)
-stack.add(routine, inputs=params.stako.inputs).start()
+```text
+<root>/stacks/<stack>/runs/003-review/result.md
 ```
 
-Run it as `python run-workflow.py run-workflow.toml` (or `STAKO_PARAMS=run-workflow.toml python run-workflow.py`). `params.stako` is the typed view; `params.params` (and `params.get(key)`) is the script's free-form table.
+The builder reads that file. Stako does not scrape the reviewer pane to decide what content matters.
 
-## HTTP API (write your own client)
-
-The SDK is a thin wrapper over a loopback JSON API; drive stako from any language:
-
-- **Base URL:** `http://127.0.0.1:<port>` — `port` is `[daemon].port` in `<root>/config.toml` (default 7421).
-- **Auth:** every request needs `Authorization: Bearer <token>`, where `<token>` is the contents of `<root>/state/local_token`.
-- **Errors:** non-2xx responses carry `{"error":{"code":…,"message":…}}`.
-
-| Method & path | Purpose |
-| --- | --- |
-| `POST /stacks` `{"name"}` | create a stack |
-| `POST /stacks/{s}/threads` `{"name","target"}` | declare a thread (do this before items target it) |
-| `POST /stacks/{s}/routines/{r}` `{"inputs"?}` | queue routine `r` (must already exist on disk) |
-| `POST /stacks/{s}/items` | append one item (body below) |
-| `POST /stacks/{s}/resume` | start / resume execution |
-| `GET  /stacks/{s}` | stack, items, and status |
-| `GET  /stacks/{s}/items/{id}` | item detail (inputs, thread, result) |
-| `GET  /stacks/{s}/items/{id}/rendered-prompt` | exact text sent to the harness (`?meta=1` → size only) |
-| `GET  /stacks/{s}/items/{id}/output` | committed output |
-| `POST /stacks/{s}/items/{id}/prompt` `{"prompt"}` | edit a **queued** item's prompt in place |
-| `GET  /stacks/{s}/events` | SSE stream of run events |
-
-Append-item body — only `kind` and `slug` are required:
-
-```json
-{
-  "kind": "prompt",
-  "slug": "implement",
-  "prompt": "Read the inputs and implement the change.",
-  "thread": {"name": "builder", "mode": "fresh"},
-  "inputs": {"items": ["0001"], "files": ["docs/spec.md"], "mode": "append"},
-  "parents": ["0001"]
-}
-```
-
-`thread.mode` (and the top-level `thread_mode`) is one of `fresh`, `resume`, `continue`, `fork`; `inputs.mode` is `append` or `prepend`. To insert before an existing item instead of appending, `POST /stacks/{s}/items/{id}/insert` with the same body.
-
-## How fixups happen
-
-A review prompt that finds something to fix writes a new prompt file and runs:
+To wire a source prompt into a target prompt:
 
 ```sh
-stako add fix add-rate-limiter
+stako link 003-review.md 004-address-review.md --pre-cmd compact
 ```
 
-`fix.toml` is a one-step routine that runs the new prompt on the `builder` thread. The builder picks it up in its existing context, commits the fix, and the next reviewer in the stack sees it. The loop continues until reviewers stop appending.
+`link` rewrites the target prompt front matter so `after` and `inputs` include the source prompt id and `action` is set to the requested pre-command.
 
-## Inspecting work
-
-The daemon serves a web UI at the same address as the API — open `http://127.0.0.1:<port>/` in a browser (default port 7421). Pages are the same routes as the JSON API; a browser gets HTML, a client sending `Accept: application/json` gets JSON.
-
-- **`/`** — every stack.
-- **`/stacks/<name>`** — the stack's items, config, and threads. Status badges update live over SSE as sessions start and finish, and queued prompts can be edited inline.
-- **`/stacks/<name>/items/<id>`** — the item's prompt, the **rendered prompt** (the exact text passed to the harness, i.e. the input), the output summary, changed paths, and a live transcript of the run.
-- **`/stacks/<name>/threads/<thread>`** — the thread's provider/model plus a table of every item that ran on it, each linking straight to that item's **input** (rendered prompt) and **output**. This is the per-thread input/output view.
-
-Headless, the same data comes from `stako stack thread show <stack> <thread>` (the thread's items), `stako stack item <stack> <id> [--prompt | --rendered]` (one item), and the JSON/SSE endpoints above.
-
-## CLI reference
+## CLI
 
 ```sh
-stako init [--root <path>] [--quiet]
-stako daemon start|stop|status
-stako new <stack>
-stako add <routine> <stack> [--input-item <id> | --input-file <path> | --input-commit <sha>]
-stako start <stack>
-stako stack list|show|config|pause|resume <stack>
-stako stack threads <stack>
-stako stack thread show <stack> <thread>
-stako stack item <stack> <id> [--prompt | --rendered]
-stako stack edit-prompt <stack> <id> [--prompt-file <f> | --prompt <text> | --stdin]
-stako stack rerun <stack> <id> [--prompt-file <f> | --prompt <text> | --stdin] [--thread-mode <m>]
-stako routine list|show [<name>]
-stako auth status [<provider>]
+stako new <stack> [--command codex] [--root PATH]
+stako add <stack> <thread-or-prompt.md...> [--root PATH]
+stako link <source-prompt.md> <target-prompt.md> [--pre-cmd compact]
+stako start <stack> [--root PATH]
+stako attach <stack>
+stako status <stack> [--root PATH]
+stako output <stack> <prompt-id> [--root PATH]
 ```
 
-Daemon-backed commands accept `--root <path>`, `--port <n>`, `--json`, and `--verbose`. `STAKO_PORT` overrides the port when no local config is present.
+The default root is `~/stako`.
 
-`edit-prompt` overwrites a **queued** item's prompt in place (with no source flag it opens `$EDITOR` seeded with the current prompt). `rerun` forks a finished item: it appends a new item with the edited prompt, copying the original's thread and recording lineage via `parents`. `item --rendered` shows the exact text passed to the harness once an item has run. See **Inspecting work** above for the web UI and per-thread views.
+## Current Limits
 
-## Building from source
+- Queue order is insertion order. Prompt ids are still used as stable names and dependency targets.
+- Raw output is captured by dumping the zellij pane for debugging. Completion and durable handoff content are filesystem based: `done` and `result.md`.
+
+## Development
 
 ```sh
-make            # build (zig-out/bin/stako)
-make test       # run the full test suite
-make install    # install to $HOME/.local/bin (override with PREFIX=...)
+make build
+make test
+zig build -Doptimize=ReleaseFast test
 ```

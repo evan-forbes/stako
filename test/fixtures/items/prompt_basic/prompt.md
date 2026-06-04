@@ -1,1 +1,0 @@
-Say hello and exit.

@@ -1,7 +1,0 @@
-{"type":"system","subtype":"init","session_id":"sess-claude-real","model":"claude-opus-4-7","cwd":"/tmp/stako-smoke-workdir"}
-{"type":"stream_event","event":{"type":"message_start","message":{"id":"msg_1"}}}
-{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello, "}}}
-{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"world!"}}}
-{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Hello, world!"}]}}
-{"type":"stream_event","event":{"type":"message_stop"}}
-{"type":"result","subtype":"success","session_id":"sess-claude-real","result":"Hello, world!"}

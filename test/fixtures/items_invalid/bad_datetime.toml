@@ -1,9 +1,0 @@
-id = "0001"
-slug = "bad-datetime"
-kind = "prompt"
-status = "queued"
-created_at = "yesterday"
-updated_at = 2026-05-10T14:32:00Z
-
-[target]
-provider = "anthropic"

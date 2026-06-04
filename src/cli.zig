@@ -1,1610 +1,406 @@
-//! CLI subcommand routing for the `stako` binary.
-//!
-//! Milestones 2–3 added `init` and `daemon`. Milestone 4 wraps the daemon's
-//! read endpoints in user-facing subcommands plus short aliases. The shape
-//! mirrors `todos/implement_cli_client.md`:
-//!
-//!   stako init                              # local-only filesystem work
-//!   stako daemon start|stop|status          # process management
-//!   stako d start|stop|st                   # short daemon aliases
-//!   stako stack list|show|config            # API calls
-//!   stako s ls|sh|cfg                       # short stack aliases
-//!
-//! Every API command supports the same global flag set:
-//!
-//!   --json, -j        Pass-through of the daemon response unchanged.
-//!   --root, -r PATH   Override notes root for local config/token discovery.
-//!   --port, -p N      Override the daemon port (highest priority).
-//!   --verbose, -v     Include request URL / port on errors.
-//!
-//! Rendering belongs in `cli_stack.zig`; this file only routes and parses.
-
 const std = @import("std");
-const init_mod = @import("init.zig");
-const daemon_mod = @import("daemon.zig");
-const cli_stack = @import("cli_stack.zig");
-const cli_routine = @import("cli_routine.zig");
-const harness_dispatch = @import("harness_dispatch.zig");
 const paths = @import("paths.zig");
+const prompt_mod = @import("prompt.zig");
+const store = @import("store.zig");
+const zellij = @import("zellij.zig");
 
-pub const UsageError = error{
-    NoSubcommand,
-    UnknownSubcommand,
-    BadFlagValue,
+pub const Error = error{
+    Usage,
     OutOfMemory,
-};
+} || paths.Error || store.Error || zellij.Error || std.Io.Writer.Error || std.fs.Dir.MakeError || std.process.Child.SpawnError || std.process.Child.WaitError;
 
-fn nextFlagValue(args: []const []const u8, index: *usize) UsageError![]const u8 {
-    if (index.* + 1 >= args.len) return error.BadFlagValue;
-    index.* += 1;
-    return args[index.*];
-}
-
-fn flagValue(
-    args: []const []const u8,
-    index: *usize,
-    long: []const u8,
-    short: ?[]const u8,
-    long_eq: []const u8,
-) UsageError!?[]const u8 {
-    const a = args[index.*];
-    if (std.mem.eql(u8, a, long) or (short != null and std.mem.eql(u8, a, short.?))) {
-        return try nextFlagValue(args, index);
-    }
-    if (std.mem.startsWith(u8, a, long_eq)) return a[long_eq.len..];
-    return null;
-}
-
-fn parsePort(v: []const u8) UsageError!u16 {
-    return std.fmt.parseInt(u16, v, 10) catch error.BadFlagValue;
-}
-
-fn Alias(comptime T: type) type {
-    return struct {
-        name: []const u8,
-        value: T,
-    };
-}
-
-fn matchAlias(comptime T: type, s: []const u8, comptime aliases: []const Alias(T)) ?T {
-    inline for (aliases) |a| {
-        if (std.mem.eql(u8, s, a.name)) return a.value;
-    }
-    return null;
-}
-
-pub const Subcommand = enum {
-    init,
-    daemon,
-    stack,
-    routine,
-    auth,
-    new,
-    start,
-    add,
-
-    /// Accepts the canonical name and the short alias documented in
-    /// `todos/implement_cli_client.md`.
-    pub fn fromString(s: []const u8) ?Subcommand {
-        const aliases = [_]Alias(Subcommand){
-            .{ .name = "init", .value = .init },
-            .{ .name = "daemon", .value = .daemon },
-            .{ .name = "d", .value = .daemon },
-            .{ .name = "stack", .value = .stack },
-            .{ .name = "s", .value = .stack },
-            .{ .name = "routine", .value = .routine },
-            .{ .name = "rtn", .value = .routine },
-            .{ .name = "auth", .value = .auth },
-            .{ .name = "a", .value = .auth },
-            .{ .name = "new", .value = .new },
-            .{ .name = "start", .value = .start },
-            .{ .name = "add", .value = .add },
-        };
-        return matchAlias(Subcommand, s, &aliases);
-    }
-};
-
-pub const DaemonAction = enum {
-    start,
-    stop,
-    status,
-
-    /// `st` is the short alias for `status` per the design doc.
-    pub fn fromString(s: []const u8) ?DaemonAction {
-        const aliases = [_]Alias(DaemonAction){
-            .{ .name = "start", .value = .start },
-            .{ .name = "stop", .value = .stop },
-            .{ .name = "status", .value = .status },
-            .{ .name = "st", .value = .status },
-        };
-        return matchAlias(DaemonAction, s, &aliases);
-    }
-};
-
-pub const DaemonArgs = struct {
-    action: DaemonAction,
+const Options = struct {
     root: []const u8 = paths.DEFAULT_NOTES_ROOT,
-    /// Override `daemon.port` from config.
-    port_override: ?u16 = null,
-    /// When true, run the daemon in the foreground instead of forking.
-    /// Milestone 3 only supports foreground for testability and
-    /// simplicity; backgrounding lands when the supervisor matures.
-    foreground: bool = true,
+    command: []const u8 = "codex",
 };
 
-pub fn parseDaemonArgs(args: []const []const u8) UsageError!DaemonArgs {
-    if (args.len == 0) return error.NoSubcommand;
-    const action = DaemonAction.fromString(args[0]) orelse return error.UnknownSubcommand;
-    var out: DaemonArgs = .{ .action = action };
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (try flagValue(args, &i, "--root", "-r", "--root=")) |v| {
-            out.root = v;
-            if (out.root.len == 0) return error.BadFlagValue;
-        } else if (try flagValue(args, &i, "--port", "-p", "--port=")) |v| {
-            out.port_override = try parsePort(v);
-        } else if (std.mem.eql(u8, a, "--foreground")) {
-            out.foreground = true;
-        } else {
-            return error.BadFlagValue;
-        }
-    }
-    return out;
-}
-
-pub const InitArgs = struct {
-    /// Defaults to the user's visible stako notes root when --root is absent.
-    root: []const u8 = paths.DEFAULT_NOTES_ROOT,
-    quiet: bool = false,
-    /// Hidden: override `created_at` for deterministic fixture regeneration.
-    /// Use only via `tools/regen_*` workflows; not documented in --help.
-    now_override: ?[]const u8 = null,
-    /// Hidden: override the RNG seed used for `local_token`. Same audience.
-    rng_seed_override: ?u64 = null,
-};
-
-pub fn parseInitArgs(args: []const []const u8) UsageError!InitArgs {
-    var out: InitArgs = .{};
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
-            out.quiet = true;
-        } else if (try flagValue(args, &i, "--root", "-r", "--root=")) |v| {
-            out.root = v;
-            if (out.root.len == 0) return error.BadFlagValue;
-        } else if (std.mem.startsWith(u8, a, "--now=")) {
-            const v = a["--now=".len..];
-            if (!isValidIsoUtc(v)) return error.BadFlagValue;
-            out.now_override = v;
-        } else if (std.mem.startsWith(u8, a, "--seed=")) {
-            const v = a["--seed=".len..];
-            out.rng_seed_override = std.fmt.parseInt(u64, v, 0) catch return error.BadFlagValue;
-        } else {
-            // Unknown flag for `init`; treat as bad usage.
-            return error.BadFlagValue;
-        }
-    }
-    return out;
-}
-
-/// Strict shape check for `--now=` values: exactly `YYYY-MM-DDTHH:MM:SSZ`
-/// (20 bytes). The hidden override flows into `stack.toml` as a TOML datetime,
-/// so a malformed value would silently break readers downstream.
-fn isValidIsoUtc(s: []const u8) bool {
-    if (s.len != 20) return false;
-    const expect_digit = [_]usize{ 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18 };
-    for (expect_digit) |i| {
-        if (s[i] < '0' or s[i] > '9') return false;
-    }
-    return s[4] == '-' and s[7] == '-' and s[10] == 'T' and s[13] == ':' and s[16] == ':' and s[19] == 'Z';
-}
-
-/// Action under the `stack` subcommand. Each canonical name has one short
-/// alias; the table is also surfaced in `--help` text.
-pub const StackAction = enum {
-    list,
-    show,
-    config,
-    // Mutations (milestone 5).
-    new,
-    add,
-    insert,
-    retry,
-    cancel,
-    supersede,
-    edit_prompt,
-    rerun,
-    item,
-    pause,
-    @"resume",
-    output,
-    threads,
-    thread_show,
-    thread_create,
-    thread_archive,
-    run_routine,
-
-    pub fn fromString(s: []const u8) ?StackAction {
-        const aliases = [_]Alias(StackAction){
-            .{ .name = "list", .value = .list },
-            .{ .name = "ls", .value = .list },
-            .{ .name = "show", .value = .show },
-            .{ .name = "sh", .value = .show },
-            .{ .name = "config", .value = .config },
-            .{ .name = "cfg", .value = .config },
-            .{ .name = "new", .value = .new },
-            .{ .name = "add", .value = .add },
-            .{ .name = "insert", .value = .insert },
-            .{ .name = "ins", .value = .insert },
-            .{ .name = "retry", .value = .retry },
-            .{ .name = "rt", .value = .retry },
-            .{ .name = "cancel", .value = .cancel },
-            .{ .name = "cx", .value = .cancel },
-            .{ .name = "supersede", .value = .supersede },
-            .{ .name = "sup", .value = .supersede },
-            .{ .name = "edit-prompt", .value = .edit_prompt },
-            .{ .name = "edit", .value = .edit_prompt },
-            .{ .name = "ep", .value = .edit_prompt },
-            .{ .name = "rerun", .value = .rerun },
-            .{ .name = "rr", .value = .rerun },
-            .{ .name = "item", .value = .item },
-            .{ .name = "it", .value = .item },
-            .{ .name = "pause", .value = .pause },
-            .{ .name = "p", .value = .pause },
-            .{ .name = "resume", .value = .@"resume" },
-            .{ .name = "r", .value = .@"resume" },
-            .{ .name = "output", .value = .output },
-            .{ .name = "out", .value = .output },
-            .{ .name = "threads", .value = .threads },
-            .{ .name = "run-routine", .value = .run_routine },
-        };
-        return matchAlias(StackAction, s, &aliases);
-    }
-};
-
-/// Flags shared by every API-touching subcommand. Initialized from the
-/// command line; merged with config / env in `http_client.open`.
-pub const ApiFlags = struct {
-    root: []const u8 = paths.DEFAULT_NOTES_ROOT,
-    port_override: ?u16 = null,
-    json: bool = false,
-    verbose: bool = false,
-};
-
-fn parseApiFlag(args: []const []const u8, index: *usize, flags: *ApiFlags) UsageError!bool {
-    const a = args[index.*];
-    if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-j")) {
-        flags.json = true;
-        return true;
-    }
-    if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
-        flags.verbose = true;
-        return true;
-    }
-    if (try flagValue(args, index, "--root", "-r", "--root=")) |v| {
-        flags.root = v;
-        if (flags.root.len == 0) return error.BadFlagValue;
-        return true;
-    }
-    if (try flagValue(args, index, "--port", "-p", "--port=")) |v| {
-        flags.port_override = try parsePort(v);
-        return true;
-    }
-    return false;
-}
-
-pub const StackArgs = struct {
-    action: StackAction,
-    /// Required for `show`/`config`. Empty for `list`.
-    name: []const u8 = "",
-    flags: ApiFlags = .{},
-
-    // Action-specific positional / flag inputs (milestone 5 mutations).
-    /// `add`: kind ("prompt", "compact", …). `insert`: same.
-    kind: []const u8 = "",
-    /// `add` / `insert`: target shorthand `provider[/model]` or `match=any`.
-    target: []const u8 = "",
-    /// `add` / `insert` / `edit-prompt` / `rerun`: prompt body filename.
-    prompt_file: []const u8 = "",
-    /// `edit-prompt` / `rerun`: inline prompt text (`--prompt`).
-    prompt_inline: []const u8 = "",
-    /// `edit-prompt` / `rerun`: read the prompt from stdin (`--stdin`).
-    prompt_stdin: bool = false,
-    /// `item`: print only the prompt (`--prompt`) or rendered prompt (`--rendered`).
-    show_prompt: bool = false,
-    show_rendered: bool = false,
-    /// `add` / `insert`: explicit slug (else derived from prompt file or
-    /// auto-generated).
-    slug: []const u8 = "",
-    /// `insert`: reference item id (positional before the kind).
-    ref: []const u8 = "",
-    /// `retry`/`cancel`/`supersede`: target item id.
-    item_id: []const u8 = "",
-    /// `supersede`: replacement item id.
-    replacement: []const u8 = "",
-    thread_name: []const u8 = "",
-    thread_mode: []const u8 = "",
-    routine_name: []const u8 = "",
-    input_items: [16][]const u8 = std.mem.zeroes([16][]const u8),
-    input_item_count: u8 = 0,
-    input_files: [16][]const u8 = std.mem.zeroes([16][]const u8),
-    input_file_count: u8 = 0,
-    input_commits: [16][]const u8 = std.mem.zeroes([16][]const u8),
-    input_commit_count: u8 = 0,
-    input_mode: []const u8 = "",
-    /// `config`: one or more --set entries (key=value). Up to 8 in v1.
-    set_pairs: [8][]const u8 = std.mem.zeroes([8][]const u8),
-    set_count: u8 = 0,
-};
-
-/// Parse `stack <action> [<name>] [flags...]`. Flags can appear before or
-/// after the positional `<name>` argument; positionals are taken in order.
-pub fn parseStackArgs(args: []const []const u8) UsageError!StackArgs {
-    if (args.len == 0) return error.NoSubcommand;
-    var action: StackAction = undefined;
-    var nested_offset: usize = 1;
-    if (std.mem.eql(u8, args[0], "thread")) {
-        if (args.len < 2) return error.NoSubcommand;
-        if (std.mem.eql(u8, args[1], "show")) action = .thread_show else if (std.mem.eql(u8, args[1], "create")) action = .thread_create else if (std.mem.eql(u8, args[1], "archive")) action = .thread_archive else return error.UnknownSubcommand;
-        nested_offset = 2;
-    } else {
-        action = StackAction.fromString(args[0]) orelse return error.UnknownSubcommand;
-    }
-    var out: StackArgs = .{ .action = action };
-    var positional_seen: usize = 0;
-    var i: usize = nested_offset;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        // Global flags shared by every action.
-        if (try parseApiFlag(args, &i, &out.flags)) continue;
-
-        // Action-specific flags.
-        if (out.action == .add or out.action == .insert) {
-            if (try flagValue(args, &i, "--target", "-t", "--target=")) |v| {
-                out.target = v;
-                continue;
-            }
-            if (try flagValue(args, &i, "--prompt-file", "-f", "--prompt-file=")) |v| {
-                out.prompt_file = v;
-                continue;
-            }
-            if (try flagValue(args, &i, "--slug", null, "--slug=")) |v| {
-                out.slug = v;
-                continue;
-            }
-            if (try flagValue(args, &i, "--thread", null, "--thread=")) |v| {
-                out.thread_name = v;
-                continue;
-            }
-            if (try flagValue(args, &i, "--thread-mode", null, "--thread-mode=")) |v| {
-                out.thread_mode = v;
-                continue;
-            }
-            if (try flagValue(args, &i, "--input-item", null, "--input-item=")) |v| {
-                if (out.input_item_count >= out.input_items.len) return error.BadFlagValue;
-                out.input_items[out.input_item_count] = v;
-                out.input_item_count += 1;
-                continue;
-            }
-        }
-        if (out.action == .run_routine) {
-            if (try flagValue(args, &i, "--input-item", null, "--input-item=")) |v| {
-                if (out.input_item_count >= out.input_items.len) return error.BadFlagValue;
-                out.input_items[out.input_item_count] = v;
-                out.input_item_count += 1;
-                continue;
-            }
-            if (try flagValue(args, &i, "--input-file", null, "--input-file=")) |v| {
-                if (out.input_file_count >= out.input_files.len) return error.BadFlagValue;
-                out.input_files[out.input_file_count] = v;
-                out.input_file_count += 1;
-                continue;
-            }
-            if (try flagValue(args, &i, "--input-commit", null, "--input-commit=")) |v| {
-                if (out.input_commit_count >= out.input_commits.len) return error.BadFlagValue;
-                out.input_commits[out.input_commit_count] = v;
-                out.input_commit_count += 1;
-                continue;
-            }
-            if (try flagValue(args, &i, "--input-mode", null, "--input-mode=")) |v| {
-                out.input_mode = v;
-                continue;
-            }
-        }
-        if (out.action == .edit_prompt or out.action == .rerun) {
-            if (try flagValue(args, &i, "--prompt-file", "-f", "--prompt-file=")) |v| {
-                out.prompt_file = v;
-                continue;
-            }
-            if (try flagValue(args, &i, "--prompt", null, "--prompt=")) |v| {
-                out.prompt_inline = v;
-                continue;
-            }
-            if (std.mem.eql(u8, a, "--stdin")) {
-                out.prompt_stdin = true;
-                continue;
-            }
-            if (out.action == .rerun) {
-                if (try flagValue(args, &i, "--thread-mode", null, "--thread-mode=")) |v| {
-                    out.thread_mode = v;
-                    continue;
-                }
-            }
-        }
-        if (out.action == .item) {
-            if (std.mem.eql(u8, a, "--prompt")) {
-                out.show_prompt = true;
-                continue;
-            }
-            if (std.mem.eql(u8, a, "--rendered")) {
-                out.show_rendered = true;
-                continue;
-            }
-        }
-        if (out.action == .thread_create) {
-            if (try flagValue(args, &i, "--provider", null, "--provider=")) |v| {
-                out.target = v;
-                continue;
-            }
-            if (try flagValue(args, &i, "--model", null, "--model=")) |v| {
-                out.replacement = v;
-                continue;
-            }
-        }
-        if (out.action == .config) {
-            if (try flagValue(args, &i, "--set", "-s", "--set=")) |v| {
-                if (out.set_count >= out.set_pairs.len) return error.BadFlagValue;
-                out.set_pairs[out.set_count] = v;
-                out.set_count += 1;
-                continue;
-            }
-        }
-
-        if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
-
-        // Positionals (per-action layout).
-        switch (out.action) {
-            .list => return error.BadFlagValue,
-            .show, .config, .new, .pause, .@"resume", .threads => {
-                if (positional_seen != 0) return error.BadFlagValue;
-                out.name = a;
-            },
-            .output => {
-                switch (positional_seen) {
-                    0 => out.name = a,
-                    1 => out.item_id = a,
-                    else => return error.BadFlagValue,
-                }
-            },
-            .thread_show, .thread_create, .thread_archive => {
-                switch (positional_seen) {
-                    0 => out.name = a,
-                    1 => out.thread_name = a,
-                    else => return error.BadFlagValue,
-                }
-            },
-            .run_routine => {
-                switch (positional_seen) {
-                    0 => out.name = a,
-                    1 => out.routine_name = a,
-                    else => return error.BadFlagValue,
-                }
-            },
-            .add => {
-                // positionals: <name> <kind>
-                switch (positional_seen) {
-                    0 => out.name = a,
-                    1 => out.kind = a,
-                    else => return error.BadFlagValue,
-                }
-            },
-            .insert => {
-                // positionals: <name> <ref> <kind>
-                switch (positional_seen) {
-                    0 => out.name = a,
-                    1 => out.ref = a,
-                    2 => out.kind = a,
-                    else => return error.BadFlagValue,
-                }
-            },
-            .retry, .cancel, .edit_prompt, .rerun, .item => {
-                // positionals: <name> <id>
-                switch (positional_seen) {
-                    0 => out.name = a,
-                    1 => out.item_id = a,
-                    else => return error.BadFlagValue,
-                }
-            },
-            .supersede => {
-                // positionals: <name> <id> <replacement>
-                switch (positional_seen) {
-                    0 => out.name = a,
-                    1 => out.item_id = a,
-                    2 => out.replacement = a,
-                    else => return error.BadFlagValue,
-                }
-            },
-        }
-        positional_seen += 1;
-    }
-
-    // Validate per-action that we got the required positionals.
-    switch (out.action) {
-        .list => {},
-        .show, .config, .new, .pause, .@"resume", .threads => if (out.name.len == 0) return error.NoSubcommand,
-        .output => if (out.name.len == 0 or out.item_id.len == 0) return error.NoSubcommand,
-        .thread_show, .thread_create, .thread_archive => if (out.name.len == 0 or out.thread_name.len == 0) return error.NoSubcommand,
-        .run_routine => if (out.name.len == 0 or out.routine_name.len == 0) return error.NoSubcommand,
-        .add => if (out.name.len == 0 or out.kind.len == 0) return error.NoSubcommand,
-        .insert => if (out.name.len == 0 or out.ref.len == 0 or out.kind.len == 0) return error.NoSubcommand,
-        .retry, .cancel, .edit_prompt, .rerun, .item => if (out.name.len == 0 or out.item_id.len == 0) return error.NoSubcommand,
-        .supersede => if (out.name.len == 0 or out.item_id.len == 0 or out.replacement.len == 0) return error.NoSubcommand,
-    }
-    return out;
-}
-
-/// `auth` subcommand actions (milestone 8). The canonical shape is:
-///
-///   stako auth status                  # GET /providers, summary view
-///   stako auth <provider>              # GET /providers/<name>, single view
-///   stako auth signout <provider>      # not implemented in v1 — see below
-///
-/// Short aliases: `stako a st`, `stako a <provider>`, `stako a out <p>`.
-///
-/// `signout` is recognized by the parser but the runner emits a stable
-/// "not supported" message: stako doesn't own subscription tokens in v1
-/// (see `todos/research_provider_sign_in.md`), so it has nothing to sign
-/// out. API-key callers should unset the relevant env var themselves.
-pub const AuthAction = enum {
-    status,
-    provider,
-    signout,
-
-    pub fn fromString(s: []const u8) ?AuthAction {
-        const aliases = [_]Alias(AuthAction){
-            .{ .name = "status", .value = .status },
-            .{ .name = "st", .value = .status },
-            .{ .name = "signout", .value = .signout },
-            .{ .name = "out", .value = .signout },
-        };
-        return matchAlias(AuthAction, s, &aliases);
-    }
-};
-
-pub const RoutineAction = enum {
-    list,
-    show,
-
-    pub fn fromString(s: []const u8) ?RoutineAction {
-        const aliases = [_]Alias(RoutineAction){
-            .{ .name = "list", .value = .list },
-            .{ .name = "ls", .value = .list },
-            .{ .name = "show", .value = .show },
-            .{ .name = "sh", .value = .show },
-        };
-        return matchAlias(RoutineAction, s, &aliases);
-    }
-};
-
-pub const RoutineArgs = struct {
-    action: RoutineAction,
-    name: []const u8 = "",
-    flags: ApiFlags = .{},
-};
-
-pub fn parseRoutineArgs(args: []const []const u8) UsageError!RoutineArgs {
-    if (args.len == 0) return error.NoSubcommand;
-    const action = RoutineAction.fromString(args[0]) orelse return error.UnknownSubcommand;
-    var out: RoutineArgs = .{ .action = action };
-    var i: usize = 1;
-    var positional_seen: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (try parseApiFlag(args, &i, &out.flags)) continue;
-        if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
-        switch (out.action) {
-            .list => return error.BadFlagValue,
-            .show => {
-                if (positional_seen != 0) return error.BadFlagValue;
-                out.name = a;
-            },
-        }
-        positional_seen += 1;
-    }
-    switch (out.action) {
-        .list => {},
-        .show => if (out.name.len == 0) return error.NoSubcommand,
-    }
-    return out;
-}
-
-pub const AddArgs = struct {
-    routine_name: []const u8 = "",
-    stack_name: []const u8 = "",
-    flags: ApiFlags = .{},
-    input_items: [16][]const u8 = std.mem.zeroes([16][]const u8),
-    input_item_count: u8 = 0,
-    input_files: [16][]const u8 = std.mem.zeroes([16][]const u8),
-    input_file_count: u8 = 0,
-    input_commits: [16][]const u8 = std.mem.zeroes([16][]const u8),
-    input_commit_count: u8 = 0,
-    input_mode: []const u8 = "",
-};
-
-/// Parse top-level `stako add <routine> <stack>` and flag forms:
-/// `stako add -r <routine> -s <stack>`.
-pub fn parseAddArgs(args: []const []const u8) UsageError!AddArgs {
-    var out: AddArgs = .{};
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        if (std.mem.eql(u8, a, "--json") or std.mem.eql(u8, a, "-j")) {
-            out.flags.json = true;
-            continue;
-        }
-        if (std.mem.eql(u8, a, "--verbose") or std.mem.eql(u8, a, "-v")) {
-            out.flags.verbose = true;
-            continue;
-        }
-        if (try flagValue(args, &i, "--root", null, "--root=")) |v| {
-            out.flags.root = v;
-            if (out.flags.root.len == 0) return error.BadFlagValue;
-            continue;
-        }
-        if (try flagValue(args, &i, "--port", "-p", "--port=")) |v| {
-            out.flags.port_override = try parsePort(v);
-            continue;
-        }
-        if (try flagValue(args, &i, "--routine", "-r", "--routine=")) |v| {
-            out.routine_name = v;
-            if (out.routine_name.len == 0) return error.BadFlagValue;
-            continue;
-        }
-        if (try flagValue(args, &i, "--stack", "-s", "--stack=")) |v| {
-            out.stack_name = v;
-            if (out.stack_name.len == 0) return error.BadFlagValue;
-            continue;
-        }
-        if (try flagValue(args, &i, "--input-item", null, "--input-item=")) |v| {
-            if (out.input_item_count >= out.input_items.len) return error.BadFlagValue;
-            out.input_items[out.input_item_count] = v;
-            out.input_item_count += 1;
-            continue;
-        }
-        if (try flagValue(args, &i, "--input-file", null, "--input-file=")) |v| {
-            if (out.input_file_count >= out.input_files.len) return error.BadFlagValue;
-            out.input_files[out.input_file_count] = v;
-            out.input_file_count += 1;
-            continue;
-        }
-        if (try flagValue(args, &i, "--input-commit", null, "--input-commit=")) |v| {
-            if (out.input_commit_count >= out.input_commits.len) return error.BadFlagValue;
-            out.input_commits[out.input_commit_count] = v;
-            out.input_commit_count += 1;
-            continue;
-        }
-        if (try flagValue(args, &i, "--input-mode", null, "--input-mode=")) |v| {
-            out.input_mode = v;
-            continue;
-        }
-
-        if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
-        if (out.routine_name.len == 0) {
-            out.routine_name = a;
-        } else if (out.stack_name.len == 0) {
-            out.stack_name = a;
-        } else {
-            return error.BadFlagValue;
-        }
-    }
-
-    if (out.routine_name.len == 0 or out.stack_name.len == 0) return error.NoSubcommand;
-    return out;
-}
-
-pub const AuthArgs = struct {
-    action: AuthAction,
-    /// Filled for `provider` and `signout` actions.
-    provider_name: []const u8 = "",
-    flags: ApiFlags = .{},
-};
-
-/// Parse `auth [status|<provider>|signout <provider>] [flags...]`.
-pub fn parseAuthArgs(args: []const []const u8) UsageError!AuthArgs {
-    if (args.len == 0) {
-        // Bare `stako auth` defaults to status.
-        return .{ .action = .status };
-    }
-    var out: AuthArgs = .{ .action = .status };
-    // First positional: either an action keyword or a provider name.
-    var i: usize = 0;
-    var positional_seen: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const a = args[i];
-        // Shared API flags.
-        if (try parseApiFlag(args, &i, &out.flags)) continue;
-        if (std.mem.startsWith(u8, a, "-")) return error.BadFlagValue;
-
-        // Positionals.
-        if (positional_seen == 0) {
-            if (AuthAction.fromString(a)) |act| {
-                out.action = act;
-            } else {
-                // Treated as a provider name shortcut: `stako auth claude`.
-                out.action = .provider;
-                out.provider_name = a;
-            }
-        } else if (positional_seen == 1) {
-            // Only valid for `signout`.
-            if (out.action != .signout) return error.BadFlagValue;
-            out.provider_name = a;
-        } else {
-            return error.BadFlagValue;
-        }
-        positional_seen += 1;
-    }
-
-    // Validate per-action.
-    switch (out.action) {
-        .status => {},
-        .provider => if (out.provider_name.len == 0) return error.NoSubcommand,
-        .signout => if (out.provider_name.len == 0) return error.NoSubcommand,
-    }
-    return out;
-}
-
-/// Top-level dispatch. `argv` excludes argv[0]. `stdout`/`stderr` are
-/// std.Io.Writer-compatible; in tests we pass an `ArrayList(u8)` writer.
 pub fn dispatch(
     allocator: std.mem.Allocator,
-    argv: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    if (argv.len == 0) {
-        try printUsage(stderr);
+    args: []const []const u8,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+) Error!u8 {
+    if (args.len == 0) {
+        try usage(stderr);
         return 2;
     }
 
-    const sub = Subcommand.fromString(argv[0]) orelse {
-        try stderr.print("stako: unknown subcommand `{s}`\n", .{argv[0]});
-        try printUsage(stderr);
-        return 2;
-    };
+    const cmd = args[0];
+    if (std.mem.eql(u8, cmd, "new")) return try cmdNew(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "add")) return try cmdAdd(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "link")) return try cmdLink(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "start")) return try cmdStart(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "attach")) return try cmdAttach(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "status")) return try cmdStatus(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "output")) return try cmdOutput(allocator, args[1..], stdout, stderr);
 
-    const rest = argv[1..];
-    switch (sub) {
-        .init => return try runInit(allocator, rest, stdout, stderr),
-        .daemon => return try runDaemon(allocator, rest, stdout, stderr),
-        .stack => return try runStack(allocator, rest, stdout, stderr),
-        .routine => return try runRoutine(allocator, rest, stdout, stderr),
-        .auth => return try runAuth(allocator, rest, stdout, stderr),
-        .new => return try runStackShortcut(allocator, .new, rest, stdout, stderr),
-        .start => return try runStackShortcut(allocator, .@"resume", rest, stdout, stderr),
-        .add => return try runAddShortcut(allocator, rest, stdout, stderr),
+    try stderr.print("unknown command: {s}\n", .{cmd});
+    try usage(stderr);
+    return 2;
+}
+
+fn cmdLink(allocator: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    if (args.len < 2) {
+        try usage(stderr);
+        return 2;
     }
-}
-
-fn runRoutine(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    const parsed = parseRoutineArgs(args) catch |e| {
-        try stderr.print("stako routine: {s}\n", .{@errorName(e)});
-        try printRoutineUsage(stderr);
-        return 2;
-    };
-    return cli_routine.run(allocator, parsed, stdout, stderr);
-}
-
-fn runAuth(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    const parsed = parseAuthArgs(args) catch |e| {
-        try stderr.print("stako auth: {s}\n", .{@errorName(e)});
-        try printAuthUsage(stderr);
-        return 2;
-    };
-    return @import("cli_auth.zig").run(allocator, parsed, stdout, stderr);
-}
-
-fn runDaemon(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    const parsed = parseDaemonArgs(args) catch |e| {
-        try stderr.print("stako daemon: {s}\n", .{@errorName(e)});
-        try printDaemonUsage(stderr);
-        return 2;
-    };
-
-    switch (parsed.action) {
-        .start => {
-            const root = try paths.resolveNotesRoot(allocator, parsed.root);
-            defer allocator.free(root);
-            var d = daemon_mod.start(allocator, .{
-                .notes_root = root,
-                .port_override = parsed.port_override,
-                .enable_runtime = true,
-                .dispatch = harness_dispatch.dispatch(),
-                .enable_provider_preflight = true,
-            }) catch |e| {
-                try stderr.print("stako daemon start: failed: {s}\n", .{@errorName(e)});
-                return 1;
-            };
-            defer d.deinit();
-            // Mutations + the runtime supervisor come up here, now that
-            // `d` has a stable address (workers hold a pointer back to
-            // the heap-allocated supervisor and the queue audit_writer).
-            d.startWorker() catch |e| {
-                try stderr.print("stako daemon start: failed to start mutation worker: {s}\n", .{@errorName(e)});
-                return 1;
-            };
-            try stdout.print("stako daemon: listening on 127.0.0.1:{d}\n", .{d.bound_port});
-            try stdout.flush();
-            try stderr.flush();
-            // Foreground accept loop until SIGTERM.
-            g_daemon_for_signals = &d;
-            defer g_daemon_for_signals = null;
-            installSignalHandlers();
-            // Best-effort: serve until interrupted.
-            daemon_mod.serveUntilShutdown(&d) catch |e| {
-                try stderr.print("stako daemon: serve loop ended: {s}\n", .{@errorName(e)});
-            };
-            // Clean up PID file on graceful exit.
-            if (d.pid_written) {
-                daemon_mod.removePidFile(allocator, d.notes_root_abs) catch {};
-            }
-            return 0;
-        },
-        .stop => {
-            const root = try paths.resolveNotesRoot(allocator, parsed.root);
-            defer allocator.free(root);
-            const result = daemon_mod.stop(allocator, root, 5) catch |e| {
-                try stderr.print("stako daemon stop: failed: {s}\n", .{@errorName(e)});
-                return 1;
-            };
-            switch (result) {
-                .not_running => try stdout.writeAll("stako daemon: not running\n"),
-                .stopped => try stdout.writeAll("stako daemon: stopped\n"),
-                .timeout => {
-                    try stdout.writeAll("stako daemon: process did not exit within grace; pid file left for inspection\n");
-                    return 1;
-                },
-            }
-            return 0;
-        },
-        .status => {
-            const root = try paths.resolveNotesRoot(allocator, parsed.root);
-            defer allocator.free(root);
-            const info = daemon_mod.readPidFile(allocator, root) catch |e| {
-                try stderr.print("stako daemon status: failed: {s}\n", .{@errorName(e)});
-                return 1;
-            };
-            if (info) |pi| {
-                if (daemon_mod.isProcessAlive(pi.pid)) {
-                    const uptime = std.time.timestamp() - pi.started_at;
-                    try stdout.print("stako daemon: running (pid {d}, port {d}, uptime {d}s)\n", .{ pi.pid, pi.port, uptime });
-                } else {
-                    try stdout.print("stako daemon: stale pid file (pid {d} not alive)\n", .{pi.pid});
-                }
-            } else {
-                try stdout.writeAll("stako daemon: stopped\n");
-            }
-            return 0;
-        },
-    }
-}
-
-fn runStack(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    const parsed = parseStackArgs(args) catch |e| {
-        try stderr.print("stako stack: {s}\n", .{@errorName(e)});
-        try printStackUsage(stderr);
-        return 2;
-    };
-
-    return cli_stack.run(allocator, parsed, stdout, stderr);
-}
-
-fn runStackShortcut(
-    allocator: std.mem.Allocator,
-    action: StackAction,
-    args: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    var parsed: StackArgs = .{ .action = action };
-    var i: usize = 0;
-    var saw_name = false;
+    const source_path = args[0];
+    const target_path = args[1];
+    var action: prompt_mod.Action = .none;
+    var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (try parseApiFlag(args, &i, &parsed.flags)) continue;
-        if (std.mem.startsWith(u8, a, "-")) {
-            try stderr.print("stako {s}: BadFlagValue\n", .{if (action == .new) "new" else "start"});
-            try printShortcutUsage(stderr, action);
-            return 2;
+        if (std.mem.eql(u8, a, "--pre-cmd")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            action = try prompt_mod.Action.parse(args[i]);
+        } else if (std.mem.startsWith(u8, a, "--pre-cmd=")) {
+            action = try prompt_mod.Action.parse(a["--pre-cmd=".len..]);
+        } else {
+            return error.Usage;
         }
-        if (saw_name) {
-            try stderr.print("stako {s}: BadFlagValue\n", .{if (action == .new) "new" else "start"});
-            try printShortcutUsage(stderr, action);
-            return 2;
-        }
-        parsed.name = a;
-        saw_name = true;
     }
-    if (parsed.name.len == 0) {
-        try stderr.print("stako {s}: NoSubcommand\n", .{if (action == .new) "new" else "start"});
-        try printShortcutUsage(stderr, action);
-        return 2;
-    }
-    return cli_stack.run(allocator, parsed, stdout, stderr);
-}
 
-fn runAddShortcut(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    const parsed = parseAddArgs(args) catch |e| {
-        try stderr.print("stako add: {s}\n", .{@errorName(e)});
-        try printAddUsage(stderr);
-        return 2;
-    };
-    const stack_args: StackArgs = .{
-        .action = .run_routine,
-        .name = parsed.stack_name,
-        .flags = parsed.flags,
-        .routine_name = parsed.routine_name,
-        .input_items = parsed.input_items,
-        .input_item_count = parsed.input_item_count,
-        .input_files = parsed.input_files,
-        .input_file_count = parsed.input_file_count,
-        .input_commits = parsed.input_commits,
-        .input_commit_count = parsed.input_commit_count,
-        .input_mode = parsed.input_mode,
-    };
-    return cli_stack.run(allocator, stack_args, stdout, stderr);
-}
+    const source_src = try readPathAlloc(allocator, source_path);
+    defer allocator.free(source_src);
+    var source = try prompt_mod.parsePromptFile(allocator, source_src);
+    defer source.deinit();
 
-var g_daemon_for_signals: ?*daemon_mod.Daemon = null;
+    const target_src = try readPathAlloc(allocator, target_path);
+    defer allocator.free(target_src);
+    var target = try prompt_mod.parsePromptFile(allocator, target_src);
+    defer target.deinit();
 
-fn installSignalHandlers() void {
-    if (@import("builtin").os.tag == .windows) return;
-    var sa: std.posix.Sigaction = .{
-        .handler = .{ .handler = handleTermSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
-    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
-}
-
-fn handleTermSignal(_: c_int) callconv(.c) void {
-    if (g_daemon_for_signals) |d| d.requestShutdown();
-}
-
-fn runInit(
-    allocator: std.mem.Allocator,
-    args: []const []const u8,
-    stdout: anytype,
-    stderr: anytype,
-) !u8 {
-    const parsed = parseInitArgs(args) catch |e| {
-        try stderr.print("stako init: {s}\n", .{@errorName(e)});
-        try printInitUsage(stderr);
-        return 2;
-    };
-
-    const root = try paths.resolveNotesRoot(allocator, parsed.root);
-    defer allocator.free(root);
-
-    var report = init_mod.run(allocator, .{
-        .root = root,
-        .quiet = parsed.quiet,
-        .now_override = parsed.now_override,
-        .rng_seed_override = parsed.rng_seed_override,
-    }) catch |e| {
-        try stderr.print("stako init: failed: {s}\n", .{@errorName(e)});
-        return 1;
-    };
-    defer report.deinit();
-
-    try printReport(stdout, &report, parsed.quiet);
+    const linked = try renderLinkedPromptAlloc(allocator, &target, source.id, action);
+    defer allocator.free(linked);
+    try std.fs.cwd().writeFile(.{ .sub_path = target_path, .data = linked });
+    try stdout.print("linked {s} -> {s} action={s}\n", .{ source.id, target.id, actionName(action) });
     return 0;
 }
 
-fn printUsage(w: anytype) !void {
-    try w.writeAll(
-        \\stako — local orchestrator for AI coding harnesses
-        \\
-        \\Usage:
-        \\  stako <subcommand> [options]
-        \\
-        \\Subcommands:
-        \\  init                        Bootstrap a notes-root layout
-        \\  daemon, d  start|stop|st    Start/stop/inspect the local daemon
-        \\  new       <stack>           Create a stack
-        \\  add       <routine> <stack> Append a routine to a stack
-        \\  start     <stack>           Resume a stack when the daemon is running
-        \\  stack,  s  list|show|cfg    Read stacks via the daemon
-        \\  routine    list|show        Read routines via the daemon
-        \\  auth,   a  status|<prov>    Report provider availability + auth state
-        \\
-        \\Run `stako <subcommand>` with no further args for per-subcommand help.
-        \\
-    );
-}
-
-fn printShortcutUsage(w: anytype, action: StackAction) !void {
-    if (action == .new) {
-        try w.writeAll(
-            \\Usage: stako new <stack> [flags...]
-            \\
-            \\Alias for `stako stack new <stack>`.
-            \\
-            \\Flags:
-            \\  --root,    -r <path>  Notes root for local config/token discovery.
-            \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
-            \\  --json,    -j         Pass the daemon JSON through unchanged.
-            \\  --verbose, -v         Show request URL on errors.
-            \\
-        );
-    } else {
-        try w.writeAll(
-            \\Usage: stako start <stack> [flags...]
-            \\
-            \\Resumes/unpauses the stack. The daemon must already be running.
-            \\
-            \\Flags:
-            \\  --root,    -r <path>  Notes root for local config/token discovery.
-            \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
-            \\  --json,    -j         Pass the daemon JSON through unchanged.
-            \\  --verbose, -v         Show request URL on errors.
-            \\
-        );
+fn cmdNew(allocator: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    if (args.len == 0) {
+        try usage(stderr);
+        return 2;
     }
-}
-
-fn printAddUsage(w: anytype) !void {
-    try w.writeAll(
-        \\Usage:
-        \\  stako add <routine> <stack> [flags...]
-        \\  stako add --routine <routine> --stack <stack> [flags...]
-        \\  stako add -r <routine> -s <stack> [flags...]
-        \\
-        \\Appends a routine to a stack through the daemon.
-        \\
-        \\Flags:
-        \\  --routine, -r <name>  Routine name.
-        \\  --stack,   -s <name>  Stack name.
-        \\  --root <path>         Notes root for local config/token discovery.
-        \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
-        \\  --json,    -j         Pass the daemon JSON through unchanged.
-        \\  --verbose, -v         Show request URL on errors.
-        \\  --input-item <id>     Register an item input for routine prompts.
-        \\  --input-file <path>   Register a file input for routine prompts.
-        \\  --input-commit <sha>  Register a commit input for routine prompts.
-        \\  --input-mode <mode>   Input placement mode.
-        \\
-    );
-}
-
-fn printAuthUsage(w: anytype) !void {
-    try w.writeAll(
-        \\Usage: stako auth|a [status|st|<provider>|signout|out <provider>] [flags...]
-        \\
-        \\Actions:
-        \\  status, st                 Show all providers (default).
-        \\  <provider>                 Show one provider (anthropic|openai|google
-        \\                             or harness aliases claude|codex|gemini).
-        \\  signout, out <provider>    Always fails in v1 — stako doesn't own
-        \\                             provider subscription tokens. Local-only;
-        \\                             never contacts the daemon. The --root,
-        \\                             --port, and --verbose flags are accepted
-        \\                             but ignored. --json emits a JSON envelope.
-        \\
-        \\Flags (common to every API subcommand):
-        \\  --json,    -j         Pass the daemon JSON through unchanged
-        \\                        (signout emits a `{"error":"not_supported"}`
-        \\                        envelope on stdout instead).
-        \\  --root,    -r <path>  Notes root for local config/token discovery.
-        \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
-        \\  --verbose, -v         Show request URL on errors.
-        \\
-    );
-}
-
-fn printDaemonUsage(w: anytype) !void {
-    try w.writeAll(
-        \\Usage: stako daemon|d <start|stop|status|st> [--root, -r <path>] [--port, -p <n>]
-        \\
-        \\Actions:
-        \\  start         Bind loopback, serve HTTP read endpoints.
-        \\  stop          Send SIGTERM to the running daemon.
-        \\  status, st    Report running/stopped, pid, port, uptime.
-        \\
-    );
-}
-
-fn printInitUsage(w: anytype) !void {
-    try w.writeAll(
-        \\Usage: stako init [--root, -r <path>] [--quiet, -q]
-        \\
-        \\  --root, -r <path>   Path to the notes root (default: ~/stako).
-        \\  --quiet, -q         Suppress per-line output; print a summary only.
-        \\
-    );
-}
-
-fn printStackUsage(w: anytype) !void {
-    try w.writeAll(
-        \\Usage: stako stack|s <action> [<name>] [flags...]
-        \\
-        \\Actions:
-        \\  list,   ls            List known stacks.
-        \\  show,   sh   <name>   Show a stack's config + items.
-        \\  config, cfg  <name>   Show a stack's config.
-        \\  new          <name>   Create a stack.
-        \\  run-routine <stack> <routine>
-        \\                        Append a routine to a stack.
-        \\  edit-prompt, ep <stack> <id> [--prompt-file f | --prompt t | --stdin]
-        \\                        Overwrite a queued item's prompt (else opens $EDITOR).
-        \\  rerun, rr <stack> <id> [--prompt-file f | --prompt t | --stdin]
-        \\                        Fork a finished item with an edited prompt.
-        \\  item, it <stack> <id> [--prompt | --rendered]
-        \\                        Show an item, or its prompt / rendered prompt.
-        \\  pause|resume <name>   Pause or resume a stack.
-        \\
-        \\Flags (common to every API subcommand):
-        \\  --json,    -j         Pass the daemon JSON through unchanged.
-        \\  --root,    -r <path>  Notes root for local config/token discovery.
-        \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
-        \\  --verbose, -v         Show request URL on errors.
-        \\
-    );
-}
-
-fn printRoutineUsage(w: anytype) !void {
-    try w.writeAll(
-        \\Usage: stako routine|rtn <list|show> [<name>] [flags...]
-        \\
-        \\Actions:
-        \\  list, ls            List routines.
-        \\  show, sh <name>     Show a routine.
-        \\
-        \\Flags (common to every API subcommand):
-        \\  --json,    -j         Pass the daemon JSON through unchanged.
-        \\  --root,    -r <path>  Notes root for local config/token discovery.
-        \\  --port,    -p <n>     Override the daemon port (also: STAKO_PORT).
-        \\  --verbose, -v         Show request URL on errors.
-        \\
-    );
-}
-
-fn printReport(w: anytype, r: *const init_mod.Report, quiet: bool) !void {
-    if (r.inside_existing_git) {
-        try w.writeAll("warning: notes root is inside an existing git repository;\n");
-        try w.writeAll("         the stako layout will join that repo's history.\n");
+    var opts: Options = .{};
+    const name = args[0];
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--root")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            opts.root = args[i];
+        } else if (std.mem.startsWith(u8, a, "--root=")) {
+            opts.root = a["--root=".len..];
+        } else if (std.mem.eql(u8, a, "--command")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            opts.command = args[i];
+        } else if (std.mem.startsWith(u8, a, "--command=")) {
+            opts.command = a["--command=".len..];
+        } else {
+            return error.Usage;
+        }
     }
-    if (r.git_initialized) {
-        try w.writeAll("initialized git repository (.git)\n");
+    const root = try paths.resolveNotesRoot(allocator, opts.root);
+    defer allocator.free(root);
+    try std.fs.cwd().makePath(root);
+    var stack = try store.Stack.create(allocator, root, name, opts.command);
+    defer stack.deinit();
+    try stdout.print("created stack {s} command={s}\n", .{ name, opts.command });
+    return 0;
+}
+
+fn cmdAdd(allocator: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    if (args.len < 2) {
+        try usage(stderr);
+        return 2;
     }
-    if (r.created.items.len == 0) {
-        try w.writeAll("stako init: already initialized — no changes.\n");
-        return;
+    var opts: Options = .{};
+    const name = args[0];
+    var files: std.ArrayList([]const u8) = .empty;
+    defer files.deinit(allocator);
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--root")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            opts.root = args[i];
+        } else if (std.mem.startsWith(u8, a, "--root=")) {
+            opts.root = a["--root=".len..];
+        } else {
+            try files.append(allocator, a);
+        }
     }
-    if (quiet) {
-        try w.print(
-            "stako init: {d} created, {d} already present.\n",
-            .{ r.created.items.len, r.already_present.items.len },
-        );
-        return;
+    if (files.items.len == 0) return error.Usage;
+    const root = try paths.resolveNotesRoot(allocator, opts.root);
+    defer allocator.free(root);
+    var stack = try store.Stack.open(allocator, root, name);
+    defer stack.deinit();
+    const reports = try stack.addFiles(files.items);
+    defer stack.freeReports(reports);
+    for (reports) |r| {
+        try stdout.print("{s}: {s} ({s})\n", .{ r.id, r.status.name(), dispositionName(r.disposition) });
     }
-    try w.writeAll("created:\n");
-    for (r.created.items) |p| try w.print("  {s}\n", .{p});
-    if (r.already_present.items.len > 0) {
-        try w.writeAll("already present:\n");
-        for (r.already_present.items) |p| try w.print("  {s}\n", .{p});
+    return 0;
+}
+
+fn cmdStart(allocator: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    const parsed = try parseStackOnly(args, stderr);
+    if (parsed.name.len == 0) return 2;
+    const root = try paths.resolveNotesRoot(allocator, parsed.opts.root);
+    defer allocator.free(root);
+    var stack = try store.Stack.open(allocator, root, parsed.name);
+    defer stack.deinit();
+    var adapter = zellij.CommandAdapter{ .allocator = allocator };
+    var runtime = zellij.Runtime(zellij.CommandAdapter){ .allocator = allocator, .adapter = &adapter };
+    try runtime.runUntilIdle(&stack, sleepOneSecond);
+    try stdout.print("stack {s} idle\n", .{stack.name});
+    return 0;
+}
+
+fn cmdAttach(allocator: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    _ = stdout;
+    const parsed = try parseStackOnly(args, stderr);
+    if (parsed.name.len == 0) return 2;
+    const argv = [_][]const u8{ "zellij", "attach", parsed.name };
+    var child = std.process.Child.init(&argv, allocator);
+    try child.spawn();
+    const term = try child.wait();
+    return switch (term) {
+        .Exited => |code| code,
+        else => 1,
+    };
+}
+
+fn cmdStatus(allocator: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    const parsed = try parseStackOnly(args, stderr);
+    if (parsed.name.len == 0) return 2;
+    const root = try paths.resolveNotesRoot(allocator, parsed.opts.root);
+    defer allocator.free(root);
+    var stack = try store.Stack.open(allocator, root, parsed.name);
+    defer stack.deinit();
+    try stdout.print("stack {s} command={s}\n", .{ stack.name, stack.command });
+    const threads = try stack.listThreads();
+    defer stack.freeThreads(threads);
+    for (threads) |thread| {
+        try stdout.print("thread {s} status={s} pane={s}\n", .{ thread.name, thread.status.name(), thread.pane_id });
     }
-}
-
-// ---------- unit tests ----------
-
-test "parseInitArgs: defaults" {
-    const a = try parseInitArgs(&.{});
-    try std.testing.expectEqualStrings(paths.DEFAULT_NOTES_ROOT, a.root);
-    try std.testing.expect(!a.quiet);
-}
-
-test "parseInitArgs: --root path" {
-    const a = try parseInitArgs(&.{ "--root", "/tmp/x" });
-    try std.testing.expectEqualStrings("/tmp/x", a.root);
-}
-
-test "parseInitArgs: --root=path" {
-    const a = try parseInitArgs(&.{"--root=/tmp/y"});
-    try std.testing.expectEqualStrings("/tmp/y", a.root);
-}
-
-test "parseInitArgs: -r short flag" {
-    const a = try parseInitArgs(&.{ "-r", "/tmp/z" });
-    try std.testing.expectEqualStrings("/tmp/z", a.root);
-}
-
-test "parseInitArgs: flags" {
-    const a = try parseInitArgs(&.{"-q"});
-    try std.testing.expect(a.quiet);
-}
-
-test "parseInitArgs: unknown flag rejected" {
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--nope"}));
-}
-
-test "parseInitArgs: --root missing value rejected" {
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--root"}));
-}
-
-test "parseInitArgs: --now= valid ISO UTC accepted" {
-    const a = try parseInitArgs(&.{"--now=2026-05-10T14:00:00Z"});
-    try std.testing.expectEqualStrings("2026-05-10T14:00:00Z", a.now_override.?);
-}
-
-test "parseInitArgs: --now= malformed rejected" {
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now=not a date"}));
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now="}));
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now=2026-05-10"}));
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now=2026-05-10T14:00:00"}));
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--now=2026/05/10T14:00:00Z"}));
-}
-
-test "parseInitArgs: --seed= malformed rejected" {
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"--seed=notanumber"}));
-}
-
-test "parseStackArgs: edit-prompt aliases + sources" {
-    inline for (.{ "edit-prompt", "edit", "ep" }) |name| {
-        const a = try parseStackArgs(&.{ name, "demo", "0001", "--prompt-file", "p.md" });
-        try std.testing.expectEqual(StackAction.edit_prompt, a.action);
-        try std.testing.expectEqualStrings("demo", a.name);
-        try std.testing.expectEqualStrings("0001", a.item_id);
-        try std.testing.expectEqualStrings("p.md", a.prompt_file);
+    const runs = try stack.listRuns();
+    defer stack.freeRuns(runs);
+    for (runs) |run| {
+        try stdout.print("prompt {s} thread={s} status={s}\n", .{ run.id, run.thread, run.status.name() });
     }
-    const inline_arg = try parseStackArgs(&.{ "ep", "demo", "0001", "--prompt", "new body" });
-    try std.testing.expectEqualStrings("new body", inline_arg.prompt_inline);
-    const stdin_arg = try parseStackArgs(&.{ "ep", "demo", "0001", "--stdin" });
-    try std.testing.expect(stdin_arg.prompt_stdin);
-    // Missing item id is a usage error.
-    try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{ "ep", "demo" }));
+    return 0;
 }
 
-test "parseStackArgs: rerun carries thread-mode" {
-    const a = try parseStackArgs(&.{ "rr", "demo", "0003", "--thread-mode", "resume" });
-    try std.testing.expectEqual(StackAction.rerun, a.action);
-    try std.testing.expectEqualStrings("0003", a.item_id);
-    try std.testing.expectEqualStrings("resume", a.thread_mode);
+fn cmdOutput(allocator: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    if (args.len < 2) {
+        try usage(stderr);
+        return 2;
+    }
+    var opts: Options = .{};
+    const name = args[0];
+    const id = args[1];
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--root")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            opts.root = args[i];
+        } else if (std.mem.startsWith(u8, a, "--root=")) {
+            opts.root = a["--root=".len..];
+        } else {
+            return error.Usage;
+        }
+    }
+    const root = try paths.resolveNotesRoot(allocator, opts.root);
+    defer allocator.free(root);
+    var stack = try store.Stack.open(allocator, root, name);
+    defer stack.deinit();
+    var run = try stack.readRun(id);
+    defer run.deinit();
+    try stdout.print("{s}", .{run.output});
+    return 0;
 }
 
-test "parseStackArgs: item show flags" {
-    const p = try parseStackArgs(&.{ "item", "demo", "0001", "--prompt" });
-    try std.testing.expectEqual(StackAction.item, p.action);
-    try std.testing.expect(p.show_prompt and !p.show_rendered);
-    const r = try parseStackArgs(&.{ "it", "demo", "0001", "--rendered" });
-    try std.testing.expect(r.show_rendered and !r.show_prompt);
+const ParsedStack = struct {
+    name: []const u8 = "",
+    opts: Options = .{},
+};
+
+fn parseStackOnly(args: []const []const u8, stderr: *std.Io.Writer) Error!ParsedStack {
+    if (args.len == 0) {
+        try usage(stderr);
+        return .{};
+    }
+    var out: ParsedStack = .{ .name = args[0] };
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (std.mem.eql(u8, a, "--root")) {
+            i += 1;
+            if (i >= args.len) return error.Usage;
+            out.opts.root = args[i];
+        } else if (std.mem.startsWith(u8, a, "--root=")) {
+            out.opts.root = a["--root=".len..];
+        } else {
+            return error.Usage;
+        }
+    }
+    return out;
 }
 
-test "parseInitArgs: --seed= hex and decimal both accepted" {
-    const a = try parseInitArgs(&.{"--seed=0xCAFE"});
-    try std.testing.expectEqual(@as(?u64, 0xCAFE), a.rng_seed_override);
-    const b = try parseInitArgs(&.{"--seed=42"});
-    try std.testing.expectEqual(@as(?u64, 42), b.rng_seed_override);
+fn dispositionName(d: store.EnqueueDisposition) []const u8 {
+    return switch (d) {
+        .inserted => "inserted",
+        .updated => "updated",
+        .existing => "existing",
+    };
 }
 
-test "parseInitArgs: -r requires value" {
-    try std.testing.expectError(error.BadFlagValue, parseInitArgs(&.{"-r"}));
+fn actionName(action: prompt_mod.Action) []const u8 {
+    return switch (action) {
+        .none => "none",
+        .new => "new",
+        .clear => "clear",
+        .compact => "compact",
+    };
 }
 
-test "parseInitArgs: flag ordering does not matter" {
-    const a = try parseInitArgs(&.{ "--root", "/tmp/x", "-q" });
-    try std.testing.expect(a.quiet);
-    try std.testing.expectEqualStrings("/tmp/x", a.root);
-    const b = try parseInitArgs(&.{ "-q", "--root", "/tmp/x" });
-    try std.testing.expect(b.quiet);
-    try std.testing.expectEqualStrings("/tmp/x", b.root);
+fn readPathAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    // Caller owns returned memory.
+    var file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const stat = try file.stat();
+    const buf = try allocator.alloc(u8, stat.size);
+    errdefer allocator.free(buf);
+    _ = try file.readAll(buf);
+    return buf;
 }
 
-test "Subcommand.fromString canonical names" {
-    try std.testing.expect(Subcommand.fromString("init") != null);
-    try std.testing.expect(Subcommand.fromString("daemon") != null);
-    try std.testing.expect(Subcommand.fromString("stack") != null);
-    try std.testing.expect(Subcommand.fromString("new") != null);
-    try std.testing.expect(Subcommand.fromString("add") != null);
-    try std.testing.expect(Subcommand.fromString("start") != null);
-    try std.testing.expect(Subcommand.fromString("nope") == null);
+fn renderLinkedPromptAlloc(allocator: std.mem.Allocator, target: *const prompt_mod.PromptFile, source_id: []const u8, action: prompt_mod.Action) ![]u8 {
+    // Caller owns returned memory.
+    const after = try withUniqueAlloc(allocator, target.after, source_id);
+    defer freeStringArray(allocator, after);
+    const inputs = try withUniqueAlloc(allocator, target.inputs, source_id);
+    defer freeStringArray(allocator, inputs);
+
+    var after_buf: std.ArrayList(u8) = .empty;
+    defer after_buf.deinit(allocator);
+    try writeStringArray(allocator, &after_buf, after);
+    var inputs_buf: std.ArrayList(u8) = .empty;
+    defer inputs_buf.deinit(allocator);
+    try writeStringArray(allocator, &inputs_buf, inputs);
+
+    return std.fmt.allocPrint(allocator,
+        \\+++
+        \\id = "{s}"
+        \\thread = "{s}"
+        \\action = "{s}"
+        \\after = {s}
+        \\inputs = {s}
+        \\+++
+        \\
+        \\{s}
+        \\
+    , .{ target.id, target.thread, actionName(action), after_buf.items, inputs_buf.items, target.body });
 }
 
-test "Subcommand.fromString: short aliases d, s" {
-    try std.testing.expectEqual(Subcommand.daemon, Subcommand.fromString("d").?);
-    try std.testing.expectEqual(Subcommand.stack, Subcommand.fromString("s").?);
+fn withUniqueAlloc(allocator: std.mem.Allocator, values: []const []const u8, extra: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |value| allocator.free(value);
+        out.deinit(allocator);
+    }
+    var found = false;
+    for (values) |value| {
+        if (std.mem.eql(u8, value, extra)) found = true;
+        try out.append(allocator, try allocator.dupe(u8, value));
+    }
+    if (!found) try out.append(allocator, try allocator.dupe(u8, extra));
+    return out.toOwnedSlice(allocator);
 }
 
-test "DaemonAction.fromString: st alias for status" {
-    try std.testing.expectEqual(DaemonAction.status, DaemonAction.fromString("st").?);
-    try std.testing.expectEqual(DaemonAction.start, DaemonAction.fromString("start").?);
-    try std.testing.expectEqual(DaemonAction.stop, DaemonAction.fromString("stop").?);
+fn freeStringArray(allocator: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| allocator.free(value);
+    allocator.free(values);
 }
 
-test "StackAction.fromString: every canonical name has a short alias" {
-    try std.testing.expectEqual(StackAction.list, StackAction.fromString("list").?);
-    try std.testing.expectEqual(StackAction.list, StackAction.fromString("ls").?);
-    try std.testing.expectEqual(StackAction.show, StackAction.fromString("show").?);
-    try std.testing.expectEqual(StackAction.show, StackAction.fromString("sh").?);
-    try std.testing.expectEqual(StackAction.config, StackAction.fromString("config").?);
-    try std.testing.expectEqual(StackAction.config, StackAction.fromString("cfg").?);
+fn writeStringArray(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), values: []const []const u8) !void {
+    try buf.append(allocator, '[');
+    for (values, 0..) |value, i| {
+        if (i != 0) try buf.appendSlice(allocator, ", ");
+        try buf.append(allocator, '"');
+        try buf.appendSlice(allocator, value);
+        try buf.append(allocator, '"');
+    }
+    try buf.append(allocator, ']');
 }
 
-test "parseDaemonArgs: actions" {
-    const a = try parseDaemonArgs(&.{"start"});
-    try std.testing.expectEqual(DaemonAction.start, a.action);
-    const b = try parseDaemonArgs(&.{ "stop", "--root=/tmp/x" });
-    try std.testing.expectEqual(DaemonAction.stop, b.action);
-    try std.testing.expectEqualStrings("/tmp/x", b.root);
-    const c = try parseDaemonArgs(&.{ "start", "--port", "8080" });
-    try std.testing.expectEqual(@as(?u16, 8080), c.port_override);
-    try std.testing.expectError(error.UnknownSubcommand, parseDaemonArgs(&.{"foo"}));
+fn usage(w: *std.Io.Writer) !void {
+    try w.print(
+        \\usage:
+        \\  stako new <stack> [--command codex] [--root PATH]
+        \\  stako add <stack> <thread-or-prompt.md...> [--root PATH]
+        \\  stako link <source-prompt.md> <target-prompt.md> [--pre-cmd compact]
+        \\  stako start <stack> [--root PATH]
+        \\  stako attach <stack>
+        \\  stako status <stack> [--root PATH]
+        \\  stako output <stack> <prompt-id> [--root PATH]
+        \\
+    , .{});
 }
 
-test "parseDaemonArgs: -r, -p short flags" {
-    const a = try parseDaemonArgs(&.{ "start", "-r", "/tmp/y", "-p", "9000" });
-    try std.testing.expectEqualStrings("/tmp/y", a.root);
-    try std.testing.expectEqual(@as(?u16, 9000), a.port_override);
+fn sleepOneSecond() void {
+    std.Thread.sleep(std.time.ns_per_s);
 }
 
-test "parseStackArgs: list with --json" {
-    const a = try parseStackArgs(&.{ "list", "--json" });
-    try std.testing.expectEqual(StackAction.list, a.action);
-    try std.testing.expectEqualStrings("", a.name);
-    try std.testing.expect(a.flags.json);
-}
+test "link rewrites target prompt with after input and pre command" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const review_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/review.md", .{&tmp.sub_path});
+    defer a.free(review_path);
+    const impl_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/impl.md", .{&tmp.sub_path});
+    defer a.free(impl_path);
 
-test "parseStackArgs: ls -j short forms" {
-    const a = try parseStackArgs(&.{ "ls", "-j" });
-    try std.testing.expectEqual(StackAction.list, a.action);
-    try std.testing.expect(a.flags.json);
-}
+    try tmp.dir.writeFile(.{ .sub_path = "review.md", .data = 
+        \\+++
+        \\id = "003-review"
+        \\thread = "reviewer"
+        \\+++
+        \\
+        \\Review.
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "impl.md", .data = 
+        \\+++
+        \\id = "004-implement"
+        \\thread = "builder"
+        \\+++
+        \\
+        \\Address review.
+    });
 
-test "parseStackArgs: show requires name" {
-    try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{"show"}));
-    try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{"sh"}));
-}
+    var stdout_buf: [1024]u8 = undefined;
+    var stderr_buf: [1024]u8 = undefined;
+    var stdout: std.Io.Writer = .fixed(&stdout_buf);
+    var stderr: std.Io.Writer = .fixed(&stderr_buf);
+    const code = try dispatch(a, &.{ "link", review_path, impl_path, "--pre-cmd", "compact" }, &stdout, &stderr);
+    try std.testing.expectEqual(@as(u8, 0), code);
 
-test "parseStackArgs: show with name and flags" {
-    const a = try parseStackArgs(&.{ "show", "demo", "--port", "1234", "-v" });
-    try std.testing.expectEqual(StackAction.show, a.action);
-    try std.testing.expectEqualStrings("demo", a.name);
-    try std.testing.expectEqual(@as(?u16, 1234), a.flags.port_override);
-    try std.testing.expect(a.flags.verbose);
-}
-
-test "parseStackArgs: cfg short alias for config with --root" {
-    const a = try parseStackArgs(&.{ "cfg", "demo", "--root=/tmp/n" });
-    try std.testing.expectEqual(StackAction.config, a.action);
-    try std.testing.expectEqualStrings("demo", a.name);
-    try std.testing.expectEqualStrings("/tmp/n", a.flags.root);
-}
-
-test "parseStackArgs: output threads and routine commands" {
-    const out = try parseStackArgs(&.{ "output", "demo", "0001" });
-    try std.testing.expectEqual(StackAction.output, out.action);
-    try std.testing.expectEqualStrings("demo", out.name);
-    try std.testing.expectEqualStrings("0001", out.item_id);
-
-    const threads = try parseStackArgs(&.{ "threads", "demo" });
-    try std.testing.expectEqual(StackAction.threads, threads.action);
-    try std.testing.expectEqualStrings("demo", threads.name);
-
-    const show = try parseStackArgs(&.{ "thread", "show", "demo", "admin" });
-    try std.testing.expectEqual(StackAction.thread_show, show.action);
-    try std.testing.expectEqualStrings("admin", show.thread_name);
-
-    const create = try parseStackArgs(&.{ "thread", "create", "demo", "admin", "--provider", "openai", "--model", "gpt" });
-    try std.testing.expectEqual(StackAction.thread_create, create.action);
-    try std.testing.expectEqualStrings("openai", create.target);
-    try std.testing.expectEqualStrings("gpt", create.replacement);
-
-    const routine = try parseStackArgs(&.{ "run-routine", "demo", "review" });
-    try std.testing.expectEqual(StackAction.run_routine, routine.action);
-    try std.testing.expectEqualStrings("review", routine.routine_name);
-
-    const routine_inputs = try parseStackArgs(&.{ "run-routine", "demo", "review", "--input-file", "src/rpc.zig", "--input-item", "0007", "--input-commit", "abc123", "--input-mode", "prepend" });
-    try std.testing.expectEqual(StackAction.run_routine, routine_inputs.action);
-    try std.testing.expectEqual(@as(u8, 1), routine_inputs.input_file_count);
-    try std.testing.expectEqualStrings("src/rpc.zig", routine_inputs.input_files[0]);
-    try std.testing.expectEqual(@as(u8, 1), routine_inputs.input_item_count);
-    try std.testing.expectEqualStrings("0007", routine_inputs.input_items[0]);
-    try std.testing.expectEqual(@as(u8, 1), routine_inputs.input_commit_count);
-    try std.testing.expectEqualStrings("abc123", routine_inputs.input_commits[0]);
-    try std.testing.expectEqualStrings("prepend", routine_inputs.input_mode);
-}
-
-test "parseStackArgs: add threaded input item" {
-    const a = try parseStackArgs(&.{ "add", "demo", "prompt", "--thread", "admin", "--thread-mode", "resume", "--input-item", "0001" });
-    try std.testing.expectEqual(StackAction.add, a.action);
-    try std.testing.expectEqualStrings("admin", a.thread_name);
-    try std.testing.expectEqualStrings("resume", a.thread_mode);
-    try std.testing.expectEqual(@as(u8, 1), a.input_item_count);
-    try std.testing.expectEqualStrings("0001", a.input_items[0]);
-}
-
-test "parseRoutineArgs: list and show" {
-    const list = try parseRoutineArgs(&.{"list"});
-    try std.testing.expectEqual(RoutineAction.list, list.action);
-    const show = try parseRoutineArgs(&.{ "show", "review", "--json" });
-    try std.testing.expectEqual(RoutineAction.show, show.action);
-    try std.testing.expectEqualStrings("review", show.name);
-    try std.testing.expect(show.flags.json);
-}
-
-test "parseAddArgs: positional and flag forms" {
-    const positional = try parseAddArgs(&.{ "planning", "demo" });
-    try std.testing.expectEqualStrings("planning", positional.routine_name);
-    try std.testing.expectEqualStrings("demo", positional.stack_name);
-
-    const flagged = try parseAddArgs(&.{ "-r", "review", "-s", "default", "--root", "/tmp/stako", "-p", "4242" });
-    try std.testing.expectEqualStrings("review", flagged.routine_name);
-    try std.testing.expectEqualStrings("default", flagged.stack_name);
-    try std.testing.expectEqualStrings("/tmp/stako", flagged.flags.root);
-    try std.testing.expectEqual(@as(?u16, 4242), flagged.flags.port_override);
-}
-
-test "parseAddArgs: collects routine input flags" {
-    const a = try parseAddArgs(&.{ "planning", "demo", "--input-file", "src/main.zig", "--input-item", "0001", "--input-commit", "abc123", "--input-mode", "prepend" });
-    try std.testing.expectEqual(@as(u8, 1), a.input_file_count);
-    try std.testing.expectEqualStrings("src/main.zig", a.input_files[0]);
-    try std.testing.expectEqual(@as(u8, 1), a.input_item_count);
-    try std.testing.expectEqualStrings("0001", a.input_items[0]);
-    try std.testing.expectEqual(@as(u8, 1), a.input_commit_count);
-    try std.testing.expectEqualStrings("abc123", a.input_commits[0]);
-    try std.testing.expectEqualStrings("prepend", a.input_mode);
-}
-
-test "parseAddArgs: requires routine and stack" {
-    try std.testing.expectError(error.NoSubcommand, parseAddArgs(&.{}));
-    try std.testing.expectError(error.NoSubcommand, parseAddArgs(&.{"planning"}));
-}
-
-test "parseStackArgs: rejects unknown flag" {
-    try std.testing.expectError(error.BadFlagValue, parseStackArgs(&.{ "list", "--nope" }));
-}
-
-test "parseStackArgs: rejects extra positional" {
-    try std.testing.expectError(error.BadFlagValue, parseStackArgs(&.{ "show", "a", "b" }));
-}
-
-test "parseStackArgs: rejects unknown action" {
-    try std.testing.expectError(error.UnknownSubcommand, parseStackArgs(&.{"bogus"}));
-}
-
-// ---------- mutation subcommand parser tests (milestone 5) ----------
-
-test "parseStackArgs: new <name>" {
-    const a = try parseStackArgs(&.{ "new", "demo" });
-    try std.testing.expectEqual(StackAction.new, a.action);
-    try std.testing.expectEqualStrings("demo", a.name);
-}
-
-test "parseStackArgs: add with kind, target shorthand, prompt file" {
-    const a = try parseStackArgs(&.{ "add", "demo", "prompt", "-t", "anthropic/claude-opus-4-7", "-f", "p.md" });
-    try std.testing.expectEqual(StackAction.add, a.action);
-    try std.testing.expectEqualStrings("demo", a.name);
-    try std.testing.expectEqualStrings("prompt", a.kind);
-    try std.testing.expectEqualStrings("anthropic/claude-opus-4-7", a.target);
-    try std.testing.expectEqualStrings("p.md", a.prompt_file);
-}
-
-test "parseStackArgs: insert <name> <ref> <kind>" {
-    const a = try parseStackArgs(&.{ "ins", "demo", "0002", "prompt" });
-    try std.testing.expectEqual(StackAction.insert, a.action);
-    try std.testing.expectEqualStrings("demo", a.name);
-    try std.testing.expectEqualStrings("0002", a.ref);
-    try std.testing.expectEqualStrings("prompt", a.kind);
-}
-
-test "parseStackArgs: retry/cancel short aliases" {
-    const r = try parseStackArgs(&.{ "rt", "demo", "0001" });
-    try std.testing.expectEqual(StackAction.retry, r.action);
-    try std.testing.expectEqualStrings("0001", r.item_id);
-    const c = try parseStackArgs(&.{ "cx", "demo", "0001" });
-    try std.testing.expectEqual(StackAction.cancel, c.action);
-}
-
-test "parseStackArgs: supersede has replacement positional" {
-    const a = try parseStackArgs(&.{ "sup", "demo", "0001", "0007" });
-    try std.testing.expectEqual(StackAction.supersede, a.action);
-    try std.testing.expectEqualStrings("0001", a.item_id);
-    try std.testing.expectEqualStrings("0007", a.replacement);
-}
-
-test "parseStackArgs: pause / resume short aliases" {
-    const p = try parseStackArgs(&.{ "p", "demo" });
-    try std.testing.expectEqual(StackAction.pause, p.action);
-    const r = try parseStackArgs(&.{ "r", "demo" });
-    try std.testing.expectEqual(StackAction.@"resume", r.action);
-}
-
-test "parseStackArgs: config --set key=value collects entries" {
-    const a = try parseStackArgs(&.{ "cfg", "demo", "-s", "paused=true", "--set=continuity=chain" });
-    try std.testing.expectEqual(StackAction.config, a.action);
-    try std.testing.expectEqual(@as(u8, 2), a.set_count);
-    try std.testing.expectEqualStrings("paused=true", a.set_pairs[0]);
-    try std.testing.expectEqualStrings("continuity=chain", a.set_pairs[1]);
-}
-
-test "parseStackArgs: add missing kind rejected" {
-    try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{ "add", "demo" }));
-}
-
-test "parseStackArgs: supersede missing replacement rejected" {
-    try std.testing.expectError(error.NoSubcommand, parseStackArgs(&.{ "sup", "demo", "0001" }));
-}
-
-// ---------- auth parser tests (milestone 8) ----------
-
-test "parseAuthArgs: bare auth defaults to status" {
-    const a = try parseAuthArgs(&.{});
-    try std.testing.expectEqual(AuthAction.status, a.action);
-    try std.testing.expectEqualStrings("", a.provider_name);
-}
-
-test "parseAuthArgs: explicit status and short alias" {
-    const a = try parseAuthArgs(&.{"status"});
-    try std.testing.expectEqual(AuthAction.status, a.action);
-    const b = try parseAuthArgs(&.{"st"});
-    try std.testing.expectEqual(AuthAction.status, b.action);
-}
-
-test "parseAuthArgs: provider shortcut" {
-    const a = try parseAuthArgs(&.{"anthropic"});
-    try std.testing.expectEqual(AuthAction.provider, a.action);
-    try std.testing.expectEqualStrings("anthropic", a.provider_name);
-}
-
-test "parseAuthArgs: signout + provider" {
-    const a = try parseAuthArgs(&.{ "signout", "openai" });
-    try std.testing.expectEqual(AuthAction.signout, a.action);
-    try std.testing.expectEqualStrings("openai", a.provider_name);
-    const b = try parseAuthArgs(&.{ "out", "claude" });
-    try std.testing.expectEqual(AuthAction.signout, b.action);
-    try std.testing.expectEqualStrings("claude", b.provider_name);
-}
-
-test "parseAuthArgs: signout without provider rejected" {
-    try std.testing.expectError(error.NoSubcommand, parseAuthArgs(&.{"signout"}));
-}
-
-test "parseAuthArgs: --json flag picked up" {
-    const a = try parseAuthArgs(&.{ "status", "--json" });
-    try std.testing.expect(a.flags.json);
-    const b = try parseAuthArgs(&.{ "-j", "claude" });
-    try std.testing.expect(b.flags.json);
-    try std.testing.expectEqual(AuthAction.provider, b.action);
-}
-
-test "Subcommand: auth and short alias a" {
-    try std.testing.expectEqual(Subcommand.auth, Subcommand.fromString("auth").?);
-    try std.testing.expectEqual(Subcommand.auth, Subcommand.fromString("a").?);
+    const linked_src = try readPathAlloc(a, impl_path);
+    defer a.free(linked_src);
+    var linked = try prompt_mod.parsePromptFile(a, linked_src);
+    defer linked.deinit();
+    try std.testing.expectEqual(prompt_mod.Action.compact, linked.action);
+    try std.testing.expectEqual(@as(usize, 1), linked.after.len);
+    try std.testing.expectEqualStrings("003-review", linked.after[0]);
+    try std.testing.expectEqual(@as(usize, 1), linked.inputs.len);
+    try std.testing.expectEqualStrings("003-review", linked.inputs[0]);
+    try std.testing.expectEqualStrings("Address review.", linked.body);
 }
