@@ -1,9 +1,10 @@
-//! Minimal TOML reader/writer tailored to stako's meta.toml schema.
+//! Minimal TOML reader/writer tailored to stako's plan.toml schema.
 //!
 //! This is deliberately a small, hand-rolled implementation rather than a
 //! vendored full TOML parser. The supported subset:
 //!
-//!   - Top-level key/value pairs and `[table]` headers (no `[[arrays of tables]]`).
+//!   - Top-level key/value pairs, `[table]` headers, and `[[array-of-tables]]`
+//!     headers (each `[[name]]` opens a new element of the `name` array).
 //!   - String, bool, integer, RFC3339-datetime values, and arrays of strings.
 //!   - Comments (`# ...`) and blank lines (ignored on read; not preserved).
 //!   - One key per line, no inline tables, no dotted keys.
@@ -12,7 +13,7 @@
 //! checks RFC3339 shape. The writer prints them back verbatim so a value read
 //! from a file and rewritten produces the same bytes.
 //!
-//! Why a hand-rolled parser: meta.toml is fully under our control, and the
+//! Why a hand-rolled parser: plan.toml is fully under our control, and the
 //! schema is fixed. A full TOML library would add an external dependency for
 //! features we never use. Round-trip stability is easier to guarantee when we
 //! own the key emission order.
@@ -37,11 +38,21 @@ pub const Value = union(ValueKind) {
 };
 
 /// One parsed key/value entry, in source order. `table` is "" for top-level
-/// keys and the bare table name (e.g. "target") otherwise.
+/// keys and the bare table name (e.g. "target") otherwise. `array_index` is
+/// set when the entry belongs to an `[[array-of-tables]]` element and names
+/// which element (0-based, in source order); it is null for top-level keys and
+/// single `[table]` entries.
 pub const Entry = struct {
     table: []const u8,
     key: []const u8,
     value: Value,
+    array_index: ?usize = null,
+};
+
+/// One `[[array-of-tables]]` name and how many elements were parsed for it.
+pub const ArrayTable = struct {
+    name: []const u8,
+    count: usize,
 };
 
 pub const Document = struct {
@@ -50,18 +61,24 @@ pub const Document = struct {
     /// Every `[table]` header observed, in source order. Includes empty
     /// tables (which have no entries). Top-level "" is not recorded.
     tables: std.ArrayList([]const u8),
+    /// Every `[[array-of-tables]]` name and its element count, in first-seen
+    /// order. Used to iterate `[[thread]]`/`[[prompt]]` blocks.
+    array_tables: std.ArrayList(ArrayTable),
     /// Owned backing storage for all strings/arrays inside `entries`.
     arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Document) void {
         self.entries.deinit(self.allocator);
         self.tables.deinit(self.allocator);
+        self.array_tables.deinit(self.allocator);
         self.arena.deinit();
     }
 
-    /// Find the first entry matching (table, key). Returns null if absent.
+    /// Find the first top-level or single-`[table]` entry matching (table, key).
+    /// Array-of-tables entries are skipped; use `findInArray` for those.
     pub fn find(self: *const Document, table: []const u8, key: []const u8) ?*const Entry {
         for (self.entries.items) |*e| {
+            if (e.array_index != null) continue;
             if (std.mem.eql(u8, e.table, table) and std.mem.eql(u8, e.key, key)) return e;
         }
         return null;
@@ -72,6 +89,25 @@ pub const Document = struct {
             if (std.mem.eql(u8, t, table)) return true;
         }
         return false;
+    }
+
+    /// Number of `[[name]]` elements parsed, or 0 if `name` is not an array of
+    /// tables.
+    pub fn arrayCount(self: *const Document, name: []const u8) usize {
+        for (self.array_tables.items) |at| {
+            if (std.mem.eql(u8, at.name, name)) return at.count;
+        }
+        return 0;
+    }
+
+    /// Find `key` within element `index` of the `[[name]]` array of tables.
+    pub fn findInArray(self: *const Document, name: []const u8, index: usize, key: []const u8) ?*const Entry {
+        for (self.entries.items) |*e| {
+            const ai = e.array_index orelse continue;
+            if (ai != index) continue;
+            if (std.mem.eql(u8, e.table, name) and std.mem.eql(u8, e.key, key)) return e;
+        }
+        return null;
     }
 };
 
@@ -95,12 +131,15 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!Docume
         .allocator = allocator,
         .entries = .empty,
         .tables = .empty,
+        .array_tables = .empty,
         .arena = std.heap.ArenaAllocator.init(allocator),
     };
     errdefer doc.deinit();
     const arena_alloc = doc.arena.allocator();
 
     var current_table: []const u8 = "";
+    // null while top-level or under a single `[table]`; set under `[[name]]`.
+    var current_array_index: ?usize = null;
     var i: usize = 0;
     while (i < source.len) {
         // skip leading whitespace
@@ -123,15 +162,22 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!Docume
         }
 
         if (source[i] == '[') {
-            i += 1;
+            const is_array = i + 1 < source.len and source[i + 1] == '[';
+            i += if (is_array) 2 else 1;
             const name_start = i;
             while (i < source.len and source[i] != ']' and source[i] != '\n') : (i += 1) {}
             if (i >= source.len or source[i] != ']') return error.UnclosedTableHeader;
+            if (is_array and (i + 1 >= source.len or source[i + 1] != ']')) return error.UnclosedTableHeader;
             const name = std.mem.trim(u8, source[name_start..i], " \t");
             if (name.len == 0) return error.EmptyTableName;
             current_table = try arena_alloc.dupe(u8, name);
-            try doc.tables.append(allocator, current_table);
-            i += 1; // consume ']'
+            i += if (is_array) 2 else 1; // consume `]` or `]]`
+            if (is_array) {
+                current_array_index = try bumpArrayTable(&doc, current_table);
+            } else {
+                current_array_index = null;
+                try doc.tables.append(allocator, current_table);
+            }
             // skip trailing whitespace + optional comment, then newline
             while (i < source.len and (source[i] == ' ' or source[i] == '\t')) : (i += 1) {}
             if (i < source.len and source[i] == '#') {
@@ -176,10 +222,24 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) ParseError!Docume
             .table = current_table,
             .key = try arena_alloc.dupe(u8, key),
             .value = value,
+            .array_index = current_array_index,
         });
     }
 
     return doc;
+}
+
+/// Record one more `[[name]]` element and return its 0-based index.
+fn bumpArrayTable(doc: *Document, name: []const u8) ParseError!usize {
+    for (doc.array_tables.items) |*at| {
+        if (std.mem.eql(u8, at.name, name)) {
+            const idx = at.count;
+            at.count += 1;
+            return idx;
+        }
+    }
+    try doc.array_tables.append(doc.allocator, .{ .name = name, .count = 1 });
+    return 0;
 }
 
 fn parseValue(arena: std.mem.Allocator, source: []const u8, i_ptr: *usize) ParseError!Value {
@@ -369,6 +429,58 @@ test "parse table and array" {
     const arr = doc.entries.items[1].value.string_array;
     try std.testing.expectEqual(@as(usize, 2), arr.len);
     try std.testing.expectEqualStrings("a", arr[0]);
+}
+
+test "parse array of tables" {
+    const src =
+        \\name = "refactor-loop"
+        \\
+        \\[[thread]]
+        \\name = "impl"
+        \\command = "codex"
+        \\
+        \\[[thread]]
+        \\name = "reviewer"
+        \\command = "claude"
+        \\
+        \\[[prompt]]
+        \\name = "impl-1"
+        \\thread = "impl"
+        \\blocked_by = []
+        \\
+        \\[[prompt]]
+        \\name = "review-1"
+        \\thread = "reviewer"
+        \\blocked_by = ["impl-1"]
+        \\
+    ;
+    var doc = try parse(std.testing.allocator, src);
+    defer doc.deinit();
+
+    try std.testing.expectEqualStrings("refactor-loop", doc.find("", "name").?.value.string);
+    try std.testing.expectEqual(@as(usize, 2), doc.arrayCount("thread"));
+    try std.testing.expectEqual(@as(usize, 2), doc.arrayCount("prompt"));
+    try std.testing.expectEqual(@as(usize, 0), doc.arrayCount("missing"));
+
+    try std.testing.expectEqualStrings("impl", doc.findInArray("thread", 0, "name").?.value.string);
+    try std.testing.expectEqualStrings("codex", doc.findInArray("thread", 0, "command").?.value.string);
+    try std.testing.expectEqualStrings("reviewer", doc.findInArray("thread", 1, "name").?.value.string);
+
+    try std.testing.expectEqualStrings("review-1", doc.findInArray("prompt", 1, "name").?.value.string);
+    const blockers = doc.findInArray("prompt", 1, "blocked_by").?.value.string_array;
+    try std.testing.expectEqual(@as(usize, 1), blockers.len);
+    try std.testing.expectEqualStrings("impl-1", blockers[0]);
+
+    // Top-level `find` must not return array-of-tables entries.
+    try std.testing.expect(doc.find("thread", "name") == null);
+}
+
+test "array-of-tables header rejects single-bracket close" {
+    try std.testing.expectError(error.UnclosedTableHeader, parse(std.testing.allocator,
+        \\[[thread]
+        \\name = "impl"
+        \\
+    ));
 }
 
 test "parse datetime" {

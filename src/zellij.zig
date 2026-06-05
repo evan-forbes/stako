@@ -1,5 +1,8 @@
 const std = @import("std");
-const store = @import("store.zig");
+const runtime = @import("runtime.zig");
+const scheduler = @import("scheduler.zig");
+const plan = @import("plan.zig");
+const status = @import("status.zig");
 
 pub const Error = error{
     SessionConflict,
@@ -9,7 +12,7 @@ pub const Error = error{
     CommandFailed,
     Timeout,
     OutOfMemory,
-} || store.Error || std.Thread.SpawnError;
+} || runtime.Error || std.Thread.SpawnError;
 
 pub const Pane = struct {
     tab_id: []const u8,
@@ -58,134 +61,182 @@ pub fn enterArgv(session: []const u8, pane_id: []const u8) [8][]const u8 {
     return .{ "zellij", "--session", session, "action", "send-keys", "--pane-id", pane_id, "Enter" };
 }
 
-pub fn Runtime(comptime Adapter: type) type {
+/// Drives a stack to idle over the `plan.toml` model: it owns the per-thread
+/// pane bindings for the life of the run, delivers ready nodes, and records the
+/// lifecycle in `events.jsonl`. Status is never written — it is computed from
+/// markers and the event log — so this only appends `delivered`/`completed`/
+/// `failed` events and writes the run artifacts.
+pub fn PlanRuntime(comptime Adapter: type) type {
     return struct {
-        allocator: std.mem.Allocator,
+        gpa: std.mem.Allocator,
         adapter: *Adapter,
+        /// thread name -> pane id, both owned.
+        panes: std.StringHashMapUnmanaged([]const u8) = .empty,
+        /// nodes delivered this run and awaiting a terminal marker; keys owned.
+        pending: std.StringHashMapUnmanaged(void) = .empty,
 
         const Self = @This();
 
-        pub fn startStack(self: *Self, stack: *store.Stack) Error!void {
+        pub fn deinit(self: *Self) void {
+            var pit = self.panes.iterator();
+            while (pit.next()) |e| {
+                self.gpa.free(e.key_ptr.*);
+                self.gpa.free(e.value_ptr.*);
+            }
+            self.panes.deinit(self.gpa);
+            var dit = self.pending.keyIterator();
+            while (dit.next()) |k| self.gpa.free(k.*);
+            self.pending.deinit(self.gpa);
+        }
+
+        pub fn startStack(self: *Self, stack: *runtime.Stack) Error!void {
             const exists = try self.adapter.sessionExists(stack.name);
             if (exists and !stack.hasOwnershipMarker()) return error.SessionConflict;
             if (!exists) try self.adapter.createSession(stack.name);
-
-            const runs = try stack.listRuns();
-            defer stack.freeRuns(runs);
-            const threads = try stack.listThreads();
-            defer stack.freeThreads(threads);
-            for (threads) |thread| {
-                if (thread.pane_id.len != 0) {
-                    if (try self.adapter.paneExists(stack.name, thread.pane_id)) continue;
-                    if (hasRunningOnThread(runs, thread.name)) continue;
-                }
-                const command = if (thread.command.len != 0) thread.command else stack.command;
-                const pane = try self.adapter.ensureThreadTab(stack.name, thread.name, command, stack.cwd);
-                defer {
-                    self.allocator.free(pane.tab_id);
-                    self.allocator.free(pane.pane_id);
-                }
-                try stack.setThreadPane(thread.name, pane.tab_id, pane.pane_id);
+            for (stack.plan.threads) |thread| {
+                if (self.panes.contains(thread.name)) continue;
+                const pane = try self.adapter.ensureThreadTab(stack.name, thread.name, thread.command, stack.agentCwd());
+                self.gpa.free(pane.tab_id);
+                errdefer self.gpa.free(pane.pane_id);
+                const key = try self.gpa.dupe(u8, thread.name);
+                errdefer self.gpa.free(key);
+                try self.panes.put(self.gpa, key, pane.pane_id);
             }
         }
 
-        pub fn deliver(self: *Self, stack: *store.Stack, run_id: []const u8) Error!void {
-            var run = try stack.readRun(run_id);
-            defer run.deinit();
-            var thread = try stack.readThread(run.thread);
-            defer thread.deinit();
-            if (thread.pane_id.len == 0) return error.MissingThreadPane;
-            if (run.action != .none) {
-                try self.adapter.paste(stack.name, thread.pane_id, run.action.command());
-                try self.adapter.enter(stack.name, thread.pane_id);
+        pub fn deliver(self: *Self, stack: *runtime.Stack, node: *const plan.Node) Error!void {
+            const pane = self.panes.get(node.thread) orelse return error.MissingThreadPane;
+            const rendered = try stack.renderNodeAlloc(self.gpa, node);
+            defer self.gpa.free(rendered);
+            try stack.writeRendered(node.name, rendered);
+            if (node.action != .none) {
+                try self.adapter.paste(stack.name, pane, node.action.command());
+                try self.adapter.enter(stack.name, pane);
             }
-            try self.adapter.paste(stack.name, thread.pane_id, run.rendered);
-            try self.adapter.enter(stack.name, thread.pane_id);
-            try stack.setRunStatus(run.id, .running, "");
+            try self.adapter.paste(stack.name, pane, rendered);
+            try self.adapter.enter(stack.name, pane);
+            try self.logDelivered(stack, node);
+            try self.trackPending(node.name);
         }
 
-        pub fn pollOnce(self: *Self, stack: *store.Stack, run_id: []const u8) Error!bool {
-            var run = try stack.readRun(run_id);
-            defer run.deinit();
-            if (stack.completionExists(run.id)) {
-                if (stack.resultExists(run.id)) {
-                    try stack.setRunStatus(run.id, .completed, "");
-                } else {
-                    try stack.setRunStatus(run.id, .failed, "missing_result_file");
-                }
-                return true;
-            }
-            var thread = try stack.readThread(run.thread);
-            defer thread.deinit();
-            if (thread.pane_id.len == 0) return error.MissingThreadPane;
-            if (!try self.adapter.paneExists(stack.name, thread.pane_id)) return error.MissingThreadPane;
-            const dump = try self.adapter.dumpPane(stack.name, thread.pane_id);
-            defer self.allocator.free(dump);
-            try stack.storeOutput(run.id, dump);
-            return false;
-        }
-
-        pub fn runUntilIdle(self: *Self, stack: *store.Stack, sleep: SleepFn) Error!void {
+        pub fn runUntilIdle(self: *Self, stack: *runtime.Stack, sleep: SleepFn) Error!void {
             try self.startStack(stack);
+            try stack.appendEvent(.{ .event = .runner_started });
+            try self.seedPending(stack);
             while (true) {
-                const running_left = try self.pollRunning(stack);
+                const running_left = try self.pollPending(stack);
 
-                const runs = try stack.listRuns();
-                defer stack.freeRuns(runs);
-                const ready = try @import("scheduler.zig").readyRunsAlloc(self.allocator, runs);
-                defer {
-                    for (ready) |id| self.allocator.free(id);
-                    self.allocator.free(ready);
-                }
-                for (ready) |id| {
-                    self.deliver(stack, id) catch |e| switch (e) {
-                        error.MissingThreadPane, error.CommandFailed => {
-                            try stack.setRunStatus(id, .failed, deliverFailureReason(e));
+                const statuses = try stack.statusesAlloc(self.gpa);
+                defer self.gpa.free(statuses);
+                const deliverable = try scheduler.deliverableAlloc(self.gpa, &stack.plan, statuses);
+                defer self.gpa.free(deliverable);
+                for (deliverable) |idx| {
+                    self.deliver(stack, &stack.plan.nodes[idx]) catch |e| switch (e) {
+                        error.MissingThreadPane, error.CommandFailed, error.SpawnFailed => {
+                            try self.failNode(stack, stack.plan.nodes[idx].name, deliverFailureReason(e));
                             continue;
                         },
                         else => return e,
                     };
                 }
-                try self.blockFailedDependents(stack);
-                if (running_left == 0 and ready.len == 0) return;
+                if (running_left == 0 and deliverable.len == 0) {
+                    try stack.appendEvent(.{ .event = .runner_stopped });
+                    return;
+                }
                 sleep();
             }
         }
 
-        fn pollRunning(self: *Self, stack: *store.Stack) Error!usize {
-            const runs = try stack.listRuns();
-            defer stack.freeRuns(runs);
+        /// Poll each pending node: a `done` marker closes it (completed when a
+        /// result exists, failed otherwise); otherwise dump its pane for debug
+        /// output. Returns how many are still running.
+        fn pollPending(self: *Self, stack: *runtime.Stack) Error!usize {
+            var keys: std.ArrayList([]const u8) = .empty;
+            defer keys.deinit(self.gpa);
+            var it = self.pending.keyIterator();
+            while (it.next()) |k| try keys.append(self.gpa, k.*);
+
             var running_left: usize = 0;
-            for (runs) |run| {
-                if (run.status != .running) continue;
-                const completed = self.pollOnce(stack, run.id) catch |e| switch (e) {
-                    error.MissingThreadPane, error.CommandFailed => {
-                        try stack.setRunStatus(run.id, .failed, pollFailureReason(e));
-                        continue;
-                    },
-                    else => return e,
+            for (keys.items) |node_name| {
+                const node = stack.plan.nodeByName(node_name) orelse {
+                    self.removePending(node_name);
+                    continue;
                 };
-                if (!completed) running_left += 1;
+                if (stack.completionExists(node_name)) {
+                    try self.logTerminal(stack, node_name);
+                    self.removePending(node_name);
+                    continue;
+                }
+                const pane = self.panes.get(node.thread) orelse {
+                    try self.failNode(stack, node_name, "missing_thread_pane");
+                    self.removePending(node_name);
+                    continue;
+                };
+                const dump = self.adapter.dumpPane(stack.name, pane) catch {
+                    try self.failNode(stack, node_name, "zellij_dump_failed");
+                    self.removePending(node_name);
+                    continue;
+                };
+                defer self.gpa.free(dump);
+                try stack.storeOutput(node_name, dump);
+                running_left += 1;
             }
             return running_left;
         }
 
-        fn blockFailedDependents(self: *Self, stack: *store.Stack) Error!void {
-            const runs = try stack.listRuns();
-            defer stack.freeRuns(runs);
-            for (runs) |run| {
-                if (run.status != .queued) continue;
-                if (try failedDepReason(self.allocator, runs, run.after, "dependency_failed")) |reason| {
-                    defer self.allocator.free(reason);
-                    try stack.setRunStatus(run.id, .blocked, reason);
-                    continue;
-                }
-                if (try failedDepReason(self.allocator, runs, run.inputs, "input_failed")) |reason| {
-                    defer self.allocator.free(reason);
-                    try stack.setRunStatus(run.id, .blocked, reason);
-                    continue;
-                }
+        fn seedPending(self: *Self, stack: *runtime.Stack) Error!void {
+            const statuses = try stack.statusesAlloc(self.gpa);
+            defer self.gpa.free(statuses);
+            for (stack.plan.nodes, 0..) |node, i| {
+                if (statuses[i] == .running) try self.trackPending(node.name);
             }
+        }
+
+        fn logDelivered(self: *Self, stack: *runtime.Stack, node: *const plan.Node) Error!void {
+            const rendered_rel = try std.fmt.allocPrint(self.gpa, "runs/{s}/rendered.md", .{node.name});
+            defer self.gpa.free(rendered_rel);
+            var inputs: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (inputs.items) |s| self.gpa.free(s);
+                inputs.deinit(self.gpa);
+            }
+            for (node.blocked_by) |b| {
+                try inputs.append(self.gpa, try std.fmt.allocPrint(self.gpa, "runs/{s}/result.md", .{b}));
+            }
+            try stack.appendEvent(.{
+                .event = .delivered,
+                .node = node.name,
+                .thread = node.thread,
+                .action = if (node.action == .none) "" else @tagName(node.action),
+                .rendered = rendered_rel,
+                .inputs = inputs.items,
+            });
+        }
+
+        fn logTerminal(self: *Self, stack: *runtime.Stack, node_name: []const u8) Error!void {
+            if (stack.resultExists(node_name)) {
+                const result_rel = try std.fmt.allocPrint(self.gpa, "runs/{s}/result.md", .{node_name});
+                defer self.gpa.free(result_rel);
+                try stack.appendEvent(.{ .event = .completed, .node = node_name, .result = result_rel });
+            } else {
+                try self.failNode(stack, node_name, "missing_result_file");
+            }
+        }
+
+        fn failNode(self: *Self, stack: *runtime.Stack, node_name: []const u8, reason: []const u8) Error!void {
+            _ = self;
+            try stack.appendEvent(.{ .event = .failed, .node = node_name, .reason = reason });
+        }
+
+        fn trackPending(self: *Self, node_name: []const u8) Error!void {
+            if (self.pending.contains(node_name)) return;
+            const key = try self.gpa.dupe(u8, node_name);
+            errdefer self.gpa.free(key);
+            try self.pending.put(self.gpa, key, {});
+        }
+
+        fn removePending(self: *Self, node_name: []const u8) void {
+            if (self.pending.fetchRemove(node_name)) |kv| self.gpa.free(kv.key);
         }
     };
 }
@@ -274,40 +325,13 @@ pub const CommandAdapter = struct {
     }
 };
 
-fn hasRunningOnThread(runs: []const store.PromptRun, thread: []const u8) bool {
-    for (runs) |run| {
-        if (run.status == .running and std.mem.eql(u8, run.thread, thread)) return true;
-    }
-    return false;
-}
-
-fn pollFailureReason(e: Error) []const u8 {
-    return switch (e) {
-        error.MissingThreadPane => "missing_thread_pane",
-        error.CommandFailed => "zellij_dump_failed",
-        else => unreachable,
-    };
-}
-
 fn deliverFailureReason(e: Error) []const u8 {
     return switch (e) {
         error.MissingThreadPane => "missing_thread_pane",
+        error.SpawnFailed => "zellij_spawn_failed",
         error.CommandFailed => "zellij_deliver_failed",
         else => unreachable,
     };
-}
-
-fn failedDepReason(allocator: std.mem.Allocator, runs: []const store.PromptRun, deps: []const []const u8, prefix: []const u8) error{OutOfMemory}!?[]u8 {
-    for (deps) |dep| {
-        for (runs) |run| {
-            if (!std.mem.eql(u8, run.id, dep)) continue;
-            if (run.status == .failed or run.status == .blocked) {
-                return try std.fmt.allocPrint(allocator, "{s}:{s}", .{ prefix, dep });
-            }
-            break;
-        }
-    }
-    return null;
 }
 
 fn findPaneForTabAlloc(allocator: std.mem.Allocator, src: []const u8, tab_id: []const u8, tab_name: []const u8) ![]u8 {
@@ -463,539 +487,210 @@ test "zellij action argv targets the stack session" {
     }
 }
 
-test "runUntilIdle completes a dependency chain with FakeAdapter" {
+fn noSleep() void {}
+
+// ---------- PlanRuntime tests (plan.toml model) ----------
+
+const chain_plan =
+    \\[[thread]]
+    \\name = "impl"
+    \\command = "codex"
+    \\
+    \\[[thread]]
+    \\name = "reviewer"
+    \\command = "claude"
+    \\
+    \\[[prompt]]
+    \\name = "impl-1"
+    \\thread = "impl"
+    \\action = "new"
+    \\body = "Implement the feature."
+    \\
+    \\[[prompt]]
+    \\name = "review-1"
+    \\thread = "reviewer"
+    \\body = "Review it."
+    \\blocked_by = ["impl-1"]
+    \\
+;
+
+fn planStack(tmp: *std.testing.TmpDir, plan_text: []const u8) !runtime.Stack {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    try tmp.dir.makePath("root");
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
     defer a.free(root);
-    const thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/builder.md", .{&tmp.sub_path});
-    defer a.free(thread_path);
-    const plan_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/plan.md", .{&tmp.sub_path});
-    defer a.free(plan_path);
-    const impl_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/impl.md", .{&tmp.sub_path});
-    defer a.free(impl_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
-    defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "builder"
-        \\+++
-        \\Build.
-    });
-    try stack.installThreadFile(thread_path);
-    try tmp.dir.writeFile(.{ .sub_path = "plan.md", .data = 
-        \\+++
-        \\id = "plan"
-        \\thread = "builder"
-        \\+++
-        \\Plan.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "impl.md", .data = 
-        \\+++
-        \\id = "impl"
-        \\thread = "builder"
-        \\after = ["plan"]
-        \\+++
-        \\Implement.
-    });
-    const reports = try stack.addFiles(&.{ plan_path, impl_path });
-    defer stack.freeReports(reports);
-    try stack.storeResult("plan", "plan result");
-    try stack.storeResult("impl", "impl result");
-    try stack.storeCompletion("plan");
-    try stack.storeCompletion("impl");
-
-    var adapter = FakeAdapter{ .allocator = a };
-    defer adapter.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
-    try runtime.runUntilIdle(&stack, noSleep);
-
-    var plan = try stack.readRun("plan");
-    defer plan.deinit();
-    var impl = try stack.readRun("impl");
-    defer impl.deinit();
-    try std.testing.expectEqual(store.PromptStatus.completed, plan.status);
-    try std.testing.expectEqual(store.PromptStatus.completed, impl.status);
+    return runtime.Stack.createFromSource(a, root, "demo", .{ .plan_text = plan_text, .agent_cwd_abs = "/work/repo" });
 }
 
-test "startStack uses thread command override when present" {
+fn statusOf(stack: *const runtime.Stack, statuses: []const status.Status, name: []const u8) status.Status {
+    for (stack.plan.nodes, 0..) |n, i| {
+        if (std.mem.eql(u8, n.name, name)) return statuses[i];
+    }
+    unreachable;
+}
+
+test "plan startStack launches each thread command in agent cwd" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    const builder_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/builder.md", .{&tmp.sub_path});
-    defer a.free(builder_path);
-    const reviewer_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reviewer.md", .{&tmp.sub_path});
-    defer a.free(reviewer_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "/work/repo");
+    var stack = try planStack(&tmp, chain_plan);
     defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "builder"
-        \\+++
-        \\Build.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "reviewer.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "reviewer"
-        \\command = "claude"
-        \\+++
-        \\Review.
-    });
-    try stack.installThreadFile(builder_path);
-    try stack.installThreadFile(reviewer_path);
 
     var adapter = FakeAdapter{ .allocator = a };
     defer adapter.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
-    try runtime.startStack(&stack);
+    var rt = PlanRuntime(FakeAdapter){ .gpa = a, .adapter = &adapter };
+    defer rt.deinit();
+    try rt.startStack(&stack);
 
     try std.testing.expectEqual(@as(usize, 2), adapter.launch_log.items.len);
-    try std.testing.expectEqualStrings("builder:codex:/work/repo", adapter.launch_log.items[0]);
+    try std.testing.expectEqualStrings("impl:codex:/work/repo", adapter.launch_log.items[0]);
     try std.testing.expectEqualStrings("reviewer:claude:/work/repo", adapter.launch_log.items[1]);
 }
 
-test "runUntilIdle marks only a missing pane running prompt failed" {
+test "plan runtime delivers ready nodes and advances on completion" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    const lost_thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/lost.md", .{&tmp.sub_path});
-    defer a.free(lost_thread_path);
-    const ok_thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ok.md", .{&tmp.sub_path});
-    defer a.free(ok_thread_path);
-    const lost_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/lost-run.md", .{&tmp.sub_path});
-    defer a.free(lost_path);
-    const ok_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ok-run.md", .{&tmp.sub_path});
-    defer a.free(ok_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
+    var stack = try planStack(&tmp, chain_plan);
     defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "lost.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "lost"
-        \\+++
-        \\Lost.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "ok.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "ok"
-        \\+++
-        \\Ok.
-    });
-    try stack.installThreadFile(lost_thread_path);
-    try stack.installThreadFile(ok_thread_path);
-    try tmp.dir.writeFile(.{ .sub_path = "lost-run.md", .data = 
-        \\+++
-        \\id = "lost-run"
-        \\thread = "lost"
-        \\+++
-        \\Lost run.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "ok-run.md", .data = 
-        \\+++
-        \\id = "ok-run"
-        \\thread = "ok"
-        \\+++
-        \\Ok run.
-    });
-    const reports = try stack.addFiles(&.{ lost_path, ok_path });
-    defer stack.freeReports(reports);
-    try stack.storeResult("ok-run", "ok result");
-    try stack.storeCompletion("ok-run");
 
     var adapter = FakeAdapter{ .allocator = a };
     defer adapter.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
-    try runtime.startStack(&stack);
-    try stack.setRunStatus("lost-run", .running, "");
-    try stack.setRunStatus("ok-run", .running, "");
+    var rt = PlanRuntime(FakeAdapter){ .gpa = a, .adapter = &adapter };
+    defer rt.deinit();
+    try rt.startStack(&stack);
 
-    adapter.missing_pane = "pane-lost";
-    try runtime.runUntilIdle(&stack, noSleep);
+    // impl-1 is ready; review-1 is blocked.
+    try rt.deliver(&stack, stack.plan.nodeByName("impl-1").?);
+    try std.testing.expect(std.mem.startsWith(u8, adapter.paste_log.items[0], "pane-impl:/new"));
+    {
+        const statuses = try stack.statusesAlloc(a);
+        defer a.free(statuses);
+        try std.testing.expectEqual(status.Status.running, statusOf(&stack, statuses, "impl-1"));
+        try std.testing.expectEqual(status.Status.queued, statusOf(&stack, statuses, "review-1"));
+    }
 
-    var lost = try stack.readRun("lost-run");
-    defer lost.deinit();
-    var reread_ok = try stack.readRun("ok-run");
-    defer reread_ok.deinit();
-    try std.testing.expectEqual(store.PromptStatus.failed, lost.status);
-    try std.testing.expectEqualStrings("missing_thread_pane", lost.blocked_reason);
-    try std.testing.expectEqual(store.PromptStatus.completed, reread_ok.status);
+    // Agent finishes impl-1; poll closes it and review-1 becomes deliverable.
+    try stack.storeResult("impl-1", "impl result");
+    try stack.storeCompletion("impl-1");
+    _ = try rt.pollPending(&stack);
+    {
+        const statuses = try stack.statusesAlloc(a);
+        defer a.free(statuses);
+        try std.testing.expectEqual(status.Status.completed, statusOf(&stack, statuses, "impl-1"));
+        const deliverable = try scheduler.deliverableAlloc(a, &stack.plan, statuses);
+        defer a.free(deliverable);
+        try std.testing.expectEqual(@as(usize, 1), deliverable.len);
+        try std.testing.expectEqualStrings("review-1", stack.plan.nodes[deliverable[0]].name);
+    }
+
+    // review-1 receives impl-1's result path as an input.
+    try rt.deliver(&stack, stack.plan.nodeByName("review-1").?);
+    const rendered = try stack.readRunFileAlloc(a, "review-1", "rendered.md");
+    defer a.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "runs/impl-1/result.md") != null);
 }
 
-test "runUntilIdle marks only a dump-failed running prompt failed" {
+test "plan runUntilIdle terminates when all work is already complete" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    const bad_thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bad.md", .{&tmp.sub_path});
-    defer a.free(bad_thread_path);
-    const ok_thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ok.md", .{&tmp.sub_path});
-    defer a.free(ok_thread_path);
-    const bad_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bad-run.md", .{&tmp.sub_path});
-    defer a.free(bad_path);
-    const ok_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ok-run.md", .{&tmp.sub_path});
-    defer a.free(ok_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
+    var stack = try planStack(&tmp, chain_plan);
     defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "bad.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "bad"
-        \\+++
-        \\Bad.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "ok.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "ok"
-        \\+++
-        \\Ok.
-    });
-    try stack.installThreadFile(bad_thread_path);
-    try stack.installThreadFile(ok_thread_path);
-    try tmp.dir.writeFile(.{ .sub_path = "bad-run.md", .data = 
-        \\+++
-        \\id = "bad-run"
-        \\thread = "bad"
-        \\+++
-        \\Bad run.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "ok-run.md", .data = 
-        \\+++
-        \\id = "ok-run"
-        \\thread = "ok"
-        \\+++
-        \\Ok run.
-    });
-    const reports = try stack.addFiles(&.{ bad_path, ok_path });
-    defer stack.freeReports(reports);
-    try stack.storeResult("ok-run", "ok result");
-    try stack.storeCompletion("ok-run");
+    try stack.storeResult("impl-1", "r");
+    try stack.storeCompletion("impl-1");
+    try stack.storeResult("review-1", "r");
+    try stack.storeCompletion("review-1");
 
     var adapter = FakeAdapter{ .allocator = a };
     defer adapter.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
-    try runtime.startStack(&stack);
-    try stack.setRunStatus("bad-run", .running, "");
-    try stack.setRunStatus("ok-run", .running, "");
+    var rt = PlanRuntime(FakeAdapter){ .gpa = a, .adapter = &adapter };
+    defer rt.deinit();
+    try rt.runUntilIdle(&stack, noSleep);
 
-    adapter.fail_dump_pane = "pane-bad";
-    try runtime.runUntilIdle(&stack, noSleep);
-
-    var bad = try stack.readRun("bad-run");
-    defer bad.deinit();
-    var reread_ok = try stack.readRun("ok-run");
-    defer reread_ok.deinit();
-    try std.testing.expectEqual(store.PromptStatus.failed, bad.status);
-    try std.testing.expectEqualStrings("zellij_dump_failed", bad.blocked_reason);
-    try std.testing.expectEqual(store.PromptStatus.completed, reread_ok.status);
+    const statuses = try stack.statusesAlloc(a);
+    defer a.free(statuses);
+    try std.testing.expectEqual(status.Status.completed, statusOf(&stack, statuses, "impl-1"));
+    try std.testing.expectEqual(status.Status.completed, statusOf(&stack, statuses, "review-1"));
 }
 
-test "completion marker without result file fails the run" {
+test "plan delivery failure marks only that node failed" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    const thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/builder.md", .{&tmp.sub_path});
-    defer a.free(thread_path);
-    const prompt_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/impl.md", .{&tmp.sub_path});
-    defer a.free(prompt_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
+    var stack = try planStack(&tmp, chain_plan);
     defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "builder"
-        \\+++
-        \\Build.
-    });
-    try stack.installThreadFile(thread_path);
-    try tmp.dir.writeFile(.{ .sub_path = "impl.md", .data = 
-        \\+++
-        \\id = "impl"
-        \\thread = "builder"
-        \\+++
-        \\Implement.
-    });
-    const reports = try stack.addFiles(&.{prompt_path});
-    defer stack.freeReports(reports);
-    try stack.storeCompletion("impl");
+
+    var adapter = FakeAdapter{ .allocator = a, .fail_paste_pane = "pane-impl" };
+    defer adapter.deinit();
+    var rt = PlanRuntime(FakeAdapter){ .gpa = a, .adapter = &adapter };
+    defer rt.deinit();
+    try rt.startStack(&stack);
+
+    rt.deliver(&stack, stack.plan.nodeByName("impl-1").?) catch |e| {
+        try rt.failNode(&stack, "impl-1", deliverFailureReason(e));
+    };
+    const statuses = try stack.statusesAlloc(a);
+    defer a.free(statuses);
+    try std.testing.expectEqual(status.Status.failed, statusOf(&stack, statuses, "impl-1"));
+}
+
+test "plan completion without result fails the node" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stack = try planStack(&tmp, chain_plan);
+    defer stack.deinit();
 
     var adapter = FakeAdapter{ .allocator = a };
     defer adapter.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
-    try runtime.runUntilIdle(&stack, noSleep);
+    var rt = PlanRuntime(FakeAdapter){ .gpa = a, .adapter = &adapter };
+    defer rt.deinit();
+    try rt.startStack(&stack);
+    try rt.deliver(&stack, stack.plan.nodeByName("impl-1").?);
+    try stack.storeCompletion("impl-1"); // done marker, no result file
+    _ = try rt.pollPending(&stack);
 
-    var reread = try stack.readRun("impl");
-    defer reread.deinit();
-    try std.testing.expectEqual(store.PromptStatus.failed, reread.status);
-    try std.testing.expectEqualStrings("missing_result_file", reread.blocked_reason);
+    const statuses = try stack.statusesAlloc(a);
+    defer a.free(statuses);
+    try std.testing.expectEqual(status.Status.failed, statusOf(&stack, statuses, "impl-1"));
 }
 
-test "rendered prompt echoed in pane does not complete the run" {
+test "plan running node with a dump failure is marked failed" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    const thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/builder.md", .{&tmp.sub_path});
-    defer a.free(thread_path);
-    const prompt_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/impl.md", .{&tmp.sub_path});
-    defer a.free(prompt_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
+    var stack = try planStack(&tmp, chain_plan);
     defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "builder"
-        \\+++
-        \\Build.
-    });
-    try stack.installThreadFile(thread_path);
-    try tmp.dir.writeFile(.{ .sub_path = "impl.md", .data = 
-        \\+++
-        \\id = "impl"
-        \\thread = "builder"
-        \\+++
-        \\Implement.
-    });
-    const reports = try stack.addFiles(&.{prompt_path});
-    defer stack.freeReports(reports);
 
-    var adapter = FakeAdapter{ .allocator = a };
+    var adapter = FakeAdapter{ .allocator = a, .fail_dump_pane = "pane-impl" };
     defer adapter.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
-    try runtime.startStack(&stack);
-    try runtime.deliver(&stack, "impl");
+    var rt = PlanRuntime(FakeAdapter){ .gpa = a, .adapter = &adapter };
+    defer rt.deinit();
+    try rt.startStack(&stack);
+    try rt.deliver(&stack, stack.plan.nodeByName("impl-1").?);
+    _ = try rt.pollPending(&stack); // no done marker; dump fails -> failed
 
-    var running = try stack.readRun("impl");
-    const rendered_echo = try a.dupe(u8, running.rendered);
-    running.deinit();
-    defer a.free(rendered_echo);
-    adapter.dump = rendered_echo;
-    try stack.storeResult("impl", "durable result");
-    try std.testing.expect(!try runtime.pollOnce(&stack, "impl"));
-
-    var reread = try stack.readRun("impl");
-    defer reread.deinit();
-    try std.testing.expectEqual(store.PromptStatus.running, reread.status);
+    const statuses = try stack.statusesAlloc(a);
+    defer a.free(statuses);
+    try std.testing.expectEqual(status.Status.failed, statusOf(&stack, statuses, "impl-1"));
 }
 
-test "delivery failure marks only that prompt failed" {
+test "rejects an existing unowned zellij session" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    const bad_thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bad.md", .{&tmp.sub_path});
-    defer a.free(bad_thread_path);
-    const ok_thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ok.md", .{&tmp.sub_path});
-    defer a.free(ok_thread_path);
-    const bad_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bad-run.md", .{&tmp.sub_path});
-    defer a.free(bad_path);
-    const ok_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/ok-run.md", .{&tmp.sub_path});
-    defer a.free(ok_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
+    var stack = try planStack(&tmp, chain_plan);
     defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "bad.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "bad"
-        \\+++
-        \\Bad.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "ok.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "ok"
-        \\+++
-        \\Ok.
-    });
-    try stack.installThreadFile(bad_thread_path);
-    try stack.installThreadFile(ok_thread_path);
-    try tmp.dir.writeFile(.{ .sub_path = "bad-run.md", .data = 
-        \\+++
-        \\id = "bad-run"
-        \\thread = "bad"
-        \\+++
-        \\Bad run.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "ok-run.md", .data = 
-        \\+++
-        \\id = "ok-run"
-        \\thread = "ok"
-        \\+++
-        \\Ok run.
-    });
-    const reports = try stack.addFiles(&.{ bad_path, ok_path });
-    defer stack.freeReports(reports);
-    try stack.storeResult("ok-run", "ok result");
-    try stack.storeCompletion("ok-run");
 
-    var adapter = FakeAdapter{ .allocator = a, .fail_paste_pane = "pane-bad" };
+    // Remove the ownership marker so the existing session is treated as foreign.
+    var dir = try std.fs.cwd().openDir(stack.dir_abs, .{});
+    defer dir.close();
+    try dir.deleteFile("state/zellij-owner");
+
+    var adapter = FakeAdapter{ .allocator = a, .session_exists = true };
     defer adapter.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
-    try runtime.runUntilIdle(&stack, noSleep);
-
-    var bad = try stack.readRun("bad-run");
-    defer bad.deinit();
-    var ok = try stack.readRun("ok-run");
-    defer ok.deinit();
-    try std.testing.expectEqual(store.PromptStatus.failed, bad.status);
-    try std.testing.expectEqualStrings("zellij_deliver_failed", bad.blocked_reason);
-    try std.testing.expectEqual(store.PromptStatus.completed, ok.status);
-}
-
-test "failed dependency blocks queued dependent" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    const thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/builder.md", .{&tmp.sub_path});
-    defer a.free(thread_path);
-    const plan_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/plan.md", .{&tmp.sub_path});
-    defer a.free(plan_path);
-    const impl_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/impl.md", .{&tmp.sub_path});
-    defer a.free(impl_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
-    defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "builder"
-        \\+++
-        \\Build.
-    });
-    try stack.installThreadFile(thread_path);
-    try tmp.dir.writeFile(.{ .sub_path = "plan.md", .data = 
-        \\+++
-        \\id = "plan"
-        \\thread = "builder"
-        \\+++
-        \\Plan.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "impl.md", .data = 
-        \\+++
-        \\id = "impl"
-        \\thread = "builder"
-        \\after = ["plan"]
-        \\+++
-        \\Implement.
-    });
-    const reports = try stack.addFiles(&.{ plan_path, impl_path });
-    defer stack.freeReports(reports);
-    try stack.setRunStatus("plan", .failed, "test_failed");
-
-    var adapter = FakeAdapter{ .allocator = a };
-    defer adapter.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &adapter };
-    try runtime.runUntilIdle(&stack, noSleep);
-
-    var impl = try stack.readRun("impl");
-    defer impl.deinit();
-    try std.testing.expectEqual(store.PromptStatus.blocked, impl.status);
-    try std.testing.expectEqualStrings("dependency_failed:plan", impl.blocked_reason);
-}
-
-fn noSleep() void {}
-
-test "runtime rejects unowned existing zellij session" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
-    defer stack.deinit();
-
-    const marker = try std.fmt.allocPrint(a, "{s}/stacks/demo/state/zellij-owner", .{root});
-    defer a.free(marker);
-    try std.fs.cwd().deleteFile(marker);
-
-    var fake = FakeAdapter{ .allocator = a, .session_exists = true };
-    defer fake.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &fake };
-    try std.testing.expectError(error.SessionConflict, runtime.startStack(&stack));
-}
-
-test "runtime targets panes, stores dumps, and completes on done marker" {
-    const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/root", .{&tmp.sub_path});
-    defer a.free(root);
-    const thread_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/builder.md", .{&tmp.sub_path});
-    defer a.free(thread_path);
-    const prompt_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/plan.md", .{&tmp.sub_path});
-    defer a.free(prompt_path);
-
-    try tmp.dir.makePath("root");
-    var stack = try store.Stack.create(a, root, "demo", "codex", "");
-    defer stack.deinit();
-    try tmp.dir.writeFile(.{ .sub_path = "builder.md", .data = 
-        \\+++
-        \\type = "thread"
-        \\thread = "builder"
-        \\+++
-        \\Thread prompt.
-    });
-    try tmp.dir.writeFile(.{ .sub_path = "plan.md", .data = 
-        \\+++
-        \\id = "plan"
-        \\thread = "builder"
-        \\action = "compact"
-        \\+++
-        \\Plan the work.
-    });
-    const reports = try stack.addFiles(&.{ thread_path, prompt_path });
-    defer stack.freeReports(reports);
-
-    var fake = FakeAdapter{ .allocator = a };
-    defer fake.deinit();
-    var runtime = Runtime(FakeAdapter){ .allocator = a, .adapter = &fake };
-    try runtime.startStack(&stack);
-    try runtime.deliver(&stack, "plan");
-    try std.testing.expect(fake.created);
-    try std.testing.expect(fake.paste_log.items.len >= 4);
-    try std.testing.expect(std.mem.startsWith(u8, fake.paste_log.items[0], "pane-builder:/compact"));
-
-    fake.dump = try a.dupe(u8, "claude/codex result\n");
-    defer a.free(fake.dump);
-    try stack.storeResult("plan", "durable plan result");
-    try std.testing.expect(!try runtime.pollOnce(&stack, "plan"));
-    try stack.storeCompletion("plan");
-    try std.testing.expect(try runtime.pollOnce(&stack, "plan"));
-
-    var after = try stack.readRun("plan");
-    defer after.deinit();
-    try std.testing.expectEqual(store.PromptStatus.completed, after.status);
-    try std.testing.expect(std.mem.indexOf(u8, after.output, "claude/codex result") != null);
+    var rt = PlanRuntime(FakeAdapter){ .gpa = a, .adapter = &adapter };
+    defer rt.deinit();
+    try std.testing.expectError(error.SessionConflict, rt.startStack(&stack));
 }

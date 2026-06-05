@@ -34,7 +34,7 @@ make skill
 Create a stack:
 
 ```sh
-stako new my-work --command codex --cwd ~/src/my-repo
+stako new my-work --cwd ~/src/my-repo
 ```
 
 `--cwd` is the directory the agent threads launch in; it is the repository the
@@ -48,14 +48,14 @@ Write a thread prompt:
 +++
 type = "thread"
 thread = "builder"
+command = "codex"
 +++
 
 You are working in the user's repository.
 Read the task, make the requested change, run the relevant checks, and report the result.
 ```
 
-`--command` on the stack is the default harness command for every thread. A
-thread can override it:
+Each thread file chooses the harness command for that durable zellij tab:
 
 ```md
 +++
@@ -67,8 +67,7 @@ command = "claude"
 Review the implementation for correctness and missing tests.
 ```
 
-With the stack created as `--command codex`, the builder thread launches
-`codex`; this reviewer thread launches `claude`.
+The builder thread launches `codex`; the reviewer thread launches `claude`.
 
 Write a prompt:
 
@@ -127,8 +126,8 @@ Review the latest implementation for correctness, missing tests, and unnecessary
 Do not make code changes unless explicitly asked.
 ```
 
-Thread `command` is optional. If it is omitted, the thread uses the stack's
-default `command` from `stako new`.
+Thread `command` is required. It is the harness command Stako runs when it
+creates that thread's zellij tab.
 
 Prompt files define queued work:
 
@@ -226,7 +225,7 @@ stako link 003-review.md 004-address-review.md --pre-cmd compact
 ## CLI
 
 ```sh
-stako new <stack> [--command codex] [--cwd PATH] [--root PATH]
+stako new <stack> [--cwd PATH] [--root PATH]
 stako add <stack> <thread-or-prompt.md...> [--root PATH]
 stako link <source-prompt.md> <target-prompt.md> [--pre-cmd compact]
 stako start <stack> [--root PATH]
