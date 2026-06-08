@@ -8,3 +8,10 @@ stako/**/*
 !stako/*.md
 !stako/deferred/
 !stako/deferred/*.md
+# Python plan API build/install artifacts.
+__pycache__/
+python/build/
+python/*.egg-info/
+python/stako.egg-info/
+# Prompt library copied into the package only for wheel/pipx builds.
+python/stako/prompts/

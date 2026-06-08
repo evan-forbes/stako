@@ -1,17 +1,26 @@
 # stako
 
-Stako is a tiny queue runner for coding agents.
+Stako is a tiny queue runner for coding agents, built around one `plan.toml`
+graph.
 
 The model is deliberately small:
 
-- A **stack** is a queue of prompt files.
-- A **thread** is one long-lived agent session in a zellij tab.
-- Each prompt targets one thread.
-- Prompts on the same thread run one at a time.
-- Prompts on different threads may run in parallel unless they declare `after`.
-- A thread prompt is prepended every time a prompt is delivered, including after `new`, `clear`, and `compact` actions.
+- A **stack** is one `plan.toml` — the only graph. There is no state file.
+- A **thread** is a long-lived agent session in a zellij tab. It sets a harness
+  `command` (`claude` or `codex`) and an optional `default` body.
+- A **prompt** node targets one thread. Same-thread nodes run one at a time;
+  different-thread nodes run in parallel.
+- **`blocked_by`** is the only edge: a node waits for the named nodes and
+  receives their `result.md` files as inputs.
+- **Status is computed**, never stored, from the plan plus run markers plus an
+  append-only `events.jsonl` log.
 
-Stako stores the queue on disk, starts one zellij tab per thread, and pastes prompts into the relevant tab. Durable content moves between threads through per-prompt `result.md` files, and completion is signaled by a per-run `done` marker file, not by zellij pane text.
+Stako stores the graph on disk, starts one zellij tab per thread, and pastes
+rendered prompts into the relevant tab. Durable content moves between threads
+through per-node `result.md` files; completion is a per-node `done` marker, not
+zellij pane text. Result quality is classified from the top of `result.md`:
+`stako-status: done` satisfies dependents, while `stako-status: blocked` and
+`stako-status: failed` are terminal but do not satisfy `blocked_by`.
 
 ## Install
 
@@ -20,226 +29,259 @@ Prerequisites:
 - Zig 0.15.2
 - `zellij`
 - the agent CLI you want to run, usually `codex` or `claude`
+- Python 3.9+ (only for the plan-authoring library)
 
 ```sh
 make build
-make install
-make skill
+make install            # installs the stako binary to ~/.local/bin
+make skill              # symlinks the bundled skill for Codex and Claude
+make install-python     # installs the `stako` Python library globally
 ```
 
-`make skill` installs the bundled Stako skill for Codex and Claude by symlinking `skills/stako`.
+`make install-python` prefers `pipx`, then `pip --user`; on an
+externally-managed interpreter with neither, it links the package editable via a
+`.pth` in your user site so `import stako` works globally. Override the binary it
+shells out to with `STAKO_BIN`.
 
-## Quick Start
+## Quick start
 
-Create a stack:
+Author a plan with Python (best for repetitive loops):
+
+```python
+from stako import Stack, prompts
+
+with Stack("my-work", cwd="~/src/my-repo") as s:
+    impl   = s.thread("impl",   command="codex")
+    review = s.thread("review", command="claude")
+    cursor = s.cursor()
+
+    for task in s.glob("plans/*.md"):
+        i = impl(cursor, prompts.implementer, task, new=cursor.empty)
+        review(prompts.code_quality, i)
+        cursor = cursor.advance(i)
+```
+
+Running the script writes `plan.toml` and calls `stako new`. Or hand-author a
+folder and create the stack yourself:
 
 ```sh
-stako new my-work --cwd ~/src/my-repo
-```
-
-`--cwd` is the directory the agent threads launch in; it is the repository the
-agents work on. The path is resolved to an absolute path when the stack is
-created, so it does not depend on where you later run `stako start`. Omit it to
-inherit the directory `stako start` runs from.
-
-Write a thread prompt:
-
-```md
-+++
-type = "thread"
-thread = "builder"
-command = "codex"
-+++
-
-You are working in the user's repository.
-Read the task, make the requested change, run the relevant checks, and report the result.
-```
-
-Each thread file chooses the harness command for that durable zellij tab:
-
-```md
-+++
-type = "thread"
-thread = "reviewer"
-command = "claude"
-+++
-
-Review the implementation for correctness and missing tests.
-```
-
-The builder thread launches `codex`; the reviewer thread launches `claude`.
-
-Write a prompt:
-
-```md
-+++
-id = "001-plan"
-thread = "builder"
-+++
-
-Inspect the repository and write a short implementation plan.
-```
-
-Queue both files:
-
-```sh
-stako add my-work builder.md 001-plan.md
-```
-
-Start the stack:
-
-```sh
-stako start my-work
-```
-
-`start` watches the stack until it is idle: it polls running prompts for their `done` marker, delivers newly unblocked prompts, and exits when nothing is running or ready.
-
-Attach to the zellij session:
-
-```sh
-stako attach my-work
-```
-
-Inspect status and output:
-
-```sh
+stako plan ./my-folder       # validate + preview
+stako new  ./my-folder --cwd ~/src/my-repo
+stako start my-work --watch  # resident: deliver ready nodes, pick up injects live
 stako status my-work
-stako output my-work 001-plan
+stako attach my-work
+stako stop my-work           # end the watch runner
 ```
 
-`stako output` is raw pane dump output for debugging. Downstream prompts read `result.md` files.
+`--cwd` is the directory the agent threads launch in — the repository they work
+on. It is resolved to an absolute path when the stack is created, so it does not
+depend on where you later run `stako start`. It can also live in the plan header.
 
-## Prompt Files
+## The plan
 
-All input files are Markdown with TOML front matter delimited by `+++`.
+A `plan.toml` declares threads once and nodes once; edges are `blocked_by`,
+referenced by name.
 
-Thread files define reusable per-thread behavior:
+```toml
+name = "review-loop"
+cwd  = "~/src/my-repo"           # agent cwd; relative paths resolve from this file
 
-```md
-+++
-type = "thread"
-thread = "reviewer"
+[[thread]]
+name = "impl"
+command = "codex"
+
+[[thread]]
+name = "reviewer"
 command = "claude"
-+++
 
-Review the latest implementation for correctness, missing tests, and unnecessary complexity.
-Do not make code changes unless explicitly asked.
-```
+[[prompt]]
+name = "impl-1"
+thread = "impl"
+action = "new"                   # new | clear | compact, sent before the body
+use = "prompts/implementer.md"   # a reusable library body
+with = ["plans/auth.md"]         # extra body inputs (files or inline strings)
+# no blocked_by -> ready immediately
 
-Thread `command` is required. It is the harness command Stako runs when it
-creates that thread's zellij tab.
-
-Prompt files define queued work:
-
-```md
-+++
-id = "002-review"
+[[prompt]]
+name = "review-1"
 thread = "reviewer"
-after = ["001-plan"]
-inputs = ["001-plan"]
-+++
-
-Review the plan and call out concrete risks before implementation starts.
+use = "prompts/code_quality.md"
+blocked_by = ["impl-1"]          # waits for impl-1 and reads its result.md
 ```
 
-Fields:
+Node fields:
 
-- `id`: unique prompt id within the stack. Use sortable ids such as `001-plan`, `002-implement`, `003-review`.
-- `thread`: target thread name.
-- `after`: optional list of prompt ids that must complete first.
-- `inputs`: optional list of prompt ids whose `result.md` files should be passed to this prompt. Inputs also block until the source prompt completes.
-- `action`: optional thread action: `none`, `new`, `clear`, or `compact`.
+- `name` (required): unique; the handle other nodes target with `blocked_by`.
+- `thread` (required): which thread runs it.
+- `use` / `with` / `body`: the body. `use` is a library prompt path, `with` is a
+  list of extra file paths or inline strings, `body` is an inline string. With
+  none, the thread `default` is used.
+- `action` (optional): `new` | `clear` | `compact`, sent before the body.
+- `blocked_by` (optional): node names to wait for and read `result.md` from.
+- `raw = true` (optional): deliver the body verbatim with no auto-contract.
 
-`action` sends the matching slash command before the prompt body:
+`use` paths resolve against the prompt folder (made absolute at `stako new`
+time), so one `prompts/` library serves many plans.
 
-- `new` sends `/new`
-- `clear` sends `/clear`
-- `compact` sends `/compact`
+## Python plan API
 
-The rendered prompt is always:
+`from stako import Stack, prompt, prompts`.
 
-1. stack prompt from `stack.md`
-2. target thread prompt
-3. input result file paths from `inputs`
-4. queued prompt body
-5. result file instructions
-6. completion marker instructions
+- `s.thread(name, command="claude", default=None)` registers a thread and
+  returns a callable.
+- Calling a thread appends one node and returns a **handle**:
+  - a `prompts.*` ref or `prompt("path.md")` is the body (`use`);
+  - a **handle** or **cursor** argument becomes `blocked_by` (and therefore an input);
+  - a file path or string becomes an extra body input (`with`);
+  - `new` / `clear` / `compact` are per-call actions; `label="..."` suffixes the
+    node name; `raw=True` skips the contract.
+- `s.cursor(*deps)` creates a dependency cursor from zero or more handles or
+  cursors. `cursor.advance(*deps)` returns a new cursor whose tail is only
+  `deps`; `cursor.join(*deps)` fans in the current cursor plus more deps.
+- `s.glob("plans/*.md")` returns sorted absolute paths.
+- `with s.step():` groups calls into a barrier: every node in a step is
+  `blocked_by` every node of the previous step.
 
-Every run has a predetermined durable result file and completion marker:
+Consecutive calls on the same thread add no hidden edges — thread occupancy
+orders them. On clean `with` exit the library writes `plan.toml` and runs
+`stako new`; an exception in the block writes nothing. `dry_run=True` writes the
+file and prints the exact command without queueing.
 
-```text
-<root>/stacks/<stack>/runs/<prompt-id>/result.md
-<root>/stacks/<stack>/runs/<prompt-id>/done
-```
+The bundled prompt library (an implement → review → check loop) is reached by
+nickname:
 
-The agent must write the final downstream handoff content to `result.md`, then create `done`. The marker can be empty, but it must not exist before the result is complete. If `done` exists but `result.md` is missing, Stako marks the run `failed` with `missing_result_file`.
+| Nickname | Role |
+|---|---|
+| `prompts.implementer` | implement a work slice and write `result.md` |
+| `prompts.code_quality` | review correctness, elegance, completeness |
+| `prompts.security` | review abuse-resistance and untrusted input |
+| `prompts.performance` | review allocation, bounds, and scaling |
+| `prompts.checker` | reconcile reviews into `pass` / `followups` verdicts |
 
-## Sync And Parallel
+The raw bodies live in `prompts/*.md`; `prompts.names()` lists what is available.
+Nested prompt bodies are available with bracket lookup, for example
+`prompts["bug_finder/entrypoint_researcher"]`. Set `STAKO_PROMPTS` to point the
+registry at a different library directory.
 
-Parallelism is implicit. If two queued prompts target different threads and have no unmet dependencies, `stako start` can deliver both.
+## Sync and parallel
 
-Synchronization is explicit:
+Parallelism is implicit: two nodes on different threads with no unmet
+`blocked_by` can both be delivered. Synchronization is explicit via `blocked_by`,
+which both waits for a node and passes its `result.md` path as an input. When a
+review node is `blocked_by = ["impl-1"]`, the reviewer receives the absolute path
+to `runs/impl-1/result.md`; Stako does not scrape the implementer's pane.
 
-```md
-+++
-id = "003-review"
-thread = "reviewer"
-after = ["002-implement"]
-+++
-
-Review the implementation produced by 002-implement.
-```
-
-Same-thread prompts are serialized. Different-thread prompts block when `after` or `inputs` says they block.
-
-Content handoff is explicit with `inputs`:
-
-```md
-+++
-id = "004-address-review"
-thread = "builder"
-after = ["003-review"]
-inputs = ["003-review"]
-action = "compact"
-+++
-
-Address the reviewer findings.
-```
-
-When this prompt is delivered, Stako includes the absolute path to:
-
-```text
-<root>/stacks/<stack>/runs/003-review/result.md
-```
-
-The builder reads that file. Stako does not scrape the reviewer pane to decide what content matters.
-
-To wire a source prompt into a target prompt:
+Wire an edge into an existing plan with:
 
 ```sh
-stako link 003-review.md 004-address-review.md --pre-cmd compact
+stako link <stack> impl-1 review-1   # adds impl-1 to review-1's blocked_by
 ```
 
-`link` rewrites the target prompt front matter so `after` and `inputs` include the source prompt id and `action` is set to the requested pre-command.
+## Rendered prompt and the result contract
+
+The bytes an agent receives are composed at delivery, in order:
+
+1. **action** — `/new` | `/clear` | `/compact` when set
+2. **body** — the resolved `use` file, plus `with`/`body`, or the thread `default`
+3. **inputs contract** — the `runs/<blocked_by>/result.md` paths to read
+4. **output contract** — write `runs/<node>/result.md`, create `done`, then stop
+
+The exact bytes are written to `runs/<node>/rendered.md` and referenced from the
+`delivered` event in `events.jsonl`. Preview them before any run with:
+
+```sh
+stako render <stack> <node>
+```
+
+Every run has predetermined durable paths:
+
+```text
+<root>/stacks/<stack>/runs/<node>/result.md
+<root>/stacks/<stack>/runs/<node>/done
+```
+
+The agent writes the final handoff content to `result.md`, then creates `done`,
+then stops. The marker can be empty, but must not exist before the result is
+complete. The first result line should be `stako-status: done`,
+`stako-status: blocked`, or `stako-status: failed`; an optional second line may
+be `stako-verdict: pass`, `stako-verdict: followups`, or `stako-verdict: fail`.
+Legacy first lines `PASS`, `FOLLOWUPS REQUIRED`, `BLOCKED`, `FAILED`, and
+`FAIL` are still classified for compatibility. `done` without `result.md` makes
+the run `failed`.
+
+## Run, watch, and recover
+
+`stako start` delivers ready prompts and polls running ones. By default it
+returns once the stack is idle; `--watch` keeps it resident as a daemon that
+re-reads `plan.toml` every tick, so `stako inject`/`stako reset` take effect
+**without a restart**, and a currently running node is polled rather than
+re-delivered. The runner holds no cached graph — it re-derives status from
+`plan.toml` + run markers + `events.jsonl` each tick. It records `runner.pid`
+(pid, start time, watch); `stako stop` reads it, verifies the process is the
+stack's runner, and signals it.
+
+When a node wedges (e.g. a large paste whose submit never registered — the runner
+retries Enter once, but the long tail is yours to recover):
+
+```sh
+stako redeliver <stack> <node>   # re-send the rendered prompt to its pane
+stako reset <stack> <node>       # clear its run artifacts; it re-queues (and a watch runner re-delivers)
+stako complete <stack> <node> [--result FILE]  # force-finish it from a file or stdin
+```
+
+`stako output <stack> <node>` recaptures a running node's pane when a live pane
+is available, updates `runs/<node>/output.md`, and prints it. Use
+`stako output <stack> <node> --snapshot` for the stored snapshot only.
+
+## Status and history
+
+`stako status` computes the view from `plan.toml` + run markers + `events.jsonl`:
+per-node status (`queued`/`running`/`completed`/`blocked`/`failed`) with readiness and the
+`blocked_by` a queued node is waiting on, which node each thread is running, the
+attached runner's liveness, and a `(stalled?)` hint for a running node whose pane
+has been quiet too long. `stako status --json` emits the same view as JSON.
+
+`events.jsonl` is append-only: one JSON object per delivery, completion, blocked
+result, failure, injection, reset, and runner start/stop. It is audit history and the source for
+the `running` part of computed status — never a second copy of the graph.
+
+## Inject follow-ups
+
+```sh
+stako inject <stack> <node> --thread T [--use F | --body B] [--with f1,f2] [--action A] \
+  [--blocked-by a,b] [--gate target] [--raw]
+```
+
+`inject` appends a `[[prompt]]` node to `plan.toml`; `--gate target` also adds the
+new node to `target`'s `blocked_by`. `--with` attaches extra body inputs (files or
+inline strings, repeatable or comma-separated). Because edges are by name and
+there is no ordering, appending cannot invert dependencies or renumber anything.
+`--use` paths are validated before mutation. The mutation is recorded in
+`events.jsonl`; any live runner picks it up on its next tick. If no live runner
+is present, the command prints the exact `stako start <stack> --watch` command to
+continue.
 
 ## CLI
 
 ```sh
-stako new <stack> [--cwd PATH] [--root PATH]
-stako add <stack> <thread-or-prompt.md...> [--root PATH]
-stako link <source-prompt.md> <target-prompt.md> [--pre-cmd compact]
-stako start <stack> [--root PATH]
+stako plan <prompt-folder> [--name N] [--root P] [--cwd P] [--json]
+stako new <prompt-folder> [--name N] [--root P] [--cwd P]
+stako new <name> --from <prompt-folder> [--root P] [--cwd P]
+stako status <stack> [--root P] [--json]
+stako render <stack> <node> [--root P]
+stako inject <stack> <node> --thread T [--use F|--body B] [--with f1,f2] [--action A] [--blocked-by a,b] [--gate target] [--raw] [--root P]
+stako link <stack> <source-node> <target-node> [--root P]
+stako start <stack> [--watch] [--root P]
+stako stop <stack> [--root P]
 stako attach <stack>
-stako status <stack> [--root PATH]
-stako output <stack> <prompt-id> [--root PATH]
+stako output <stack> <node> [--snapshot] [--root P]
+stako redeliver <stack> <node> [--force] [--root P]
+stako complete <stack> <node> [--result FILE] [--root P]
+stako reset <stack> <node> [--root P]
 ```
 
-The default root is `~/stako`.
-
-## Current Limits
-
-- Queue order is insertion order. Prompt ids are still used as stable names and dependency targets.
-- Raw output is captured by dumping the zellij pane for debugging. Completion and durable handoff content are filesystem based: `done` and `result.md`.
+The default root is `~/stako`. Runtime artifacts (`runs/`, `events.jsonl`,
+`runner.pid`) live under the stack root and are not git-tracked.
 
 ## Development
 
@@ -247,4 +289,5 @@ The default root is `~/stako`.
 make build
 make test
 zig build -Doptimize=ReleaseFast test
+python3 -m unittest discover -s python/tests   # Python plan API tests
 ```

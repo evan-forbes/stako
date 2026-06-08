@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stako"
+version = "0.1.0"
+description = "Emit a stako plan.toml graph from concise Python."
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.setuptools]
+packages = ["stako"]
+
+# Bundled for wheel/pipx installs. The editable in-tree install resolves the
+# library from the repo-root prompts/ instead (see stako._library_dir).
+[tool.setuptools.package-data]
+stako = ["prompts/*.md", "prompts/*/*.md", "prompts/*/*.py"]

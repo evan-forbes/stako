@@ -56,6 +56,7 @@ pub fn composeAlloc(
         \\{s}
         \\
         \\The result file must contain only the content that downstream prompts should read. Other threads receive this file path, not the zellij pane contents.
+        \\Start the result file with `stako-status: done`, `stako-status: blocked`, or `stako-status: failed`. Use `blocked` for follow-ups or unresolved prerequisites; blocked and failed results do not unblock dependent prompts.
         \\
         \\When the result file has been written and this request is completely finished, create this exact completion marker file:
         \\{s}

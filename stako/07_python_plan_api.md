@@ -1,8 +1,8 @@
 # Python Plan API Design
 
 > Reframed by `09_unified_authoring_model.md`: the Python API emits a single
-> central `plan.toml`, not scattered prompt front matter. Handle data flow
-> compiles to `blocked_by`, and `new`/`clear`/`compact` are per-call flags.
+> central `plan.toml`, not scattered prompt front matter. Handle and cursor data
+> flow compile to `blocked_by`, and `new`/`clear`/`compact` are per-call flags.
 
 ## Problem
 
@@ -18,7 +18,7 @@ supporting files. The Python layer owns no runtime.
 
 - Let an agent or operator describe a stack as ordinary Python control flow.
 - Emit the same `plan.toml` that hand-authored folders use.
-- Derive `blocked_by` automatically from handle data flow.
+- Derive `blocked_by` automatically from handle and cursor data flow.
 - Map `new`/`clear`/`compact` to per-node `action`.
 - Supply default bodies for common review and fix calls.
 - Stay dependency-free and installable locally.
@@ -53,10 +53,12 @@ with Stack("refactor-auth", cwd="../..", out="stako/refactor-auth") as s:
     review_body = prompt("prompts/review.md")
     fix = prompt("prompts/fix.md")
 
+    cursor = s.cursor()
     for plan in s.glob("plans/*.md"):
-        a = impl(implement, plan, new=True)
+        a = impl(cursor, implement, plan, new=cursor.empty)
         b = review(review_body, a, new=True)
-        impl(fix, b, compact=True)
+        c = impl(fix, b, compact=True)
+        cursor = cursor.advance(c)
 ```
 
 On clean context exit, the API writes `plan.toml` and referenced prompt-library
@@ -86,7 +88,10 @@ that later calls can consume.
   compact=False, name=None)` builds one prompt node.
 - `prompt(path)` returns a reusable body reference.
 - File/path/string args become body inputs.
-- Each `Handle` arg becomes a `blocked_by` entry.
+- Each `Handle` or `Cursor` arg becomes one or more `blocked_by` entries.
+- `s.cursor(*deps)` creates a cursor from handles/cursors.
+- `cursor.advance(*deps)` returns a cursor whose tail is exactly `deps`.
+- `cursor.join(*deps)` combines the current cursor with additional deps.
 - `new=True`, `clear=True`, and `compact=True` compile to `action`.
 - With no body args, the thread's `default` is used.
 
@@ -167,8 +172,9 @@ use = "prompts/fix.md"
 blocked_by = ["020-reviewer"]
 ```
 
-Handle arguments produce `blocked_by`; they do not emit separate `after` or
-`inputs` fields.
+Handle and cursor arguments produce `blocked_by`; they do not emit separate
+`after` or `inputs` fields. Cursors are authoring sugar only: they add no plan
+schema and no runtime state.
 
 ## Steps as Sugar
 
@@ -230,7 +236,7 @@ Errors should fail before queueing whenever possible:
 - missing file passed to `prompt` or `glob`
 - missing command
 - multiple actions on one call
-- handle from another stack
+- handle or cursor from another stack
 - subprocess command failure
 
 Recommended materialization strategy:
@@ -254,14 +260,14 @@ Recommended materialization strategy:
 - README gains a "Python Plan API" section with the loop example and install
   command.
 - `skills/stako/SKILL.md` gains a short "Python loops" subsection telling agents
-  to prefer the Python API for repetitive multi-step stacks and to let handle
-  data flow generate `blocked_by`.
+  to prefer the Python API for repetitive multi-step stacks and to let handle or
+  cursor data flow generate `blocked_by`.
 
 ## Implementation Plan
 
-1. Implement in-memory `Stack`, `Thread`, `PromptRef`, and `Handle` models.
+1. Implement in-memory `Stack`, `Thread`, `PromptRef`, `Handle`, and `Cursor` models.
 2. Add name sanitization, label support, and monotonic node allocation.
-3. Implement handle-derived `blocked_by`.
+3. Implement handle/cursor-derived `blocked_by`.
 4. Implement per-call `new`, `clear`, and `compact` action flags.
 5. Emit `plan.toml` plus prompt-library files.
 6. Implement temp-then-rename materialization.
@@ -273,7 +279,9 @@ Recommended materialization strategy:
 ## Test Plan
 
 - Rendering emits parseable `plan.toml`.
-- Handle arguments add `blocked_by`.
+- Handle and cursor arguments add `blocked_by`.
+- `cursor.advance()` emits only the current tail, avoiding edge bloat.
+- `cursor.join()` fans in multiple handles while preserving first-seen order.
 - Consecutive same-thread calls do not add hidden edges.
 - Step barriers compile to `blocked_by`.
 - `compact`, `clear`, and `new` apply only to the current call.

@@ -2,7 +2,8 @@
 
 > Updated by `09_unified_authoring_model.md`: the graph lives in authored
 > `plan.toml`; `blocked_by` is the only edge; status is computed from
-> `plan.toml`, filesystem markers, and append-only `events.jsonl`.
+> `plan.toml`, filesystem markers, result classification, and append-only
+> `events.jsonl`.
 
 ## Problem
 
@@ -45,9 +46,9 @@ Readiness is computed from the full graph:
 | `blocked_dependency` | One or more blockers are not completed. |
 | `invalid_graph` | A blocker is missing or a cycle exists. |
 | `running` | A delivered event exists without a completion/failure. |
-| `completed` | `done` and `result.md` exist. |
-| `failed` | Runtime failure was observed or logged. |
-| `terminal_blocked` | Cannot run because an upstream dependency failed. |
+| `completed` | `done` and `result.md` exist, and the result classifies as `stako-status: done` or legacy pass/done. |
+| `blocked` | `done` and `result.md` exist, but the result classifies as blocked/followups; terminal and non-satisfying. |
+| `failed` | Runtime failure was observed or logged, `done` exists without `result.md`, or the result classifies as failed. |
 
 ## Scheduler Semantics
 
@@ -107,7 +108,7 @@ Stako needs atomic graph mutations:
 - Remove queued node.
 - Add edge by adding a source node to target `blocked_by`.
 - Remove edge from a queued target.
-- Retry failed or terminally blocked node.
+- Retry failed or blocked node.
 
 Every mutation validates:
 

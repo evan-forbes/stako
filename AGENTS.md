@@ -1,12 +1,13 @@
 # Agent instructions for stako
 
-Stako is a zellij-first Zig CLI. A stack is a prompt queue; a thread is a long-lived agent session in a zellij tab; prompt files target threads and block with explicit `after = [...]` dependencies. Different threads are the parallelism boundary, and every thread file must set its harness with `command = "claude"` or `command = "codex"`. Durable content handoff is via `inputs = [...]`, which passes per-prompt `runs/<id>/result.md` file paths and blocks until those prompts complete. Completion is signaled by `runs/<id>/done`; zellij pane dumps are debug output only.
+Stako is a zellij-first Zig CLI. A stack is one `plan.toml` graph: threads are long-lived agent sessions in zellij tabs, prompt nodes target a thread, and `blocked_by = [...]` is the only edge — it waits for the named nodes and passes their `runs/<node>/result.md` paths as inputs. Different threads are the parallelism boundary, and every thread sets its harness with `command = "claude"` or `command = "codex"`. Status is computed (never stored) from the plan plus `runs/<node>/done`, classified `runs/<node>/result.md` content (`stako-status: done|blocked|failed`), and the append-only `events.jsonl` log; zellij pane dumps are debug output only. The architecture source of truth is `stako/09_unified_authoring_model.md`. Plans are hand-authored or emitted by the stdlib-only `stako` Python library under `python/` (`make install-python`), which exposes the `prompts/` library by nickname and a `Cursor` API for loop dependencies.
 
 ## Toolchain
 
 - Zig **0.15.2** (pinned in `build.zig.zon`). Do not assume 0.16 patterns; the skill below targets 0.15.x.
 - Build/run via `make build`, `make test`. Underneath that's `zig build` / `zig build test`.
 - Run a single test: `./zig-out/bin/<test-bin> --test-filter "<name>"`.
+- The Python plan API (`python/`) is stdlib-only, Python 3.9+. Install with `make install-python`; test with `python3 -m unittest discover -s python/tests`.
 
 ## Use the Zig skill
 

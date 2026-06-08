@@ -252,7 +252,8 @@ The bytes an agent receives are composed by Stako at delivery, in order:
 2. **Body** — the resolved `use` file, plus `with`/inline additions, or the
    thread `default`.
 3. **Inputs contract** — the `runs/<blocked_by>/result.md` paths to read.
-4. **Output contract** — write `runs/<node>/result.md`, create `done`, then stop.
+4. **Output contract** — write `runs/<node>/result.md` beginning with
+   `stako-status: done|blocked|failed`, create `done`, then stop.
 
 Because this is spread across the library prompt, the node, and Stako's template,
 it must be visible and controllable:
@@ -276,6 +277,7 @@ Stako appends one JSON object per line to `events.jsonl` as work happens:
 {"ts":"2026-06-04T12:00:00Z","event":"scheduled","node":"impl-1","thread":"impl"}
 {"ts":"2026-06-04T12:00:01Z","event":"delivered","node":"impl-1","thread":"impl","action":"new","rendered":"runs/impl-1/rendered.md","inputs":[]}
 {"ts":"2026-06-04T12:03:10Z","event":"completed","node":"impl-1","result":"runs/impl-1/result.md"}
+{"ts":"2026-06-04T12:03:11Z","event":"blocked","node":"checker-1","reason":"result_blocked"}
 {"ts":"2026-06-04T12:03:11Z","event":"scheduled","node":"review-a-1","thread":"reviewer_a"}
 {"ts":"2026-06-04T12:03:12Z","event":"delivered","node":"review-a-1","thread":"reviewer_a","action":"new","rendered":"runs/review-a-1/rendered.md","inputs":["runs/impl-1/result.md"]}
 ```
@@ -289,8 +291,9 @@ runner start/stop, and delivery failures (`06`) all land here.
 `stako status` computes the view from `plan.toml` + `runs/` markers +
 `events.jsonl`:
 
-- per node: computed status (`queued`/`running`/`completed`/`failed`) and, for
-  queued nodes, readiness and the `blocked_by` it is waiting on
+- per node: computed status (`queued`/`running`/`completed`/`blocked`/`failed`)
+  and, for queued nodes, readiness and the `blocked_by` it is waiting on.
+  `blocked` and `failed` are terminal but do not satisfy dependents.
 - per thread: idle or which node is running
 - runner: pid and watch mode from `runner.pid`
 
@@ -314,8 +317,8 @@ Supersedes storage/authoring decisions in:
   single graph; the old "front matter wins" rule is dropped.
 - `05` — the scheduler/readiness model stands, reduced to one `blocked_by` edge;
   there is no compiled state file and no `order`; status is computed.
-- `07` — reframed as a `plan.toml` emitter with handle-derived `blocked_by` and
-  per-call actions.
+- `07` — reframed as a `plan.toml` emitter with handle/cursor-derived
+  `blocked_by` and per-call actions.
 
 Composes with, and adjusts:
 
@@ -338,18 +341,21 @@ Composes with, and adjusts:
 4. Add the `events.jsonl` appender and the `runner.pid` file.
 5. Implement `stako status` and `stako status --json` as computed projections.
 6. Move `stako inject` to append to `plan.toml` + log the mutation.
-7. Build the Python API: callable threads, handle-derived `blocked_by`, per-call
-   actions, prompt library refs, `plan.toml` emission, `stako` shell-out.
+7. Build the Python API: callable threads, handle/cursor-derived `blocked_by`,
+   per-call actions, prompt library refs, `plan.toml` emission, `stako` shell-out.
 8. Add `with s.step()` sugar over `blocked_by`.
 9. Update README and `skills/stako/SKILL.md` for the plan + library + render flow.
 
 ## Test Plan
 
 - A handle chain compiles to the expected `blocked_by` graph and runs in order.
+- A cursor loop compiles to serialized iterations without serializing unrelated
+  reviewers inside an iteration.
 - Two reviewers blocked on one implement node run in parallel; two fixes block on
   their respective reviews.
 - `blocked_by` waits and passes the blocker's `result.md` path as an input.
-- Status is computed correctly from markers + log with no stored status.
+- Status is computed correctly from markers, result classification, and log with
+  no stored status.
 - `stako render` output equals the bytes written to `runs/<node>/rendered.md`.
 - `raw = true` delivers the body with no contract appended.
 - `events.jsonl` records a rendered reference and inputs for every delivery.

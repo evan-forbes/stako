@@ -41,8 +41,8 @@ follow-up work.
 
 Output:
 
-- Start with `PASS` if the slice is complete enough to proceed.
-- Otherwise start with `FOLLOWUPS REQUIRED`.
+- Start with `stako-status: done` and `stako-verdict: pass` if the slice is complete enough to proceed, followed by `PASS` for readability.
+- Otherwise start with `stako-status: blocked` and `stako-verdict: followups`, followed by `FOLLOWUPS REQUIRED`.
 - If follow-ups are required and Stako provides prompt-folder plus mutation
   instructions, create focused prompt files under `flups/` and inject or flup
   them as instructed.

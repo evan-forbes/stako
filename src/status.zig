@@ -12,6 +12,7 @@ pub const Status = enum {
     queued,
     running,
     completed,
+    blocked,
     failed,
 
     pub fn name(self: Status) []const u8 {
@@ -19,15 +20,61 @@ pub const Status = enum {
     }
 
     pub fn isTerminal(self: Status) bool {
-        return self == .completed or self == .failed;
+        return self == .completed or self == .blocked or self == .failed;
     }
+};
+
+pub const Verdict = enum {
+    none,
+    pass,
+    followups,
+    fail,
+};
+
+pub const ResultClassification = struct {
+    status: Status,
+    verdict: Verdict = .none,
 };
 
 /// Filesystem completion markers for one node's `runs/<node>/` directory.
 pub const Marker = struct {
     done: bool,
     result: bool,
+    /// Result bytes when the caller read them. `null` means the caller only
+    /// knows the file exists, which keeps older unit tests and probes simple.
+    result_text: ?[]const u8 = null,
 };
+
+/// Classify a durable result body. Structured headers are preferred; legacy
+/// first-line tokens remain accepted for older prompts.
+pub fn classifyResult(text: []const u8) ResultClassification {
+    const first = firstLine(text);
+    const trimmed = std.mem.trim(u8, first, " \t\r");
+    if (startsWithIgnoreCase(trimmed, "stako-status:")) {
+        const value = std.mem.trim(u8, trimmed["stako-status:".len..], " \t\r");
+        var verdict: Verdict = .none;
+        if (secondStructuredLine(text)) |line| {
+            const vline = std.mem.trim(u8, line, " \t\r");
+            if (startsWithIgnoreCase(vline, "stako-verdict:")) {
+                const v = std.mem.trim(u8, vline["stako-verdict:".len..], " \t\r");
+                if (std.ascii.eqlIgnoreCase(v, "pass")) verdict = .pass;
+                if (std.ascii.eqlIgnoreCase(v, "followups")) verdict = .followups;
+                if (std.ascii.eqlIgnoreCase(v, "fail")) verdict = .fail;
+            }
+        }
+        if (std.ascii.eqlIgnoreCase(value, "done")) return .{ .status = .completed, .verdict = verdict };
+        if (std.ascii.eqlIgnoreCase(value, "blocked")) return .{ .status = .blocked, .verdict = verdict };
+        if (std.ascii.eqlIgnoreCase(value, "failed")) return .{ .status = .failed, .verdict = verdict };
+        return .{ .status = .failed, .verdict = verdict };
+    }
+
+    if (std.mem.eql(u8, trimmed, "PASS")) return .{ .status = .completed, .verdict = .pass };
+    if (std.mem.eql(u8, trimmed, "FOLLOWUPS REQUIRED")) return .{ .status = .blocked, .verdict = .followups };
+    if (std.mem.startsWith(u8, trimmed, "BLOCKED")) return .{ .status = .blocked };
+    if (std.mem.eql(u8, trimmed, "FAILED") or std.mem.eql(u8, trimmed, "FAIL")) return .{ .status = .failed, .verdict = .fail };
+    if (std.mem.trim(u8, text, " \t\r\n").len != 0) return .{ .status = .completed };
+    return .{ .status = .failed };
+}
 
 /// Compute status for every node, parallel to `plan.nodes`. `markers` is
 /// parallel to `plan.nodes`; `events` is the whole log. Caller owns the slice.
@@ -59,13 +106,19 @@ pub fn computeAlloc(
 /// running forever; and `failed` never satisfies a blocker, so it cannot unblock
 /// downstream work without a durable `result.md`.
 pub fn nodeStatus(marker: Marker, node_name: []const u8, log: []const events.Event) Status {
-    if (marker.done) return if (marker.result) .completed else .failed;
+    if (marker.done) {
+        if (!marker.result) return .failed;
+        if (marker.result_text) |text| return classifyResult(text).status;
+        return .completed;
+    }
     var s: Status = .queued;
     for (log) |ev| {
         if (!std.mem.eql(u8, ev.node, node_name)) continue;
         switch (ev.event) {
             .delivered => s = .running,
+            .blocked => s = .blocked,
             .completed, .failed => s = .failed,
+            .reset => s = .queued,
             else => {},
         }
     }
@@ -94,6 +147,22 @@ fn indexOf(p: *const plan.Plan, name: []const u8) ?usize {
         if (std.mem.eql(u8, node.name, name)) return i;
     }
     return null;
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
+}
+
+fn secondStructuredLine(text: []const u8) ?[]const u8 {
+    const first_end = std.mem.indexOfScalar(u8, text, '\n') orelse return null;
+    const rest = text[first_end + 1 ..];
+    const second_end = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
+    return rest[0..second_end];
+}
+
+fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return haystack.len >= needle.len and std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
 }
 
 // ---------- tests ----------
@@ -125,6 +194,24 @@ test "done with result is completed; done without result is failed" {
     try testing.expectEqual(Status.failed, try statusFor(one_node, "n", &.{.{ .done = true, .result = false }}, &.{}));
 }
 
+test "result classifier maps structured and legacy outputs" {
+    try testing.expectEqual(Status.completed, classifyResult("stako-status: done\nstako-verdict: pass\nPASS\n").status);
+    try testing.expectEqual(Verdict.pass, classifyResult("stako-status: done\nstako-verdict: pass\nPASS\n").verdict);
+    try testing.expectEqual(Status.blocked, classifyResult("stako-status: blocked\nstako-verdict: followups\n").status);
+    try testing.expectEqual(Status.failed, classifyResult("stako-status: failed\n").status);
+    try testing.expectEqual(Status.completed, classifyResult("PASS\nlooks good\n").status);
+    try testing.expectEqual(Status.blocked, classifyResult("FOLLOWUPS REQUIRED\nfix x\n").status);
+    try testing.expectEqual(Status.blocked, classifyResult("BLOCKED waiting on access\n").status);
+    try testing.expectEqual(Status.failed, classifyResult("FAIL\n").status);
+    try testing.expectEqual(Status.completed, classifyResult("legacy result text\n").status);
+    try testing.expectEqual(Status.failed, classifyResult("").status);
+}
+
+test "done marker classifies result quality" {
+    try testing.expectEqual(Status.blocked, try statusFor(one_node, "n", &.{.{ .done = true, .result = true, .result_text = "FOLLOWUPS REQUIRED\n" }}, &.{}));
+    try testing.expectEqual(Status.failed, try statusFor(one_node, "n", &.{.{ .done = true, .result = true, .result_text = "" }}, &.{}));
+}
+
 test "delivered without terminal marker is running; nothing is queued" {
     const delivered = [_]events.Event{.{ .event = .delivered, .node = "n" }};
     try testing.expectEqual(Status.running, try statusFor(one_node, "n", &.{.{ .done = false, .result = false }}, &delivered));
@@ -136,6 +223,11 @@ test "a failed event without a done marker is failed" {
     try testing.expectEqual(Status.failed, try statusFor(one_node, "n", &.{.{ .done = false, .result = false }}, &log));
 }
 
+test "a blocked event without a done marker is blocked" {
+    const log = [_]events.Event{ .{ .event = .delivered, .node = "n" }, .{ .event = .blocked, .node = "n", .reason = "result_blocked" } };
+    try testing.expectEqual(Status.blocked, try statusFor(one_node, "n", &.{.{ .done = false, .result = false }}, &log));
+}
+
 test "a completed event without the done marker is an inconsistent failure" {
     // The runner only emits `completed` after writing `done`, so a `completed`
     // event with no `done` marker means the marker was lost. It must not be
@@ -143,6 +235,22 @@ test "a completed event without the done marker is an inconsistent failure" {
     // perpetual `running`; it is a terminal `failed`.
     const log = [_]events.Event{ .{ .event = .delivered, .node = "n" }, .{ .event = .completed, .node = "n", .result = "runs/n/result.md" } };
     try testing.expectEqual(Status.failed, try statusFor(one_node, "n", &.{.{ .done = false, .result = false }}, &log));
+}
+
+test "a reset event after a terminal event returns the node to queued" {
+    // `stako reset` deletes the run markers and appends a `reset` event. With the
+    // markers gone the projection replays the log, and `reset` — being the last
+    // event for the node — overrides the earlier delivered/completed.
+    const after_completed = [_]events.Event{
+        .{ .event = .delivered, .node = "n" },
+        .{ .event = .completed, .node = "n", .result = "runs/n/result.md" },
+        .{ .event = .reset, .node = "n" },
+    };
+    try testing.expectEqual(Status.queued, try statusFor(one_node, "n", &.{.{ .done = false, .result = false }}, &after_completed));
+
+    // A redelivery after the reset makes it running again.
+    const redelivered = after_completed ++ [_]events.Event{.{ .event = .delivered, .node = "n" }};
+    try testing.expectEqual(Status.running, try statusFor(one_node, "n", &.{.{ .done = false, .result = false }}, &redelivered));
 }
 
 test "thread idle and blockers-complete helpers" {
@@ -175,5 +283,14 @@ test "thread idle and blockers-complete helpers" {
         const statuses = [_]Status{ .completed, .queued };
         try testing.expect(threadIdle(&p, &statuses, "impl"));
         try testing.expect(blockersComplete(&p, &statuses, p.nodeByName("b").?));
+    }
+    // blocked and failed are terminal but do not satisfy downstream blockers.
+    {
+        const blocked_statuses = [_]Status{ .blocked, .queued };
+        try testing.expect(threadIdle(&p, &blocked_statuses, "impl"));
+        try testing.expect(!blockersComplete(&p, &blocked_statuses, p.nodeByName("b").?));
+        const failed_statuses = [_]Status{ .failed, .queued };
+        try testing.expect(threadIdle(&p, &failed_statuses, "impl"));
+        try testing.expect(!blockersComplete(&p, &failed_statuses, p.nodeByName("b").?));
     }
 }

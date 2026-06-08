@@ -41,6 +41,9 @@ Blocker and follow-up handling:
 
 Final result content must include:
 
+- `stako-status: done` when the assigned slice is complete, `stako-status:
+  blocked` when unresolved prerequisites or follow-ups prevent completion, or
+  `stako-status: failed` when the slice cannot produce a useful handoff.
 - What changed.
 - Which assigned requirements were implemented.
 - Tests run and their results.

@@ -9,7 +9,8 @@ pub const Error = error{
     Usage,
     OutOfMemory,
 } || paths.Error || runtime.Error || zellij.Error || std.Io.Writer.Error ||
-    std.fs.Dir.MakeError || std.process.Child.SpawnError || std.process.Child.WaitError;
+    std.fs.Dir.MakeError || std.process.Child.SpawnError || std.process.Child.WaitError ||
+    std.posix.KillError;
 
 const Options = struct {
     name: []const u8 = "",
@@ -17,6 +18,9 @@ const Options = struct {
     cwd: []const u8 = "",
     from: []const u8 = "",
     json: bool = false,
+    watch: bool = false,
+    force: bool = false,
+    snapshot: bool = false,
 };
 
 pub fn dispatch(
@@ -40,8 +44,12 @@ pub fn dispatch(
     if (std.mem.eql(u8, cmd, "inject")) return try cmdInject(allocator, args[1..], stdout, stderr);
     if (std.mem.eql(u8, cmd, "link")) return try cmdLink(allocator, args[1..], stdout, stderr);
     if (std.mem.eql(u8, cmd, "start")) return try cmdStart(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "stop")) return try cmdStop(allocator, args[1..], stdout, stderr);
     if (std.mem.eql(u8, cmd, "attach")) return try cmdAttach(allocator, args[1..], stdout, stderr);
     if (std.mem.eql(u8, cmd, "output")) return try cmdOutput(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "redeliver")) return try cmdRedeliver(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "complete")) return try cmdComplete(allocator, args[1..], stdout, stderr);
+    if (std.mem.eql(u8, cmd, "reset")) return try cmdReset(allocator, args[1..], stdout, stderr);
 
     try stderr.print("unknown command: {s}\n", .{cmd});
     try overview(stderr);
@@ -153,6 +161,15 @@ fn cmdNew(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writ
     var resolved = resolvePlanAlloc(gpa, folder, resolve_opts) catch |e| return reportResolveError(e, folder, stderr);
     defer resolved.deinit();
 
+    // Agents write run artifacts (result.md, done) under the stack root. With a
+    // sandboxed harness (e.g. codex workspace-write) a root outside the agent cwd
+    // is unwritable, so the stack silently never completes. Warn, don't block.
+    if (std.fs.path.isAbsolute(resolved.root) and std.fs.path.isAbsolute(resolved.agent_cwd) and
+        !pathInside(resolved.root, resolved.agent_cwd))
+    {
+        try stderr.print("warning: stack root {s} is outside the agent cwd {s}; a sandboxed agent may be unable to write results there\n", .{ resolved.root, resolved.agent_cwd });
+    }
+
     std.fs.cwd().makePath(resolved.root) catch {
         try stderr.print("cannot create stack root: {s}\n", .{resolved.root});
         return 2;
@@ -204,8 +221,14 @@ fn cmdStatus(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
     return 0;
 }
 
+/// A running node whose pane has not changed for this many seconds is flagged as
+/// possibly stalled. The pane heartbeat (`output.md` mtime) proves only that the
+/// pane repaints, so this is a hint, not proof — durable progress is `result.md`.
+const stall_threshold_s: i64 = 300;
+
 fn printStatusText(w: *std.Io.Writer, stack: *const runtime.Stack, statuses: []const status.Status) Error!void {
     try w.print("stack {s} cwd={s}\n", .{ stack.name, stack.agentCwd() });
+    try printRunner(w, stack);
     for (stack.plan.threads) |t| {
         if (runningNode(stack, statuses, t.name)) |node| {
             try w.print("thread {s} running={s}\n", .{ t.name, node });
@@ -221,9 +244,38 @@ fn printStatusText(w: *std.Io.Writer, stack: *const runtime.Stack, statuses: []c
             } else {
                 try printUnmet(w, stack, statuses, &n);
             }
+        } else if (statuses[i] == .running) {
+            if (idleSeconds(stack, n.name)) |idle| {
+                if (idle >= stall_threshold_s) try w.print(" (stalled? quiet {d}s)", .{idle});
+            }
         }
         try w.writeByte('\n');
     }
+}
+
+/// Print the attached runner's liveness, and note when the graph was edited
+/// after the runner started. Runners reload live on every tick.
+fn printRunner(w: *std.Io.Writer, stack: *const runtime.Stack) Error!void {
+    const info = (stack.readRunnerPid() catch null) orelse {
+        try w.writeAll("runner none\n");
+        return;
+    };
+    const alive = runtime.pidAlive(info.pid);
+    try w.print("runner pid={d} watch={} {s}\n", .{ info.pid, info.watch, if (alive) "alive" else "stale" });
+    if (alive) {
+        if (stack.planMtimeNanos()) |pm| {
+            const pm_s: i64 = @intCast(@divFloor(pm, std.time.ns_per_s));
+            if (pm_s > info.started) try w.writeAll("note: plan.toml was edited after this runner started; the live runner reloads it each tick\n");
+        }
+    }
+}
+
+/// Seconds since a running node's pane last changed, or null when there is no
+/// dump yet.
+fn idleSeconds(stack: *const runtime.Stack, node_name: []const u8) ?i64 {
+    const mt = stack.runFileMtimeNanos(node_name, "output.md") orelse return null;
+    const mt_s: i64 = @intCast(@divFloor(mt, std.time.ns_per_s));
+    return std.time.timestamp() - mt_s;
 }
 
 fn printUnmet(w: *std.Io.Writer, stack: *const runtime.Stack, statuses: []const status.Status, node: *const plan.Node) Error!void {
@@ -242,6 +294,12 @@ fn printStatusJson(w: *std.Io.Writer, stack: *const runtime.Stack, statuses: []c
     try jsonString(w, stack.name);
     try w.writeAll(",\"agent_cwd\":");
     try jsonString(w, stack.agentCwd());
+    try w.writeAll(",\"runner\":");
+    if (stack.readRunnerPid() catch null) |info| {
+        try w.print("{{\"pid\":{d},\"watch\":{},\"alive\":{}}}", .{ info.pid, info.watch, runtime.pidAlive(info.pid) });
+    } else {
+        try w.writeAll("null");
+    }
     try w.writeAll(",\"nodes\":[");
     for (stack.plan.nodes, 0..) |n, i| {
         if (i != 0) try w.writeByte(',');
@@ -255,6 +313,9 @@ fn printStatusJson(w: *std.Io.Writer, stack: *const runtime.Stack, statuses: []c
             status.blockersComplete(&stack.plan, statuses, &n) and
             status.threadIdle(&stack.plan, statuses, n.thread);
         try w.print(",\"ready\":{}", .{ready});
+        if (statuses[i] == .running) {
+            if (idleSeconds(stack, n.name)) |idle| try w.print(",\"idle_seconds\":{d}", .{idle});
+        }
         try w.writeAll("}");
     }
     try w.writeAll("]}\n");
@@ -296,7 +357,7 @@ fn cmdRender(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
 
 fn cmdInject(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
     if (args.len < 2) {
-        try stderr.writeAll("usage: stako inject <stack> <node> --thread T [--body B|--use F] [--action A] [--blocked-by a,b] [--gate target] [--raw] [--root P]\n");
+        try stderr.writeAll("usage: stako inject <stack> <node> --thread T [--body B|--use F] [--with f1,f2] [--action A] [--blocked-by a,b] [--gate target] [--raw] [--root P]\n");
         return 2;
     }
     const name = args[0];
@@ -309,6 +370,11 @@ fn cmdInject(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
     var action_str: []const u8 = "none";
     var blocked_csv: []const u8 = "";
     var raw = false;
+
+    // `--with` may repeat and/or carry a comma list; collect every value.
+    var with_items: std.ArrayList([]const u8) = .empty;
+    defer with_items.deinit(gpa);
+
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const a = args[i];
@@ -320,6 +386,8 @@ fn cmdInject(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
             body = v;
         } else if (try flagValue(args, &i, a, "--use")) |v| {
             use = v;
+        } else if (try flagValue(args, &i, a, "--with")) |v| {
+            try appendCsv(gpa, &with_items, v);
         } else if (try flagValue(args, &i, a, "--gate")) |v| {
             gate = v;
         } else if (try flagValue(args, &i, a, "--action")) |v| {
@@ -344,11 +412,7 @@ fn cmdInject(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
 
     var blockers: std.ArrayList([]const u8) = .empty;
     defer blockers.deinit(gpa);
-    var it = std.mem.splitScalar(u8, blocked_csv, ',');
-    while (it.next()) |part| {
-        const t = std.mem.trim(u8, part, " \t");
-        if (t.len != 0) try blockers.append(gpa, t);
-    }
+    try appendCsv(gpa, &blockers, blocked_csv);
 
     const root_resolved = try paths.resolveNotesRoot(gpa, rootOrDefault(root));
     defer gpa.free(root_resolved);
@@ -361,13 +425,18 @@ fn cmdInject(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
     };
     defer stack.deinit();
 
+    if (use.len != 0 and !stack.bodyFileExists(use)) {
+        try stderr.print("cannot inject {s}: use file not found: {s}\n", .{ node_name, use });
+        return 2;
+    }
+
     const gate_opt: ?[]const u8 = if (gate.len != 0) gate else null;
     stack.inject(.{
         .name = node_name,
         .thread = thread,
         .action = action,
         .use_path = use,
-        .with = &.{},
+        .with = with_items.items,
         .body = body,
         .blocked_by = blockers.items,
         .raw = raw,
@@ -377,6 +446,7 @@ fn cmdInject(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
     } else {
         try stdout.print("injected {s}\n", .{node_name});
     }
+    try printMutationRunnerHint(stdout, &stack, root_resolved);
     return 0;
 }
 
@@ -402,7 +472,20 @@ fn cmdLink(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Wri
     defer stack.deinit();
     stack.link(source, target) catch |e| return reportMutationError(e, stderr);
     try stdout.print("linked {s} -> {s}\n", .{ source, target });
+    try printMutationRunnerHint(stdout, &stack, root);
     return 0;
+}
+
+fn printMutationRunnerHint(w: *std.Io.Writer, stack: *const runtime.Stack, root: []const u8) Error!void {
+    if (stack.readRunnerPid() catch null) |info| {
+        if (runtime.pidAlive(info.pid) and runtime.pidIsRunnerFor(info.pid, stack.name)) {
+            try w.print("live runner pid={d} will pick it up on the next tick\n", .{info.pid});
+            return;
+        }
+    }
+    try w.print("no live runner; continue with: stako start {s} --watch", .{stack.name});
+    if (!std.mem.eql(u8, root, paths.DEFAULT_NOTES_ROOT)) try w.print(" --root {s}", .{root});
+    try w.writeByte('\n');
 }
 
 fn reportMutationError(e: Error, stderr: *std.Io.Writer) Error!u8 {
@@ -437,8 +520,51 @@ fn cmdStart(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Wr
     var adapter = zellij.CommandAdapter{ .allocator = gpa };
     var rt = zellij.PlanRuntime(zellij.CommandAdapter){ .gpa = gpa, .adapter = &adapter };
     defer rt.deinit();
-    try rt.runUntilIdle(&stack, sleepOneSecond);
+    rt.runUntilIdle(&stack, .{ .sleep = sleepOneSecond, .watch = opts.watch }) catch |e| switch (e) {
+        error.RunnerAlreadyRunning => {
+            try stderr.print("a runner is already attached to {s}; use stako stop {s} first\n", .{ name, name });
+            return 2;
+        },
+        error.SessionConflict => {
+            try stderr.print("a foreign zellij session named {s} exists; rename it or remove it\n", .{name});
+            return 2;
+        },
+        else => return e,
+    };
     try stdout.print("stack {s} idle\n", .{stack.name});
+    return 0;
+}
+
+fn cmdStop(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    var opts: Options = .{};
+    var name: []const u8 = "";
+    if (!try parseStackArgs(args, &name, &opts, stderr)) return 2;
+    const root = try paths.resolveNotesRoot(gpa, rootOrDefault(opts.root));
+    defer gpa.free(root);
+    var stack = runtime.Stack.open(gpa, root, name) catch |e| switch (e) {
+        error.NotFound => {
+            try stderr.print("no such stack: {s}\n", .{name});
+            return 2;
+        },
+        else => return e,
+    };
+    defer stack.deinit();
+
+    const info = (try stack.readRunnerPid()) orelse {
+        try stderr.print("no runner recorded for {s}\n", .{name});
+        return 2;
+    };
+    if (!runtime.pidAlive(info.pid)) {
+        stack.removeRunnerPid();
+        try stdout.print("runner for {s} was already gone (cleared stale pid {d})\n", .{ name, info.pid });
+        return 0;
+    }
+    if (!runtime.pidIsRunnerFor(info.pid, name)) {
+        try stderr.print("pid {d} does not look like the {s} runner; refusing to signal it\n", .{ info.pid, name });
+        return 2;
+    }
+    try std.posix.kill(@intCast(info.pid), std.posix.SIG.TERM);
+    try stdout.print("sent stop to {s} runner (pid {d})\n", .{ name, info.pid });
     return 0;
 }
 
@@ -459,7 +585,7 @@ fn cmdAttach(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
 
 fn cmdOutput(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
     if (args.len < 2) {
-        try stderr.writeAll("usage: stako output <stack> <node> [--root PATH]\n");
+        try stderr.writeAll("usage: stako output <stack> <node> [--snapshot] [--root PATH]\n");
         return 2;
     }
     var opts: Options = .{};
@@ -476,9 +602,173 @@ fn cmdOutput(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.W
         else => return e,
     };
     defer stack.deinit();
+    const node = stack.plan.nodeByName(node_name) orelse {
+        try stderr.print("no such node: {s}\n", .{node_name});
+        return 2;
+    };
+    if (!opts.snapshot and (try stack.nodeStatus(node_name)) == .running) {
+        var adapter = zellij.CommandAdapter{ .allocator = gpa };
+        if (adapter.findThreadPane(stack.name, node.thread)) |pane| {
+            defer {
+                gpa.free(pane.tab_id);
+                gpa.free(pane.pane_id);
+            }
+            const dump = adapter.dumpPane(stack.name, pane.pane_id) catch null;
+            if (dump) |text| {
+                defer gpa.free(text);
+                try stack.storeOutput(node_name, text);
+                try stdout.writeAll(text);
+                return 0;
+            }
+        }
+        try stderr.writeAll("note: no live pane available; showing stored output snapshot\n");
+    }
     const out = try stack.readRunFileAlloc(gpa, node_name, "output.md");
     defer gpa.free(out);
     try stdout.writeAll(out);
+    return 0;
+}
+
+// ---------- recovery ----------
+
+fn cmdRedeliver(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    if (args.len < 2) {
+        try stderr.writeAll("usage: stako redeliver <stack> <node> [--force] [--root P]\n");
+        return 2;
+    }
+    var opts: Options = .{};
+    const name = args[0];
+    const node_name = args[1];
+    if (!try parseFlags(args[2..], &opts, stderr)) return 2;
+    const root = try paths.resolveNotesRoot(gpa, rootOrDefault(opts.root));
+    defer gpa.free(root);
+    var stack = runtime.Stack.open(gpa, root, name) catch |e| switch (e) {
+        error.NotFound => {
+            try stderr.print("no such stack: {s}\n", .{name});
+            return 2;
+        },
+        else => return e,
+    };
+    defer stack.deinit();
+    const node = stack.plan.nodeByName(node_name) orelse {
+        try stderr.print("no such node: {s}\n", .{node_name});
+        return 2;
+    };
+    if (!opts.force and (try stack.nodeStatus(node_name)) == .completed) {
+        try stderr.print("{s} is completed; pass --force to redeliver and overwrite its result\n", .{node_name});
+        return 2;
+    }
+    var adapter = zellij.CommandAdapter{ .allocator = gpa };
+    var rt = zellij.PlanRuntime(zellij.CommandAdapter){ .gpa = gpa, .adapter = &adapter };
+    defer rt.deinit();
+    try rt.startStack(&stack);
+    rt.deliver(&stack, node) catch |e| switch (e) {
+        error.MissingThreadPane, error.CommandFailed, error.SpawnFailed, error.MissingUse => {
+            try stderr.print("could not deliver {s}: {s}\n", .{ node_name, deliveryErrorName(e) });
+            return 2;
+        },
+        else => return e,
+    };
+    try stdout.print("redelivered {s}\n", .{node_name});
+    return 0;
+}
+
+fn deliveryErrorName(e: Error) []const u8 {
+    return switch (e) {
+        error.MissingThreadPane => "missing_thread_pane",
+        error.CommandFailed => "zellij_deliver_failed",
+        error.SpawnFailed => "zellij_spawn_failed",
+        error.MissingUse => "missing_use",
+        else => unreachable,
+    };
+}
+
+fn cmdComplete(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    if (args.len < 2) {
+        try stderr.writeAll("usage: stako complete <stack> <node> [--result FILE] [--root P]\n       (reads result from stdin when --result is omitted)\n");
+        return 2;
+    }
+    const name = args[0];
+    const node_name = args[1];
+    var root: []const u8 = "";
+    var result_file: []const u8 = "";
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (try flagValue(args, &i, a, "--root")) |v| {
+            root = v;
+        } else if (try flagValue(args, &i, a, "--result")) |v| {
+            result_file = v;
+        } else {
+            try stderr.print("unexpected argument: {s}\n", .{a});
+            return 2;
+        }
+    }
+    const root_resolved = try paths.resolveNotesRoot(gpa, rootOrDefault(root));
+    defer gpa.free(root_resolved);
+    var stack = runtime.Stack.open(gpa, root_resolved, name) catch |e| switch (e) {
+        error.NotFound => {
+            try stderr.print("no such stack: {s}\n", .{name});
+            return 2;
+        },
+        else => return e,
+    };
+    defer stack.deinit();
+    if (stack.plan.nodeByName(node_name) == null) {
+        try stderr.print("no such node: {s}\n", .{node_name});
+        return 2;
+    }
+
+    const result_text = if (result_file.len != 0)
+        readPathAlloc(gpa, result_file) catch {
+            try stderr.print("cannot read result file: {s}\n", .{result_file});
+            return 2;
+        }
+    else
+        try readStdinAlloc(gpa);
+    defer gpa.free(result_text);
+
+    try stack.storeResult(node_name, result_text);
+    try stack.storeCompletion(node_name);
+    const result_rel = try std.fmt.allocPrint(gpa, "runs/{s}/result.md", .{node_name});
+    defer gpa.free(result_rel);
+    switch (status.classifyResult(result_text).status) {
+        .completed => try stack.appendEvent(.{ .event = .completed, .node = node_name, .result = result_rel }),
+        .blocked => try stack.appendEvent(.{ .event = .blocked, .node = node_name, .reason = "result_blocked" }),
+        .failed => try stack.appendEvent(.{ .event = .failed, .node = node_name, .reason = "result_failed" }),
+        else => unreachable,
+    }
+    try stdout.print("recorded result for {s} ({d} bytes)\n", .{ node_name, result_text.len });
+    return 0;
+}
+
+fn cmdReset(gpa: std.mem.Allocator, args: []const []const u8, stdout: *std.Io.Writer, stderr: *std.Io.Writer) Error!u8 {
+    if (args.len < 2) {
+        try stderr.writeAll("usage: stako reset <stack> <node> [--root P]\n");
+        return 2;
+    }
+    var opts: Options = .{};
+    const name = args[0];
+    const node_name = args[1];
+    if (!try parseFlags(args[2..], &opts, stderr)) return 2;
+    const root = try paths.resolveNotesRoot(gpa, rootOrDefault(opts.root));
+    defer gpa.free(root);
+    var stack = runtime.Stack.open(gpa, root, name) catch |e| switch (e) {
+        error.NotFound => {
+            try stderr.print("no such stack: {s}\n", .{name});
+            return 2;
+        },
+        else => return e,
+    };
+    defer stack.deinit();
+    stack.resetNode(node_name) catch |e| switch (e) {
+        error.UnknownTarget => {
+            try stderr.print("no such node: {s}\n", .{node_name});
+            return 2;
+        },
+        else => return e,
+    };
+    try stdout.print("reset {s} (queued; a running runner will re-deliver it)\n", .{node_name});
     return 0;
 }
 
@@ -622,12 +912,28 @@ fn parseFlags(args: []const []const u8, opts: *Options, stderr: *std.Io.Writer) 
             opts.from = v;
         } else if (std.mem.eql(u8, a, "--json")) {
             opts.json = true;
+        } else if (std.mem.eql(u8, a, "--watch")) {
+            opts.watch = true;
+        } else if (std.mem.eql(u8, a, "--force")) {
+            opts.force = true;
+        } else if (std.mem.eql(u8, a, "--snapshot")) {
+            opts.snapshot = true;
         } else {
             try stderr.print("unexpected argument: {s}\n", .{a});
             return false;
         }
     }
     return true;
+}
+
+/// Append each non-empty, comma-separated, trimmed item of `csv` to `list`. The
+/// item slices borrow from `csv`, so they live as long as the argv does.
+fn appendCsv(gpa: std.mem.Allocator, list: *std.ArrayList([]const u8), csv: []const u8) Error!void {
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |part| {
+        const t = std.mem.trim(u8, part, " \t");
+        if (t.len != 0) try list.append(gpa, t);
+    }
 }
 
 /// Match `--flag VALUE` or `--flag=VALUE`; advances `i` past a separate value.
@@ -647,6 +953,14 @@ fn flagValue(args: []const []const u8, i: *usize, arg: []const u8, flag: []const
 
 fn rootOrDefault(root: []const u8) []const u8 {
     return if (root.len != 0) root else paths.DEFAULT_NOTES_ROOT;
+}
+
+/// True if absolute path `inner` is `outer` or lies beneath it. Used only for a
+/// best-effort sandbox warning, so it is a lexical check, not a realpath one.
+fn pathInside(inner: []const u8, outer: []const u8) bool {
+    if (outer.len == 0) return true;
+    if (!std.mem.startsWith(u8, inner, outer)) return false;
+    return inner.len == outer.len or inner[outer.len] == '/' or std.mem.endsWith(u8, outer, "/");
 }
 
 fn runningNode(stack: *const runtime.Stack, statuses: []const status.Status, thread: []const u8) ?[]const u8 {
@@ -676,6 +990,16 @@ fn jsonString(w: *std.Io.Writer, s: []const u8) Error!void {
     try w.writeByte('"');
 }
 
+fn readStdinAlloc(gpa: std.mem.Allocator) Error![]u8 {
+    // Caller owns returned memory.
+    var buf: [4096]u8 = undefined;
+    var stdin_reader = std.fs.File.stdin().reader(&buf);
+    return stdin_reader.interface.allocRemaining(gpa, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.NotFound,
+    };
+}
+
 fn readPathAlloc(gpa: std.mem.Allocator, path: []const u8) Error![]u8 {
     // Caller owns returned memory.
     var file = try std.fs.cwd().openFile(path, .{});
@@ -703,16 +1027,22 @@ fn overview(w: *std.Io.Writer) Error!void {
         \\  stako new <name> --from <prompt-folder> [--root P] [--cwd P]
         \\  stako status <stack> [--root P] [--json]
         \\  stako render <stack> <node> [--root P]
-        \\  stako inject <stack> <node> --thread T [--body B|--use F] [--gate target] [--root P]
+        \\  stako inject <stack> <node> --thread T [--body B|--use F] [--with f1,f2] [--gate target] [--root P]
         \\  stako link <stack> <source-node> <target-node> [--root P]
-        \\  stako start <stack> [--root P]
+        \\  stako start <stack> [--watch] [--root P]
+        \\  stako stop <stack> [--root P]
         \\  stako attach <stack>
-        \\  stako output <stack> <node> [--root P]
+        \\  stako output <stack> <node> [--snapshot] [--root P]
+        \\  stako redeliver <stack> <node> [--force] [--root P]
+        \\  stako complete <stack> <node> [--result FILE] [--root P]
+        \\  stako reset <stack> <node> [--root P]
         \\
         \\A stack is one plan.toml graph: threads run prompts, and the only edge is
         \\blocked_by. `plan` validates and previews a prompt folder; `new` normalizes
-        \\it into <root>/stacks/<name>/plan.toml. Status is computed from run markers
-        \\and events.jsonl.
+        \\it into <root>/stacks/<name>/plan.toml. `start` delivers ready prompts and,
+        \\with --watch, stays resident and picks up injects/resets live; `stop` ends a
+        \\watch runner. Status is computed from run markers and events.jsonl;
+        \\redeliver/complete/reset recover a wedged node.
         \\
     );
 }
@@ -722,6 +1052,27 @@ fn sleepOneSecond() void {
 }
 
 // ---------- tests ----------
+
+test "appendCsv splits, trims, and drops empty items" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(a);
+    try appendCsv(a, &list, " a , b ,,c");
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try std.testing.expectEqualStrings("a", list.items[0]);
+    try std.testing.expectEqualStrings("b", list.items[1]);
+    try std.testing.expectEqualStrings("c", list.items[2]);
+    // A repeated flag accumulates; an empty value contributes nothing.
+    try appendCsv(a, &list, "");
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+}
+
+test "pathInside detects a root beneath the agent cwd" {
+    try std.testing.expect(pathInside("/work/repo/stacks/x", "/work/repo"));
+    try std.testing.expect(pathInside("/work/repo", "/work/repo"));
+    try std.testing.expect(!pathInside("/other/place", "/work/repo"));
+    try std.testing.expect(!pathInside("/work/repo-sibling", "/work/repo"));
+}
 
 test "plan and new resolve a folder, then status reports computed state" {
     const a = std.testing.allocator;

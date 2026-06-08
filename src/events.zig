@@ -13,8 +13,13 @@ pub const Kind = enum {
     scheduled,
     delivered,
     completed,
+    blocked,
     failed,
     injected,
+    /// Operator cleared a node's run artifacts so it re-runs (see `stako reset`).
+    /// Resets computed status back to queued, overriding earlier delivered/
+    /// completed/failed events because it is the latest event for the node.
+    reset,
     runner_stopped,
 };
 

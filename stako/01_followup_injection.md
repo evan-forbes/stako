@@ -190,8 +190,8 @@ refuse complex rewrites until the writer can preserve unknown fields.
 4. Implement `stako link <stack> <source-node> <target-node>`.
 5. Implement `stako inject` as a checked composition of append node plus link.
 6. Record injection audit data in `events.jsonl` and optional node provenance.
-7. Add runner wake behavior: signal a resident `--watch` runner when present;
-   otherwise print `run stako start <stack>`.
+7. Add runner wake behavior: any live runner reloads on its next tick; otherwise
+   print the exact `stako start <stack> --watch` command.
 8. Add agent prompt contract text that explains how to report or create FLUPs.
 
 ## Test Plan

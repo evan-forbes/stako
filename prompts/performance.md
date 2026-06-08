@@ -42,8 +42,12 @@ repair. Produce a durable review result.
 
 Output:
 
-- Start with `PASS` if there are no required changes.
-- Otherwise start with `CHANGES REQUESTED`.
+- Start with `stako-status: done` and `stako-verdict: pass` if there are no
+  required changes, followed by `PASS` for readability.
+- Otherwise start with `stako-status: done` and `stako-verdict: fail`, followed
+  by `CHANGES REQUESTED`. Reviewer findings are durable input to the fixer; the
+  checker is the gate that emits `stako-status: blocked` for unresolved
+  follow-ups.
 - List findings by severity with file:line references, impact, scale or memory
   path, and the concrete fix needed.
 - If a finding should become a new Stako follow-up, include exact follow-up

@@ -19,9 +19,11 @@ pub const Error = error{
     AlreadyExists,
     UnknownTarget,
     TargetNotQueued,
+    MissingUse,
 } || std.fs.Dir.OpenError ||
     std.fs.Dir.MakeError ||
     std.fs.Dir.WriteFileError ||
+    std.fs.Dir.DeleteFileError ||
     std.fs.Dir.RenameError ||
     std.fs.File.OpenError ||
     std.fs.File.ReadError ||
@@ -142,16 +144,31 @@ pub const Stack = struct {
         };
     }
 
+    fn markerInAlloc(self: *const Stack, gpa: std.mem.Allocator, dir: *std.fs.Dir, node_name: []const u8) Error!status.Marker {
+        // Caller owns `result_text` when non-null.
+        const done = self.accessRun(dir, node_name, "done");
+        const result_rel = try std.fs.path.join(gpa, &.{ "runs", node_name, "result.md" });
+        defer gpa.free(result_rel);
+        const text = readFileAlloc(gpa, dir, result_rel) catch |e| switch (e) {
+            error.FileNotFound => return .{ .done = done, .result = false },
+            else => return e,
+        };
+        return .{ .done = done, .result = true, .result_text = text };
+    }
+
     /// Computed status for every node, parallel to `plan.nodes`. Caller owns it.
     pub fn statusesAlloc(self: *const Stack, gpa: std.mem.Allocator) Error![]status.Status {
         // Caller owns returned memory.
         const markers = try gpa.alloc(status.Marker, self.plan.nodes.len);
-        defer gpa.free(markers);
+        defer {
+            for (markers) |m| if (m.result_text) |text| gpa.free(text);
+            gpa.free(markers);
+        }
         {
             // One dir handle for every node's markers, not one open per node.
             var dir = try self.openDir(.{});
             defer dir.close();
-            for (self.plan.nodes, 0..) |node, i| markers[i] = self.markerIn(&dir, node.name);
+            for (self.plan.nodes, 0..) |node, i| markers[i] = try self.markerInAlloc(gpa, &dir, node.name);
         }
 
         var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -204,7 +221,10 @@ pub const Stack = struct {
         var wrote = false;
 
         if (node.use_path.len != 0) {
-            const txt = try self.readBodyFileAlloc(gpa, node.use_path);
+            const txt = self.readBodyFileAlloc(gpa, node.use_path) catch |e| switch (e) {
+                error.FileNotFound, error.NotFound, error.NotDir => return error.MissingUse,
+                else => return e,
+            };
             defer gpa.free(txt);
             try appendSection(gpa, &body, &wrote, std.mem.trim(u8, txt, " \t\r\n"));
         }
@@ -245,7 +265,13 @@ pub const Stack = struct {
         try self.writeRunFile(node_name, "result.md", text);
     }
 
+    /// Store a pane dump as the node's debug output. Skips the write when the
+    /// content is unchanged so `output.md`'s mtime tracks the last time the pane
+    /// actually changed — the heartbeat `status` uses to flag stalled nodes.
     pub fn storeOutput(self: *const Stack, node_name: []const u8, text: []const u8) Error!void {
+        const existing = try self.readRunFileAlloc(self.gpa, node_name, "output.md");
+        defer self.gpa.free(existing);
+        if (std.mem.eql(u8, existing, text)) return;
         try self.writeRunFile(node_name, "output.md", text);
     }
 
@@ -259,6 +285,51 @@ pub const Stack = struct {
 
     pub fn completionExists(self: *const Stack, node_name: []const u8) bool {
         return self.markerFor(node_name).done;
+    }
+
+    /// True when `path` names a readable body file using the same resolution as
+    /// node `use` rendering: absolute as-is, otherwise prompt folder then stack.
+    pub fn bodyFileExists(self: *const Stack, path: []const u8) bool {
+        if (path.len == 0) return true;
+        if (std.fs.path.isAbsolute(path)) {
+            std.fs.cwd().access(path, .{}) catch return false;
+            return true;
+        }
+        const base = if (self.plan.header.prompt_folder.len != 0) self.plan.header.prompt_folder else self.dir_abs;
+        const full = std.fs.path.join(self.gpa, &.{ base, path }) catch return false;
+        defer self.gpa.free(full);
+        std.fs.cwd().access(full, .{}) catch return false;
+        return true;
+    }
+
+    /// Clear a node's run artifacts and log a `reset` event so its computed
+    /// status falls back to queued (a live runner then re-delivers it). Deleting
+    /// the markers is what lets the projection replay past the old terminal
+    /// state; the event records the action and out-ranks earlier deliveries.
+    pub fn resetNode(self: *const Stack, node_name: []const u8) Error!void {
+        if (self.plan.nodeByName(node_name) == null) return error.UnknownTarget;
+        var dir = try self.openDir(.{});
+        defer dir.close();
+        for ([_][]const u8{ "done", "result.md", "output.md", "rendered.md" }) |file| {
+            const rel = try std.fs.path.join(self.gpa, &.{ "runs", node_name, file });
+            defer self.gpa.free(rel);
+            dir.deleteFile(rel) catch |e| switch (e) {
+                error.FileNotFound => {},
+                else => return e,
+            };
+        }
+        try self.appendEvent(.{ .event = .reset, .node = node_name });
+    }
+
+    /// Modification time (ns) of `runs/<node>/<file>`, or null if absent. Used by
+    /// `status` to surface how long a running node's pane has been quiet.
+    pub fn runFileMtimeNanos(self: *const Stack, node_name: []const u8, file: []const u8) ?i128 {
+        var dir = self.openDir(.{}) catch return null;
+        defer dir.close();
+        const rel = std.fs.path.join(self.gpa, &.{ "runs", node_name, file }) catch return null;
+        defer self.gpa.free(rel);
+        const stat = dir.statFile(rel) catch return null;
+        return stat.mtime;
     }
 
     /// Read `runs/<node>/<file>`; a missing file yields "" so callers can treat
@@ -350,7 +421,10 @@ pub const Stack = struct {
 
     /// Computed status for a single node.
     pub fn nodeStatus(self: *const Stack, node_name: []const u8) Error!status.Status {
-        const marker = self.markerFor(node_name);
+        var dir = try self.openDir(.{});
+        defer dir.close();
+        const marker = try self.markerInAlloc(self.gpa, &dir, node_name);
+        defer if (marker.result_text) |text| self.gpa.free(text);
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const event_log = try self.eventsAlloc(arena.allocator());
@@ -383,11 +457,25 @@ pub const Stack = struct {
         return file;
     }
 
+    /// Modification time (ns) of `plan.toml`, or null if it cannot be stat'd.
+    /// The runner gates its per-tick reload on this; `status` uses it to warn
+    /// when the graph was edited after a runner loaded it.
+    pub fn planMtimeNanos(self: *const Stack) ?i128 {
+        var dir = self.openDir(.{}) catch return null;
+        defer dir.close();
+        const stat = dir.statFile("plan.toml") catch return null;
+        return stat.mtime;
+    }
+
     /// Re-read `plan.toml` into `self.plan`, replacing the snapshot taken at
-    /// `open`. Called while holding the mutation lock so a mutation always builds
-    /// on the latest committed graph rather than a stale in-memory copy — the
-    /// reload is what actually prevents the lost-update race, not the lock alone.
-    fn reloadPlan(self: *Stack) Error!void {
+    /// `open`. The mutators call this while holding the mutation lock so a
+    /// mutation always builds on the latest committed graph rather than a stale
+    /// in-memory copy — the reload is what actually prevents the lost-update
+    /// race, not the lock alone. The runner calls it lock-free each tick to pick
+    /// up injected nodes/edges; `writePlan`'s write-then-rename makes that read
+    /// see the old or new graph whole, never a half-written file. On a parse or
+    /// validation error the previous `self.plan` is left intact.
+    pub fn reloadPlan(self: *Stack) Error!void {
         var dir = try self.openDir(.{});
         defer dir.close();
         const src = readFileAlloc(self.gpa, &dir, "plan.toml") catch |e| switch (e) {
@@ -409,6 +497,49 @@ pub const Stack = struct {
         defer dir.close();
         dir.access("state/zellij-owner", .{}) catch return false;
         return true;
+    }
+
+    // ---------- runner liveness ----------
+
+    /// Recorded identity of the runner attached to this stack. `started` is a
+    /// Unix epoch; pair it with `pidAlive` to detect a stale `runner.pid` left by
+    /// a crashed runner. Scalar-only so it parses without allocation.
+    pub const RunnerInfo = struct {
+        pid: i64,
+        started: i64,
+        watch: bool,
+    };
+
+    /// Record this process as the stack's runner. Replaces any prior file.
+    pub fn writeRunnerPid(self: *const Stack, watch: bool) Error!void {
+        var dir = try self.openDir(.{});
+        defer dir.close();
+        var buf: [128]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "{{\"pid\":{d},\"started\":{d},\"watch\":{}}}\n", .{
+            std.os.linux.getpid(), std.time.timestamp(), watch,
+        }) catch unreachable; // fixed-width numeric format
+        try dir.writeFile(.{ .sub_path = "runner.pid", .data = line });
+    }
+
+    /// Read `runner.pid`, or null if absent/corrupt. A corrupt file reads as
+    /// null (treat it like no runner) rather than erroring.
+    pub fn readRunnerPid(self: *const Stack) Error!?RunnerInfo {
+        var dir = try self.openDir(.{});
+        defer dir.close();
+        const src = readFileAlloc(self.gpa, &dir, "runner.pid") catch |e| switch (e) {
+            error.FileNotFound => return null,
+            else => return e,
+        };
+        defer self.gpa.free(src);
+        const parsed = std.json.parseFromSlice(RunnerInfo, self.gpa, src, .{}) catch return null;
+        defer parsed.deinit();
+        return parsed.value; // scalar-only struct: a value copy outlives the parse
+    }
+
+    pub fn removeRunnerPid(self: *const Stack) void {
+        var dir = self.openDir(.{}) catch return;
+        defer dir.close();
+        dir.deleteFile("runner.pid") catch {};
     }
 
     // ---------- internals ----------
@@ -486,6 +617,30 @@ fn readPathAlloc(gpa: std.mem.Allocator, path: []const u8) Error![]u8 {
     // read so no uninitialized tail escapes. (A grow is harmlessly truncated.)
     if (n != buf.len) return gpa.realloc(buf, n);
     return buf;
+}
+
+/// True if `pid` names a live process. A permission error still proves the
+/// process exists (it is just not ours), so it counts as alive.
+pub fn pidAlive(pid: i64) bool {
+    if (pid <= 0) return false;
+    std.posix.kill(@intCast(pid), 0) catch |e| return e == error.PermissionDenied;
+    return true;
+}
+
+/// True if `pid`'s argv (read from `/proc`) looks like a `stako` runner for
+/// `stack_name` — the identity check that keeps `stako stop` from signalling an
+/// unrelated process that reused a stale pid. Linux-only; false on any failure.
+pub fn pidIsRunnerFor(pid: i64, stack_name: []const u8) bool {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch return false;
+    var file = std.fs.cwd().openFile(path, .{}) catch return false;
+    defer file.close();
+    var buf: [4096]u8 = undefined;
+    // /proc files report size 0, so read into a fixed buffer rather than stat-sizing.
+    const n = file.readAll(&buf) catch return false;
+    const argv = buf[0..n]; // NUL-separated; substring match is enough for identity
+    return std.mem.indexOf(u8, argv, "stako") != null and
+        std.mem.indexOf(u8, argv, stack_name) != null;
 }
 
 fn readFileAlloc(gpa: std.mem.Allocator, dir: *std.fs.Dir, rel: []const u8) Error![]u8 {
@@ -713,6 +868,80 @@ test "concurrent handles do not lose each other's injected nodes" {
     try testing.expectEqual(@as(usize, 4), reopened.plan.nodes.len);
     try testing.expect(reopened.plan.nodeByName("fix-a") != null);
     try testing.expect(reopened.plan.nodeByName("fix-b") != null);
+}
+
+test "injecting into a fully completed stack succeeds and renders its with inputs" {
+    const a = testing.allocator;
+    var ts = try makeStack(fixture_plan);
+    defer ts.deinit();
+    // Drive every existing node to completed.
+    for ([_][]const u8{ "impl-1", "review-1" }) |n| {
+        try ts.stack.storeResult(n, "r");
+        try ts.stack.storeCompletion(n);
+    }
+
+    // A post-stack node (no gate) must be accepted promptly, not hang.
+    try ts.stack.inject(.{
+        .name = "post-1",
+        .thread = "impl",
+        .action = .none,
+        .use_path = "",
+        .with = &.{ "extra one", "extra two" },
+        .body = "",
+        .blocked_by = &.{},
+        .raw = false,
+    }, null);
+
+    try testing.expectEqual(status.Status.queued, try ts.stack.nodeStatus("post-1"));
+    const node = ts.stack.plan.nodeByName("post-1").?;
+    try testing.expectEqual(@as(usize, 2), node.with.len);
+    const rendered = try ts.stack.renderNodeAlloc(a, node);
+    defer a.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "extra one") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "extra two") != null);
+}
+
+test "resetNode clears markers and returns the node to queued" {
+    var ts = try makeStack(fixture_plan);
+    defer ts.deinit();
+
+    try ts.stack.appendEvent(.{ .event = .delivered, .node = "impl-1", .thread = "impl" });
+    try ts.stack.storeResult("impl-1", "the result");
+    try ts.stack.storeCompletion("impl-1");
+    try ts.stack.storeOutput("impl-1", "pane dump");
+    try testing.expectEqual(status.Status.completed, try ts.stack.nodeStatus("impl-1"));
+
+    try ts.stack.resetNode("impl-1");
+    try testing.expectEqual(status.Status.queued, try ts.stack.nodeStatus("impl-1"));
+    try testing.expect(!ts.stack.completionExists("impl-1"));
+    try testing.expect(!ts.stack.resultExists("impl-1"));
+
+    try testing.expectError(error.UnknownTarget, ts.stack.resetNode("ghost"));
+}
+
+test "runner pid round-trips and liveness is detectable" {
+    var ts = try makeStack(fixture_plan);
+    defer ts.deinit();
+
+    try testing.expect((try ts.stack.readRunnerPid()) == null);
+    try ts.stack.writeRunnerPid(true);
+    const info = (try ts.stack.readRunnerPid()).?;
+    try testing.expectEqual(@as(i64, std.os.linux.getpid()), info.pid);
+    try testing.expect(info.watch);
+    try testing.expect(pidAlive(info.pid));
+    try testing.expect(!pidAlive(1 << 30)); // a pid that does not exist
+
+    ts.stack.removeRunnerPid();
+    try testing.expect((try ts.stack.readRunnerPid()) == null);
+}
+
+test "storeOutput only rewrites when the dump changes" {
+    var ts = try makeStack(fixture_plan);
+    defer ts.deinit();
+    try ts.stack.storeOutput("impl-1", "frame one");
+    const first = ts.stack.runFileMtimeNanos("impl-1", "output.md").?;
+    try ts.stack.storeOutput("impl-1", "frame one"); // identical: must not rewrite
+    try testing.expectEqual(first, ts.stack.runFileMtimeNanos("impl-1", "output.md").?);
 }
 
 test "raw node renders the body verbatim with no contract" {
